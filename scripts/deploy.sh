@@ -288,11 +288,24 @@ echo ""
 # window -- nobody rolls back more than a few deploys), delete the rest.
 # Pure disk hygiene, no live references to old backups once newer ones
 # exist and are known-good.
+# 26.09 (Wave F, deployer switched promonta -> grandmont): backups made by a
+# PREVIOUS deployer (e.g. promonta, from before this migration) are owned by
+# that user, and only the owner or root can delete them -- rm -f suppresses
+# the resulting per-file errors (still non-fatal disk hygiene) but `set -e`
+# would still fail the whole deploy on rm's nonzero exit, so check each path
+# individually and only count/report ones actually removed.
 OLD_BACKUPS=$(ls -dt /tmp/rollback_backup_* 2>/dev/null | tail -n +11)
 if [ -n "$OLD_BACKUPS" ]; then
-  echo "$OLD_BACKUPS" | xargs rm -rf
-  REMOVED_COUNT=$(echo "$OLD_BACKUPS" | wc -l)
-  echo "Очистка: удалено $REMOVED_COUNT старых backup-каталогов (оставлены последние 10)"
+  REMOVED_COUNT=0
+  SKIPPED_COUNT=0
+  while IFS= read -r old_backup; do
+    if rm -rf "$old_backup" 2>/dev/null; then
+      REMOVED_COUNT=$((REMOVED_COUNT + 1))
+    else
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+    fi
+  done <<< "$OLD_BACKUPS"
+  echo "Очистка: удалено $REMOVED_COUNT старых backup-каталогов (оставлены последние 10), пропущено $SKIPPED_COUNT (нет прав -- другой владелец, не критично)"
 fi
 
 echo "=== ДЕПЛОЙ ЗАВЕРШЁН ==="
