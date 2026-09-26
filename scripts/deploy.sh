@@ -228,11 +228,22 @@ sed -i -E "s#(src=\"js/[^\"]+)\"#\1?v=${CURRENT_SHA}\"#g; s#(href=\"css/[^\"]+)\
 # (setgid) -- the deployer is a webdeploy group member and can write here
 # directly, no root/sudo needed for this step any more. New files inherit the
 # webdeploy group automatically via setgid; no chown required after rsync.
-# 26.09 (Wave F): rsync no longer preserves source perms (see -rltD above), so
-# explicitly (re)apply the group-writable baseline every deploy instead of relying
-# on whatever mode files happened to have in the git checkout.
-find "$FRONTEND_SERVING_DIR" -type d -exec chmod 2775 {} +
-find "$FRONTEND_SERVING_DIR" -type f -exec chmod 664 {} +
+# 26.09 (Wave F): rsync no longer preserves source perms (see -rlD above).
+# Files/dirs rsync only UPDATES keep their existing root:webdeploy 664/2775
+# (set once by the one-time setup chmod) -- fine as-is, and a non-root deployer
+# can't re-chmod them anyway (even to the same value -- Linux doesn't treat
+# that as a no-op). Only a brand-new path rsync CREATES is owned by the
+# deployer and needs an explicit chmod, since it gets the deployer's own
+# umask-based mode instead of the group-writable baseline. Diff the file list
+# against the backup taken above to chmod only those new paths.
+NEW_FRONTEND_FILES="$(comm -13 \
+  <(cd "${BACKUP_DIR}/frontend" && find . -type f | sort) \
+  <(cd "$FRONTEND_SERVING_DIR" && find . -type f | sort))"
+if [[ -n "$NEW_FRONTEND_FILES" ]]; then
+  while IFS= read -r f; do
+    chmod 664 "${FRONTEND_SERVING_DIR}/${f#./}"
+  done <<< "$NEW_FRONTEND_FILES"
+fi
 echo "OK (group-writable via webdeploy, no chown needed)"
 echo "OK"
 
