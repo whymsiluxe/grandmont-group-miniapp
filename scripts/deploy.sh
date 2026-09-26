@@ -195,13 +195,15 @@ mkdir -p "$FRONTEND_SERVING_DIR"
 # `--delete` protects excluded files on destination, so old app.html.bak-* and
 # even legacy .git/.bak directories stayed publicly reachable in /var/www/miniapp.
 # 26.09 (Wave F, deployer switched promonta -> grandmont): -a implies -g (preserve
-# group), which made rsync try to chgrp every already-existing destination file to
-# the deployer's own group -- only the file's owner or root may do that, so it
-# failed non-atomically on every file not already owned by the current deployer.
-# -rlptD is -a minus -g/-o (no group/owner preservation); the destination's setgid
-# bit on /var/www/miniapp already assigns the right group to new files, and existing
-# files keep whatever group chown set them to -- no chgrp needed either way.
-rsync -rlptD -v --delete --delete-excluded \
+# group) and -p (preserve permissions), both of which made rsync try to chgrp/chmod
+# every already-existing destination file to the source's group/mode -- only a
+# file's owner or root may change its group or mode, so this failed non-atomically
+# on every file not already owned by the current deployer. -rltD is -a minus
+# -g/-o/-p (no group/owner/permission preservation); the destination's setgid bit
+# on /var/www/miniapp already assigns the right group to new files, and its 2775/664
+# baseline (set once by root) is what production actually wants regardless of
+# whatever mode the files happen to have in the repo checkout.
+rsync -rltD -v --delete --delete-excluded \
   --exclude='.git*' --exclude='.archived-legacy' --exclude='.archived-legacy/' \
   --exclude='.bak' --exclude='.bak/' --exclude='*.bak' --exclude='*.bak-*' \
   --exclude='*.corrupt-*' --exclude='*.old' --exclude='*~' \
@@ -223,9 +225,14 @@ fi
 sed -i -E "s#(src=\"js/[^\"]+)\"#\1?v=${CURRENT_SHA}\"#g; s#(href=\"css/[^\"]+)\"#\1?v=${CURRENT_SHA}\"#g" \
   "${FRONTEND_SERVING_DIR}/app.html"
 # 10.09 (deploy permissions fix): /var/www/miniapp is now root:webdeploy 2775
-# (setgid) -- promonta is a webdeploy group member and can write here directly,
-# no root/sudo needed for this step any more. New files inherit the webdeploy
-# group automatically via setgid; no chown required after rsync.
+# (setgid) -- the deployer is a webdeploy group member and can write here
+# directly, no root/sudo needed for this step any more. New files inherit the
+# webdeploy group automatically via setgid; no chown required after rsync.
+# 26.09 (Wave F): rsync no longer preserves source perms (see -rltD above), so
+# explicitly (re)apply the group-writable baseline every deploy instead of relying
+# on whatever mode files happened to have in the git checkout.
+find "$FRONTEND_SERVING_DIR" -type d -exec chmod 2775 {} +
+find "$FRONTEND_SERVING_DIR" -type f -exec chmod 664 {} +
 echo "OK (group-writable via webdeploy, no chown needed)"
 echo "OK"
 
