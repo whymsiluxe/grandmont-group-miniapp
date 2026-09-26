@@ -33,9 +33,11 @@ source "$REPO_DIR/scripts/manifest.sh"
 source "$REPO_DIR/scripts/runtime_manifest.sh"
 
 # Production paths -- НЕ угадано, сверено с реальным systemd unit
-# (/etc/systemd/system/grandmont-miniapp.service, WorkingDirectory=/home/promonta/agent,
+# (/etc/systemd/system/grandmont-group-miniapp.service, WorkingDirectory=/home/promonta/agent,
 # ExecStart=uvicorn miniapp.main:app) и реальной раздачей frontend через Caddy
-# (/var/www/miniapp/) на момент написания этого скрипта.
+# (/var/www/miniapp/) на момент написания этого скрипта. (Wave A/C/D/F, 26.09:
+# runtime path/service name/deployer since migrated to /home/grandmont/agent,
+# grandmont-group-miniapp.service, grandmont -- see BACKEND_SERVING_DIR/SERVICE_NAME below.)
 BACKEND_SERVING_DIR="/home/grandmont/agent/miniapp"
 FRONTEND_SERVING_DIR="/var/www/miniapp"
 SERVICE_NAME="grandmont-group-miniapp.service"

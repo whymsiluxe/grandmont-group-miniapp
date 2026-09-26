@@ -40,7 +40,7 @@ logging.basicConfig(
 log = logging.getLogger('plan_sync')
 
 DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/grandmont/agent/miniapp')
-SHEETS_CRED = '/home/promonta/agent/.sheets.json'
+SHEETS_CRED = '/home/grandmont/agent/.sheets.json'
 SYNC_STATE_FILE = os.path.join(DATA_ROOT, 'plan_sync_state.json')
 DAILY_PLAN_STORE_FILE = os.path.join(DATA_ROOT, 'daily_plan_store.json')
 

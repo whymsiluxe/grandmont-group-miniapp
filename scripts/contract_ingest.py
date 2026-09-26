@@ -54,7 +54,7 @@ STATE_FILE = os.path.join(DATA_ROOT, 'contract_ingest_state.json')
 
 CONTRACTS_DRIVE_FOLDER_ID = os.environ.get('CONTRACTS_DRIVE_FOLDER_ID', '')
 GOOGLE_CRED_FILE = os.environ.get(
-    'GOOGLE_CRED_FILE', '/home/promonta/agent/.sheets.json'
+    'GOOGLE_CRED_FILE', '/home/grandmont/agent/.sheets.json'
 )
 
 POLL_INTERVAL_SECONDS = int(os.environ.get('CONTRACT_INGEST_INTERVAL', '300'))  # 5 min
