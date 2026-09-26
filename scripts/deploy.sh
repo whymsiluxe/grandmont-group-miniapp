@@ -13,10 +13,11 @@
 # от РАЗНЫХ SHA после упавшего деплоя.
 #
 # Запуск: на VPS, из корня репозитория (/home/grandmont/agent/miniapp-repo), как
-# пользователь promonta -- НЕ через sudo/root:
+# пользователь grandmont -- НЕ через sudo/root:
 #   bash scripts/deploy.sh
-# (10.09, deploy permissions fix: /var/www/miniapp -- root:webdeploy 2775 setgid,
-# promonta -- член группы webdeploy, пишет туда напрямую без sudo. До этой правки
+# (10.09, deploy permissions fix; 26.09 Wave F, deployer switched promonta -> grandmont:
+# /var/www/miniapp -- root:webdeploy 2775 setgid, deployer is a member of webdeploy
+# group, пишет туда напрямую без sudo. До этой правки
 # скрипт требовал root целиком из-за frontend-шага; тот узкий сценарий больше не
 # нужен -- не запускать через sudo по старой памяти, это лишний root-доступ без
 # необходимости.)
@@ -37,7 +38,7 @@ source "$REPO_DIR/scripts/runtime_manifest.sh"
 # (/var/www/miniapp/) на момент написания этого скрипта.
 BACKEND_SERVING_DIR="/home/grandmont/agent/miniapp"
 FRONTEND_SERVING_DIR="/var/www/miniapp"
-SERVICE_NAME="grandmont-miniapp.service"
+SERVICE_NAME="grandmont-group-miniapp.service"
 HEALTH_URL="https://app.promonta.fun/api/health"
 HEALTH_READY_URL_LOCAL="http://127.0.0.1:8001/api/health/ready"
 

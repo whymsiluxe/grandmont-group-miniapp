@@ -12,7 +12,7 @@ source "$SCRIPT_DIR/runtime_manifest.sh"
 
 BACKEND_SERVING_DIR="/home/grandmont/agent/miniapp"
 FRONTEND_SERVING_DIR="/var/www/miniapp"
-SERVICE_NAME="grandmont-miniapp.service"
+SERVICE_NAME="grandmont-group-miniapp.service"
 HEALTH_URL="https://app.promonta.fun/api/health"
 
 # 11.09 (Phase 1): source manifest for BACKEND_PY_LIBS / BACKEND_JS_FILES / BACKEND_CORE_DIR
