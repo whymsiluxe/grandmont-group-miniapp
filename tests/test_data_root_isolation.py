@@ -45,7 +45,7 @@ class DataRootIsolationTests(unittest.TestCase):
         env = {
             **os.environ,
             'GRANDMONT_GROUP_ENV': 'test',
-            'MINIAPP_DATA_ROOT': '/home/promonta/agent/miniapp',
+            'MINIAPP_DATA_ROOT': '/home/grandmont/agent/miniapp',
             'BOT_TOKEN': 'ci-dummy',
         }
         # Run in a subprocess so sys.modules cache doesn't interfere
@@ -67,7 +67,7 @@ class DataRootIsolationTests(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != 'GRANDMONT_GROUP_ENV'}
         env.update({
             'PROMONTA_ENV': 'test',
-            'MINIAPP_DATA_ROOT': '/home/promonta/agent/miniapp',
+            'MINIAPP_DATA_ROOT': '/home/grandmont/agent/miniapp',
             'BOT_TOKEN': 'ci-dummy',
         })
         # Plain subprocess import (pytest not in sys.modules): only the env var can

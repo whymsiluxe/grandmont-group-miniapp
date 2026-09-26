@@ -79,17 +79,20 @@ class RepoTrackedToolsLibImportTests(unittest.TestCase):
             self.assertTrue(hasattr(module, name), f'tools_lib отсутствует {name}')
 
     def test_main_py_restores_original_global_sys_path_insert(self):
-        # main.py сам должен вставлять РОВНО '/home/promonta/agent' единственным
+        # main.py сам должен вставлять РОВНО AGENT_ROOT единственным
         # sys.path.insert верхнего уровня -- как было до commit effe2c5 (тот коммит
         # временно менял это на insert(0, backend_dir) + insert(1, agent_dir), что
         # глобально сдвинуло разрешение всех shared-модулей, включая roadmap_lib,
-        # и сломало 2 roadmap-теста). Проверяем сам исходник main.py, а не текущий
-        # sys.path теста -- этот тестовый файл сам делает свой insert(0, backend/)
-        # выше, так что live sys.path[0] в момент теста не показал бы регрессию.
+        # и сломало 2 roadmap-теста). Grandmont Group rebrand (Wave F, 26.09): литерал
+        # '/home/promonta/agent' заменён на AGENT_ROOT (env-configurable, default
+        # '/home/grandmont/agent') -- та же single-insert-first-position семантика,
+        # просто без hardcoded старого пути. Проверяем сам исходник main.py, а не
+        # текущий sys.path теста -- этот тестовый файл сам делает свой insert(0,
+        # backend/) выше, так что live sys.path[0] в момент теста не показал бы регрессию.
         with open(os.path.join(backend.BACKEND_DIR, 'main.py'), encoding='utf-8') as f:
             source = f.read()
         insert_lines = [line.strip() for line in source.splitlines() if 'sys.path.insert' in line]
-        self.assertEqual(insert_lines, ["sys.path.insert(0, '/home/promonta/agent')"])
+        self.assertEqual(insert_lines, ["sys.path.insert(0, AGENT_ROOT)"])
 
 
 class ToolsListRouteFallbackTests(unittest.TestCase):

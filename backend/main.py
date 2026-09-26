@@ -24,19 +24,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import base64
 from pydantic import BaseModel
 
-sys.path.insert(0, '/home/promonta/agent')
-
-# 30.07 (Инструменты cleanup, изолированный фикс): sys.path выше -- ГЛОБАЛЬНЫЙ и
-# специально ставит /home/promonta/agent первым, чтобы roadmap_lib/objekte_lib/другие
-# shared runtime-модули резолвились так же, как всегда (изменение этого порядка в
-# предыдущем коммите сломало 2 roadmap-теста -- откачено). tools_lib.py тем не менее
-# должен гарантированно грузиться из репозитория (backend/tools_lib.py), не из
-# untracked /home/promonta/agent/tools_lib.py -- решение точечное: загрузка по явному
-# пути к файлу через importlib.util, без малейшего влияния на глобальный sys.path.
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/promonta/agent/miniapp')
-
-
 def _env_compat(name: str, legacy_name: str, default=None):
     """Grandmont Group rebrand (26.09): env vars were renamed PROMONTA_* ->
     GRANDMONT_GROUP_*. The new name wins; the pre-rebrand name is still honoured so a
@@ -47,7 +34,19 @@ def _env_compat(name: str, legacy_name: str, default=None):
     return default if value is None else value
 
 
-AGENT_ROOT = _env_compat('GRANDMONT_GROUP_AGENT_ROOT', 'PROMONTA_AGENT_ROOT', '/home/promonta/agent')
+AGENT_ROOT = _env_compat('GRANDMONT_GROUP_AGENT_ROOT', 'PROMONTA_AGENT_ROOT', '/home/grandmont/agent')
+
+sys.path.insert(0, AGENT_ROOT)
+
+# 30.07 (Инструменты cleanup, изолированный фикс): sys.path выше -- ГЛОБАЛЬНЫЙ и
+# специально ставит AGENT_ROOT первым, чтобы roadmap_lib/objekte_lib/другие
+# shared runtime-модули резолвились так же, как всегда (изменение этого порядка в
+# предыдущем коммите сломало 2 roadmap-теста -- откачено). tools_lib.py тем не менее
+# должен гарантированно грузиться из репозитория (backend/tools_lib.py), не из
+# untracked AGENT_ROOT/tools_lib.py -- решение точечное: загрузка по явному
+# пути к файлу через importlib.util, без малейшего влияния на глобальный sys.path.
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/grandmont/agent/miniapp')
 # 17.09: default moved from AGENT_ROOT (external, untracked path) to BACKEND_DIR
 # -- both scripts are now tracked in backend/ (see scripts/manifest.sh) so a
 # clean clone + deploy is self-contained. Env override still works for anyone
@@ -56,7 +55,7 @@ CREATE_OBJECT_SCRIPT = _env_compat('GRANDMONT_GROUP_CREATE_OBJECT_SCRIPT', 'PROM
 CREATE_OBJECT_FOLDER_SCRIPT = _env_compat('GRANDMONT_GROUP_CREATE_OBJECT_FOLDER_SCRIPT', 'PROMONTA_CREATE_OBJECT_FOLDER_SCRIPT', os.path.join(BACKEND_DIR, 'create_object_folder.py'))
 TOOL_BOOKINGS_FILE = os.path.join(DATA_ROOT, 'tool_bookings.json')
 
-_PROD_DATA_ROOT = '/home/promonta/agent/miniapp'
+_PROD_DATA_ROOT = '/home/grandmont/agent/miniapp'
 _is_test_context = (
     _env_compat('GRANDMONT_GROUP_ENV', 'PROMONTA_ENV') == 'test'
     or 'pytest' in sys.modules
@@ -3200,7 +3199,7 @@ def create_rechnung(body: RechnungBody, user: dict = Depends(get_current_user), 
 
 
 # ---------- Weather feed ----------
-WEATHER_FEED_FILE = '/home/promonta/agent/.weather_feed.json'
+WEATHER_FEED_FILE = os.path.join(AGENT_ROOT, '.weather_feed.json')
 
 
 # moved to core/paths.py -- WEATHER_REACTIONS_FILE
@@ -3298,7 +3297,7 @@ def react_weather_entry(body: dict, user: dict = Depends(get_current_user)):
 
 # ---------- News feed (Фаза 9, 10.32 — лайки + read-tracking для адаптивной фильтрации) ----------
 # Наполняется отдельным cron-пайплайном на VPS (WebSearch/RSS → AI-саммари), здесь чтение + реакции.
-NEWS_FEED_FILE = '/home/promonta/agent/.news_feed.json'
+NEWS_FEED_FILE = os.path.join(AGENT_ROOT, '.news_feed.json')
 # moved to core/paths.py -- NEWS_REACTIONS_FILE
 # {post_id: {user_id: "like"|"dislike"}} — по одной реакции на пост от юзера, апдейт при повторном клике.
 # moved to core/paths.py -- NEWS_READS_FILE
@@ -5714,7 +5713,7 @@ def _call_claude_cli(messages: list, model: str) -> str:
     try:
         r = subprocess.run(
             [CLAUDE_BIN, '-p', '--model', model, prompt],
-            cwd='/home/promonta/agent', capture_output=True, stdin=subprocess.DEVNULL,
+            cwd=AGENT_ROOT, capture_output=True, stdin=subprocess.DEVNULL,
             text=True, timeout=120, env=_owner_ai_subprocess_env(),
         )
     except subprocess.TimeoutExpired:
