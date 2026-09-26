@@ -194,16 +194,16 @@ mkdir -p "$FRONTEND_SERVING_DIR"
 # 12.09: excluded frontend artifacts are deleted from production too. Plain
 # `--delete` protects excluded files on destination, so old app.html.bak-* and
 # even legacy .git/.bak directories stayed publicly reachable in /var/www/miniapp.
-# 26.09 (Wave F, deployer switched promonta -> grandmont): -a implies -g (preserve
-# group) and -p (preserve permissions), both of which made rsync try to chgrp/chmod
-# every already-existing destination file to the source's group/mode -- only a
-# file's owner or root may change its group or mode, so this failed non-atomically
-# on every file not already owned by the current deployer. -rltD is -a minus
-# -g/-o/-p (no group/owner/permission preservation); the destination's setgid bit
-# on /var/www/miniapp already assigns the right group to new files, and its 2775/664
-# baseline (set once by root) is what production actually wants regardless of
-# whatever mode the files happen to have in the repo checkout.
-rsync -rltD -v --delete --delete-excluded \
+# 26.09 (Wave F, deployer switched promonta -> grandmont): -a implies -g/-p/-t
+# (preserve group/permissions/times). All three made rsync try to chgrp/chmod/
+# touch the pre-existing destination root ("/var/www/miniapp" itself, owned by
+# root) or its files to match the source -- only a file's owner or root may do
+# that, so this failed non-atomically for anything the current deployer doesn't
+# own. -rlD is -a minus -g/-o/-p/-t (no group/owner/permission/time preservation);
+# the destination's setgid bit already assigns the right group to new files, and
+# its 2775/664 baseline (set once by root, reapplied below) is what production
+# actually wants regardless of the source's mode/mtime.
+rsync -rlD -v --delete --delete-excluded \
   --exclude='.git*' --exclude='.archived-legacy' --exclude='.archived-legacy/' \
   --exclude='.bak' --exclude='.bak/' --exclude='*.bak' --exclude='*.bak-*' \
   --exclude='*.corrupt-*' --exclude='*.old' --exclude='*~' \
