@@ -78,7 +78,7 @@ class TestConfigValidation:
         config = CoreIntegrationConfig(enabled=True, base_url='https://core.example.internal')
         client = GrandmontCoreClient(config=config, transport=None)
         with pytest.raises(CoreIntegrationError) as exc_info:
-            client.command('assign_worker', {})
+            client.command('assign_worker', {}, idempotency_key='req-no-transport')
         assert exc_info.value.kind == CoreErrorKind.CONFIG_INVALID
 
     def test_disabled_config_skips_validation_even_if_otherwise_invalid(self):
@@ -137,7 +137,30 @@ class TestEnabledModeWithFakeTransport:
         client.command('assign_worker', {}, idempotency_key='caller-supplied-key-123')
         assert seen['key'] == 'caller-supplied-key-123'
 
-    def test_missing_idempotency_key_is_generated_not_left_empty(self):
+    def test_missing_idempotency_key_is_rejected_not_generated(self):
+        """A silently client-generated key would defeat idempotency itself:
+        a caller retry (timeout, crash, double-submit) must reuse the SAME
+        key so Core recognizes the replay. Missing key is a caller bug --
+        fail loudly, never mint a fresh one."""
+        calls = []
+
+        def fake_transport(name, payload, key, timeout):
+            calls.append(key)
+            return {}
+
+        client = self._enabled_client(fake_transport)
+        with pytest.raises(CoreIntegrationError) as exc_info:
+            client.command('assign_worker', {})
+        assert exc_info.value.kind == CoreErrorKind.CONFIG_INVALID
+        assert calls == [], "transport must not be invoked when idempotency_key is missing"
+
+    def test_blank_idempotency_key_is_rejected(self):
+        client = self._enabled_client(lambda name, payload, key, timeout: {})
+        with pytest.raises(CoreIntegrationError) as exc_info:
+            client.command('assign_worker', {}, idempotency_key='   ')
+        assert exc_info.value.kind == CoreErrorKind.CONFIG_INVALID
+
+    def test_explicit_key_passed_unchanged(self):
         seen = {}
 
         def fake_transport(name, payload, key, timeout):
@@ -145,18 +168,9 @@ class TestEnabledModeWithFakeTransport:
             return {}
 
         client = self._enabled_client(fake_transport)
-        result = client.command('assign_worker', {})
-        assert seen['key']
-        assert result.idempotency_key == seen['key']
-
-    def test_two_calls_without_explicit_key_get_different_generated_keys(self):
-        def fake_transport(name, payload, key, timeout):
-            return {"key": key}
-
-        client = self._enabled_client(fake_transport)
-        r1 = client.command('assign_worker', {})
-        r2 = client.command('assign_worker', {})
-        assert r1.idempotency_key != r2.idempotency_key
+        result = client.command('assign_worker', {}, idempotency_key='caller-key-abc')
+        assert seen['key'] == 'caller-key-abc'
+        assert result.idempotency_key == 'caller-key-abc'
 
     def test_timeout_seconds_propagates_to_transport(self):
         seen = {}
@@ -167,7 +181,7 @@ class TestEnabledModeWithFakeTransport:
 
         config = CoreIntegrationConfig(enabled=True, base_url='https://core.example.internal', timeout_seconds=3.25)
         client = GrandmontCoreClient(config=config, transport=fake_transport)
-        client.command('assign_worker', {})
+        client.command('assign_worker', {}, idempotency_key='req-timeout-test')
         assert seen['timeout'] == 3.25
 
     def test_transport_timeout_error_is_wrapped(self):
@@ -176,7 +190,7 @@ class TestEnabledModeWithFakeTransport:
 
         client = self._enabled_client(failing_transport)
         with pytest.raises(CoreIntegrationError) as exc_info:
-            client.command('assign_worker', {})
+            client.command('assign_worker', {}, idempotency_key='req-timeout')
         assert exc_info.value.kind == CoreErrorKind.TIMEOUT
 
     def test_transport_generic_exception_is_wrapped_as_unavailable(self):
@@ -185,7 +199,7 @@ class TestEnabledModeWithFakeTransport:
 
         client = self._enabled_client(failing_transport)
         with pytest.raises(CoreIntegrationError) as exc_info:
-            client.command('assign_worker', {})
+            client.command('assign_worker', {}, idempotency_key='req-unavailable')
         assert exc_info.value.kind == CoreErrorKind.UNAVAILABLE
 
     def test_transport_raised_core_integration_error_passes_through_unchanged(self):
@@ -194,7 +208,7 @@ class TestEnabledModeWithFakeTransport:
 
         client = self._enabled_client(failing_transport)
         with pytest.raises(CoreIntegrationError) as exc_info:
-            client.command('assign_worker', {})
+            client.command('assign_worker', {}, idempotency_key='req-rejected')
         assert exc_info.value.kind == CoreErrorKind.REJECTED
 
 

@@ -21,7 +21,6 @@ whoever wires up the real client once Core's actual API exists.
 from __future__ import annotations
 
 import os
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -184,7 +183,20 @@ class GrandmontCoreClient:
             )
         self.config.validate()
 
-        key = idempotency_key or uuid.uuid4().hex
+        # Idempotency key must be caller-supplied, never generated here. A
+        # silently-generated key defeats the whole point of idempotency: a
+        # caller-side retry (network timeout, crash, double-submit) needs to
+        # reuse the SAME key so Core can recognize the replay -- if this
+        # client minted a fresh one on a missing key, every retry would look
+        # like a brand-new command to Core. Fail loudly instead of hiding
+        # that bug behind a client-generated key.
+        if not idempotency_key or not idempotency_key.strip():
+            raise CoreIntegrationError(
+                CoreErrorKind.CONFIG_INVALID,
+                f"idempotency_key is required for command {name!r} -- "
+                "the caller must supply and reuse the same key across retries",
+            )
+        key = idempotency_key
 
         if self.transport is None:
             raise CoreIntegrationError(
