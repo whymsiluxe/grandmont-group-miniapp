@@ -194,7 +194,14 @@ mkdir -p "$FRONTEND_SERVING_DIR"
 # 12.09: excluded frontend artifacts are deleted from production too. Plain
 # `--delete` protects excluded files on destination, so old app.html.bak-* and
 # even legacy .git/.bak directories stayed publicly reachable in /var/www/miniapp.
-rsync -av --delete --delete-excluded \
+# 26.09 (Wave F, deployer switched promonta -> grandmont): -a implies -g (preserve
+# group), which made rsync try to chgrp every already-existing destination file to
+# the deployer's own group -- only the file's owner or root may do that, so it
+# failed non-atomically on every file not already owned by the current deployer.
+# -rlptD is -a minus -g/-o (no group/owner preservation); the destination's setgid
+# bit on /var/www/miniapp already assigns the right group to new files, and existing
+# files keep whatever group chown set them to -- no chgrp needed either way.
+rsync -rlptD -v --delete --delete-excluded \
   --exclude='.git*' --exclude='.archived-legacy' --exclude='.archived-legacy/' \
   --exclude='.bak' --exclude='.bak/' --exclude='*.bak' --exclude='*.bak-*' \
   --exclude='*.corrupt-*' --exclude='*.old' --exclude='*~' \
