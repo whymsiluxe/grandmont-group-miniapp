@@ -35,3 +35,20 @@ All optional; unset = pre-rebrand behaviour. `main.py` (`_env_compat`) and `scri
 | `GRANDMONT_GROUP_CREATE_OBJECT_SCRIPT` / `..._FOLDER_SCRIPT` | `PROMONTA_CREATE_OBJECT_SCRIPT` / `..._FOLDER_SCRIPT` | object-creation script overrides |
 | `GRANDMONT_GROUP_CONTACT_EMAIL` | — | Angebot PDF contact email. LEGACY_CONTACT_DOMAIN / DOMAIN_COMPAT_PENDING: unset -> current `anfragen@promonta-bau.de` |
 | `GRANDMONT_GROUP_LOGO_PATH` | — | Rechnung PDF logo; default `backend/grandmont-group-logo.png`, text wordmark if missing |
+
+## Grandmont Core workforce shadow integration (27.09)
+
+All optional; unset/`false` = 100% current behavior, zero network calls, zero
+log lines from the integration (`backend/core/grandmont_core_client.py` /
+`backend/core/workforce_shadow.py`). No legacy `PROMONTA_*` fallback — this
+integration didn't exist before the rebrand. **Do not set
+`CORE_INTEGRATION_ENABLED=true` in production without explicit owner
+approval** — even enabled, the Mini legacy path stays authoritative
+(shadow-mode only); see `docs/DECISIONS.md`.
+
+| Variable | Required when enabled? | Purpose |
+|---|---|---|
+| `CORE_INTEGRATION_ENABLED` | — | `true`/`1`/`yes`/`on` to enable; anything else (including unset) is disabled |
+| `CORE_BASE_URL` | Yes | Core service base URL. Never hardcoded in code. |
+| `CORE_SERVICE_CREDENTIAL` | Yes | Sent as `X-Core-Service-Token` header on every Core request; never logged, never included in raised exception messages |
+| `CORE_TIMEOUT_SECONDS` | No (default `5.0`) | Per-request timeout to Core; must be `> 0` when enabled |

@@ -189,6 +189,21 @@ Wizard screen merges are still open.
   revisit if concurrency/reporting needs grow.
 - No CRM layer (clients/leads/deals) — out of scope so far, P3 idea only.
 
+## 2026-09-27 Core workforce shadow integration
+
+Branch `claude/admiring-fermi-wrjyrm` off `main`@`fd30a52` implements the real
+HTTP transport in `backend/core/grandmont_core_client.py` (previously an
+inert seam, disabled by default) against the authoritative Grandmont Core
+API contract, plus a new `backend/core/workforce_shadow.py` wired as
+best-effort shadow reads/writes into `GET /api/my-assignments` and
+`POST /api/abwesenheit`. `CORE_INTEGRATION_ENABLED` stays unset — no
+production behavior change, nothing deployed. Scope: worker identity
+resolution (Telegram id -> Core Worker UUID), worker-facing assignment
+shadow reads, worker-created absence shadow create. DailyPlan, checkin,
+execution, and CRM are untouched. See `docs/DECISIONS.md` (27.09 entry) and
+`docs/CHANGELOG.md` (27.09 entry) for full detail. Full suite: `1262 passed,
+1 skipped`, plus 1 pre-existing unrelated `rsync`-tooling failure.
+
 ## Where to look next
 
 - Active/actionable work: [BACKLOG.md](BACKLOG.md).

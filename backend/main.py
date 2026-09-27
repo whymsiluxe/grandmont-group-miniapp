@@ -267,6 +267,14 @@ except ImportError:
         ABWESENHEIT_FILE,
     )
 
+# Core workforce shadow integration (Mini <-> Grandmont Core, disabled by
+# default via CORE_INTEGRATION_ENABLED). Same relative-then-absolute import
+# fallback as every other core.* submodule above.
+try:
+    from .core.workforce_shadow import shadow_compare_assignments, shadow_create_absence
+except ImportError:
+    from core.workforce_shadow import shadow_compare_assignments, shadow_create_absence  # noqa: E402
+
 # Phase A step 3: numeric limits/TTLs moved to backend/core/limits.py.
 try:
     from .core.limits import (
@@ -3118,6 +3126,7 @@ _objects_router, _objects_handlers = create_objects_router(ObjectsRouteDeps(
     require_server_script=lambda script_path, label: _require_server_script(script_path, label),
     create_object_script=lambda: CREATE_OBJECT_SCRIPT,
     create_object_folder_script=lambda: CREATE_OBJECT_FOLDER_SCRIPT,
+    shadow_compare_assignments=lambda uid, result: shadow_compare_assignments(uid, result),
 ))
 # Canonical router registration: tests and manifests flatten _IncludedRouter
 # through tests.conftest.iter_app_routes()/equivalent production-package smoke.
@@ -7704,6 +7713,10 @@ def create_abwesenheit(body: AbwesenheitBody, user: dict = Depends(get_current_u
     # владельцем) писала свой снимок поверх, и одна из двух заявок исчезала.
     update_json_transaction(ABWESENHEIT_FILE, [], lambda items: items.append(entry))
     _notify_owner_abwesenheit_pending(entry)
+    try:
+        shadow_create_absence(user['id'], entry)
+    except Exception:
+        pass  # Core shadow create is best-effort, must never affect the legacy response
     return entry
 
 

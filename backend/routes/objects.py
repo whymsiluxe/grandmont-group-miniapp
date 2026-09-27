@@ -115,6 +115,7 @@ class ObjectsRouteDeps:
     require_server_script: Callable
     create_object_script: Callable
     create_object_folder_script: Callable
+    shadow_compare_assignments: Callable | None = None
 
 
 def create_objects_router(deps: ObjectsRouteDeps):
@@ -239,6 +240,11 @@ def create_objects_router(deps: ObjectsRouteDeps):
                     "task_note": a.get('task_note', ''),
                 })
         result.sort(key=lambda r: r['date_from'] or '', reverse=True)
+        if deps.shadow_compare_assignments:
+            try:
+                deps.shadow_compare_assignments(uid, result)
+            except Exception:
+                pass  # Core shadow comparison is best-effort, never worker-facing
         return {"assignments": result}
 
     @router.get("/api/objects/{object_id}/history")

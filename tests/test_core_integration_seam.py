@@ -74,6 +74,32 @@ class TestConfigValidation:
             config.validate()
         assert exc_info.value.kind == CoreErrorKind.CONFIG_INVALID
 
+    def test_enabled_without_service_credential_is_invalid(self):
+        config = CoreIntegrationConfig(
+            enabled=True, base_url='https://core.example.internal', service_credential='',
+        )
+        with pytest.raises(CoreIntegrationError) as exc_info:
+            config.validate()
+        assert exc_info.value.kind == CoreErrorKind.CONFIG_INVALID
+
+    def test_enabled_missing_credential_rejected_before_network(self):
+        """CONFIG_INVALID must be raised by command() itself (via
+        _ensure_enabled) before any transport is ever touched."""
+        calls = []
+
+        def fake_transport(name, payload, key, timeout):
+            calls.append((name, payload, key, timeout))
+            return {}
+
+        config = CoreIntegrationConfig(
+            enabled=True, base_url='https://core.example.internal', service_credential='',
+        )
+        client = GrandmontCoreClient(config=config, transport=fake_transport)
+        with pytest.raises(CoreIntegrationError) as exc_info:
+            client.command('assign_worker', {}, idempotency_key='req-1')
+        assert exc_info.value.kind == CoreErrorKind.CONFIG_INVALID
+        assert calls == []
+
     def test_enabled_with_base_url_and_no_transport_is_config_invalid(self):
         config = CoreIntegrationConfig(enabled=True, base_url='https://core.example.internal')
         client = GrandmontCoreClient(config=config, transport=None)
@@ -113,7 +139,10 @@ class TestConfigValidation:
 
 class TestEnabledModeWithFakeTransport:
     def _enabled_client(self, transport):
-        config = CoreIntegrationConfig(enabled=True, base_url='https://core.example.internal', timeout_seconds=1.0)
+        config = CoreIntegrationConfig(
+            enabled=True, base_url='https://core.example.internal',
+            service_credential='test-credential', timeout_seconds=1.0,
+        )
         return GrandmontCoreClient(config=config, transport=transport)
 
     def test_successful_command_returns_ok_result(self):
@@ -179,7 +208,10 @@ class TestEnabledModeWithFakeTransport:
             seen['timeout'] = timeout
             return {}
 
-        config = CoreIntegrationConfig(enabled=True, base_url='https://core.example.internal', timeout_seconds=3.25)
+        config = CoreIntegrationConfig(
+            enabled=True, base_url='https://core.example.internal',
+            service_credential='test-credential', timeout_seconds=3.25,
+        )
         client = GrandmontCoreClient(config=config, transport=fake_transport)
         client.command('assign_worker', {}, idempotency_key='req-timeout-test')
         assert seen['timeout'] == 3.25

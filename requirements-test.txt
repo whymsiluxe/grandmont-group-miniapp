@@ -9,3 +9,8 @@ fastapi==0.139.0
 pydantic==2.13.4
 python-multipart==0.0.32
 python-magic==0.4.27
+# httpx: already a backend/requirements.txt dependency (grandmont_core_client's
+# CoreHttpTransport imports it lazily, only when Core integration is enabled).
+# Listed here too because tests/test_core_http_transport.py exercises the real
+# transport directly via httpx.MockTransport (no real network call).
+httpx==0.28.1
