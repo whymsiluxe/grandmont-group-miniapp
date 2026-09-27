@@ -8,6 +8,7 @@ Run:
 """
 import os
 import sys
+import tempfile
 import unittest
 import unittest.mock
 from unittest.mock import patch
@@ -111,30 +112,48 @@ class OnboardingCompletionValidationTests(unittest.TestCase):
 # ---------- Owner-only skill verification ----------
 
 class SkillVerificationTests(unittest.TestCase):
+    """25.09 (fix/miniapp-profile-rmw-outbox-retry): verify_worker_skill now does
+    its read-modify-write under update_json_transaction (Issue 1 fix -- see
+    storage.py), which reads WORKER_PROFILES_FILE directly instead of going
+    through _load_worker_profiles()/_save_worker_profiles(). Mocking those two
+    functions (the old pattern) is no longer honored by the mutation path, so
+    these tests now seed real fixture state into an isolated temp file instead
+    -- same reassign-and-restore pattern as test_ui_fix_round_tofu_names.py."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='grandmont-group-test-skillverify-')
+        self._saved_attrs = {
+            name: getattr(backend, name) for name in ('WORKER_PROFILES_FILE',)
+        }
+        backend.WORKER_PROFILES_FILE = os.path.join(self._tmp, 'worker_profiles.json')
+
+    def tearDown(self):
+        for name, value in self._saved_attrs.items():
+            setattr(backend, name, value)
+
     def test_owner_can_verify_skill(self):
         profile = {'skills_v2': [{'skill_id': 'tile_work', 'level': 'master', 'verified': False}]}
-        with patch.object(backend, '_load_worker_profiles', return_value={'10': profile}), \
-             patch.object(backend, '_save_worker_profiles'):
-            result = backend.verify_worker_skill(
-                '10', 'tile_work', backend.SkillVerificationBody(verified=True), user=OWNER, _=None,
-            )
+        backend._save_worker_profiles({'10': profile})
+        result = backend.verify_worker_skill(
+            '10', 'tile_work', backend.SkillVerificationBody(verified=True), user=OWNER, _=None,
+        )
         self.assertTrue(result['verified'])
 
     def test_verify_nonexistent_skill_404(self):
         profile = {'skills_v2': []}
-        with patch.object(backend, '_load_worker_profiles', return_value={'10': profile}):
-            with self.assertRaises(HTTPException) as ctx:
-                backend.verify_worker_skill(
-                    '10', 'tile_work', backend.SkillVerificationBody(verified=True), user=OWNER, _=None,
-                )
+        backend._save_worker_profiles({'10': profile})
+        with self.assertRaises(HTTPException) as ctx:
+            backend.verify_worker_skill(
+                '10', 'tile_work', backend.SkillVerificationBody(verified=True), user=OWNER, _=None,
+            )
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_verify_nonexistent_profile_404(self):
-        with patch.object(backend, '_load_worker_profiles', return_value={}):
-            with self.assertRaises(HTTPException) as ctx:
-                backend.verify_worker_skill(
-                    '999', 'tile_work', backend.SkillVerificationBody(verified=True), user=OWNER, _=None,
-                )
+        backend._save_worker_profiles({})
+        with self.assertRaises(HTTPException) as ctx:
+            backend.verify_worker_skill(
+                '999', 'tile_work', backend.SkillVerificationBody(verified=True), user=OWNER, _=None,
+            )
         self.assertEqual(ctx.exception.status_code, 404)
 
 
@@ -786,10 +805,27 @@ class DeployRollbackNewModulesTests(unittest.TestCase):
 # ---------- Profile stats skills_v2 (доп.раунд П2) ----------
 
 class ProfileStatsSkillsV2Tests(unittest.TestCase):
+    """25.09 (fix/miniapp-profile-rmw-outbox-retry): profile_stats calls
+    _get_worker_skills_v2(), whose legacy-skills_v2-migration RMW now goes
+    through update_json_transaction directly against WORKER_PROFILES_FILE
+    (Issue 1 fix) -- mocking _load_worker_profiles no longer seeds what that
+    call reads. Seed real fixture state into an isolated temp file instead."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='grandmont-group-test-profilestats-')
+        self._saved_attrs = {
+            name: getattr(backend, name) for name in ('WORKER_PROFILES_FILE',)
+        }
+        backend.WORKER_PROFILES_FILE = os.path.join(self._tmp, 'worker_profiles.json')
+
+    def tearDown(self):
+        for name, value in self._saved_attrs.items():
+            setattr(backend, name, value)
+
     def test_profile_stats_returns_skills_v2(self):
         profile = {'name': 'Ivan', 'skills_v2': [{'skill_id': 'tile_work', 'level': 'master', 'verified': True}]}
+        backend._save_worker_profiles({'10': profile})
         with patch.object(backend, '_load_checkin_meta', return_value=[]), \
-             patch.object(backend, '_load_worker_profiles', return_value={'10': profile}), \
              patch.object(backend, '_load_roles', return_value={'10': 'worker'}), \
              patch.object(backend, '_load_abwesenheit', return_value=[]):
             result = backend.profile_stats(user_id='10', period='week', user=OWNER, role='owner')
@@ -799,9 +835,8 @@ class ProfileStatsSkillsV2Tests(unittest.TestCase):
 
     def test_profile_stats_migrates_legacy_skills(self):
         profile = {'name': 'Ivan', 'skills': ['Плитка']}
+        backend._save_worker_profiles({'10': profile})
         with patch.object(backend, '_load_checkin_meta', return_value=[]), \
-             patch.object(backend, '_load_worker_profiles', return_value={'10': profile}), \
-             patch.object(backend, '_save_worker_profiles'), \
              patch.object(backend, '_load_roles', return_value={'10': 'worker'}), \
              patch.object(backend, '_load_abwesenheit', return_value=[]):
             result = backend.profile_stats(user_id='10', period='week', user=OWNER, role='owner')
@@ -811,19 +846,36 @@ class ProfileStatsSkillsV2Tests(unittest.TestCase):
 # ---------- Verified preservation on skill edit (доп.раунд П3) ----------
 
 class VerifiedPreservationTests(unittest.TestCase):
+    """25.09 (fix/miniapp-profile-rmw-outbox-retry): same reason as
+    SkillVerificationTests above -- update_my_profile's RMW now goes through
+    update_json_transaction directly against WORKER_PROFILES_FILE, so mocking
+    _load_worker_profiles/_save_worker_profiles no longer seeds/observes what
+    the mutation actually reads/writes. Seed real fixture state into an
+    isolated temp file instead."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='grandmont-group-test-verifiedpres-')
+        self._saved_attrs = {
+            name: getattr(backend, name) for name in ('WORKER_PROFILES_FILE',)
+        }
+        backend.WORKER_PROFILES_FILE = os.path.join(self._tmp, 'worker_profiles.json')
+
+    def tearDown(self):
+        for name, value in self._saved_attrs.items():
+            setattr(backend, name, value)
+
     def test_unchanged_skill_keeps_verified(self):
         profile = {'skills_v2': [
             {'skill_id': 'tile_work', 'level': 'master', 'verified': True},
             {'skill_id': 'painting', 'level': 'independent', 'verified': True},
         ]}
-        with patch.object(backend, '_load_worker_profiles', return_value={'10': profile}), \
-             patch.object(backend, '_save_worker_profiles'):
-            # worker меняет уровень painting, tile_work остаётся тем же
-            body = backend.ProfileUpdateBody(skills_v2=[
-                backend.SkillV2Body(skill_id='tile_work', level='master'),
-                backend.SkillV2Body(skill_id='painting', level='master', verified=True),  # verified от worker игнорируется
-            ])
-            result = backend.update_my_profile(body, user=WORKER_A)
+        backend._save_worker_profiles({'10': profile})
+        # worker меняет уровень painting, tile_work остаётся тем же
+        body = backend.ProfileUpdateBody(skills_v2=[
+            backend.SkillV2Body(skill_id='tile_work', level='master'),
+            backend.SkillV2Body(skill_id='painting', level='master', verified=True),  # verified от worker игнорируется
+        ])
+        result = backend.update_my_profile(body, user=WORKER_A)
         tile = next(s for s in result['skills_v2'] if s['skill_id'] == 'tile_work')
         painting = next(s for s in result['skills_v2'] if s['skill_id'] == 'painting')
         self.assertTrue(tile['verified'])  # неизменён -- сохранил verified
@@ -831,13 +883,12 @@ class VerifiedPreservationTests(unittest.TestCase):
 
     def test_new_skill_gets_verified_false(self):
         profile = {'skills_v2': [{'skill_id': 'tile_work', 'level': 'master', 'verified': True}]}
-        with patch.object(backend, '_load_worker_profiles', return_value={'10': profile}), \
-             patch.object(backend, '_save_worker_profiles'):
-            body = backend.ProfileUpdateBody(skills_v2=[
-                backend.SkillV2Body(skill_id='tile_work', level='master'),
-                backend.SkillV2Body(skill_id='painting', level='helper'),
-            ])
-            result = backend.update_my_profile(body, user=WORKER_A)
+        backend._save_worker_profiles({'10': profile})
+        body = backend.ProfileUpdateBody(skills_v2=[
+            backend.SkillV2Body(skill_id='tile_work', level='master'),
+            backend.SkillV2Body(skill_id='painting', level='helper'),
+        ])
+        result = backend.update_my_profile(body, user=WORKER_A)
         painting = next(s for s in result['skills_v2'] if s['skill_id'] == 'painting')
         self.assertFalse(painting['verified'])
 
@@ -846,12 +897,11 @@ class VerifiedPreservationTests(unittest.TestCase):
             {'skill_id': 'tile_work', 'level': 'master', 'verified': True},
             {'skill_id': 'painting', 'level': 'independent', 'verified': True},
         ]}
-        with patch.object(backend, '_load_worker_profiles', return_value={'10': profile}), \
-             patch.object(backend, '_save_worker_profiles'):
-            body = backend.ProfileUpdateBody(skills_v2=[
-                backend.SkillV2Body(skill_id='tile_work', level='master'),
-            ])
-            result = backend.update_my_profile(body, user=WORKER_A)
+        backend._save_worker_profiles({'10': profile})
+        body = backend.ProfileUpdateBody(skills_v2=[
+            backend.SkillV2Body(skill_id='tile_work', level='master'),
+        ])
+        result = backend.update_my_profile(body, user=WORKER_A)
         ids = [s['skill_id'] for s in result['skills_v2']]
         self.assertEqual(ids, ['tile_work'])
 
@@ -863,14 +913,13 @@ class VerifiedPreservationTests(unittest.TestCase):
             {'skill_id': 'painting', 'level': 'independent', 'verified': True},
             {'skill_id': 'plastering', 'level': 'helper', 'verified': True},
         ]}
-        with patch.object(backend, '_load_worker_profiles', return_value={'10': profile}), \
-             patch.object(backend, '_save_worker_profiles'):
-            body = backend.ProfileUpdateBody(skills_v2=[
-                backend.SkillV2Body(skill_id='tile_work', level='master'),
-                backend.SkillV2Body(skill_id='painting', level='independent'),
-                backend.SkillV2Body(skill_id='plastering', level='master'),  # только этот меняется
-            ])
-            result = backend.update_my_profile(body, user=WORKER_A)
+        backend._save_worker_profiles({'10': profile})
+        body = backend.ProfileUpdateBody(skills_v2=[
+            backend.SkillV2Body(skill_id='tile_work', level='master'),
+            backend.SkillV2Body(skill_id='painting', level='independent'),
+            backend.SkillV2Body(skill_id='plastering', level='master'),  # только этот меняется
+        ])
+        result = backend.update_my_profile(body, user=WORKER_A)
         by_id = {s['skill_id']: s for s in result['skills_v2']}
         self.assertTrue(by_id['tile_work']['verified'])
         self.assertTrue(by_id['painting']['verified'])
