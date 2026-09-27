@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import logging
 import math
 import os
 import re
@@ -836,22 +837,32 @@ def list_workers(user: dict = Depends(get_current_user)):
     # default here makes those filters correct automatically, no frontend change
     # needed for the worker-picker call sites. `access_granted` is new, additive --
     # existing consumers reading only `role`/`name` are unaffected.
-    all_ids = set(roles.keys()) | set(profiles.keys())
+    all_ids = set(roles.keys() if isinstance(roles, dict) else []) | set(profiles.keys() if isinstance(profiles, dict) else [])
     workers = []
     for uid in all_ids:
-        p = profiles.get(uid, {})
-        last_seen = _last_seen.get(uid)
-        role = roles.get(uid)  # None if not in roles.json -- no more silent 'worker' default
-        workers.append({
-            'user_id': uid,
-            'role': role,
-            'access_granted': role is not None,
-            'name': _sanitize_display_name(p.get('name'), uid),
-            'skills': p.get('skills', []),
-            'has_avatar': bool(p.get('avatar')),
-            'quiz_completed': p.get('quiz_completed', False),
-            'online': bool(last_seen and (time.time() - last_seen) < ONLINE_THRESHOLD_SECONDS),
-        })
+        try:
+            p = profiles.get(uid) if isinstance(profiles, dict) else None
+            if not isinstance(p, dict):
+                p = {}
+            last_seen = _last_seen.get(uid)
+            role = roles.get(uid) if isinstance(roles, dict) else None  # None if not in roles.json -- no more silent 'worker' default
+            skills = p.get('skills', [])
+            workers.append({
+                'user_id': uid,
+                'role': role,
+                'access_granted': role is not None,
+                'name': _sanitize_display_name(p.get('name'), uid),
+                'skills': skills if isinstance(skills, list) else [],
+                'has_avatar': bool(p.get('avatar')),
+                'quiz_completed': bool(p.get('quiz_completed', False)),
+                'online': bool(last_seen and (time.time() - last_seen) < ONLINE_THRESHOLD_SECONDS),
+            })
+        except Exception:
+            # 27.09 (owner report: Workers screen not loading): one malformed
+            # roles/worker_profiles entry must not take down the whole roster --
+            # skip just that uid, never the profile content (could carry PII).
+            logging.getLogger('grandmont.workers').warning("workers: skipping malformed entry for uid=%s", uid)
+            continue
     return {'workers': workers}
 
 
@@ -1774,6 +1785,8 @@ def _serialize_object_for_worker(obj: dict, viewer_user_id: str, obj_assignments
     public_team = []
     my_assignments = []
     for a in obj_assignments:
+        if not isinstance(a, dict):
+            continue
         uid = str(a.get('user_id'))
         if uid == viewer_user_id:
             my_assignments.append(user_info_fn(uid, a))
@@ -2964,7 +2977,11 @@ def _object_info_entry(object_id: str) -> dict:
 
 @app.get("/api/objects/{object_id}/documents")
 def get_object_documents(object_id: str, user: dict = Depends(get_current_user), _: None = Depends(require_object_access)):
-    return {"documents": _object_info_entry(object_id).get("documents", [])}
+    entry = _object_info_entry(object_id)
+    if not isinstance(entry, dict):
+        entry = {}
+    docs = entry.get("documents", [])
+    return {"documents": [d for d in docs if isinstance(d, dict)] if isinstance(docs, list) else []}
 
 
 @app.post("/api/objects/{object_id}/documents")
@@ -3013,17 +3030,19 @@ async def upload_object_document(object_id: str, file: UploadFile = File(...), u
 def delete_object_document(object_id: str, doc_id: str, user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
     def _mutator(data):
         entry = data.get(object_id)
-        if not entry:
+        if not isinstance(entry, dict):
             raise HTTPException(404, "Не найдено")
-        doc = next((d for d in entry.get("documents", []) if d["id"] == doc_id), None)
+        docs = entry.get("documents", [])
+        docs = docs if isinstance(docs, list) else []
+        doc = next((d for d in docs if isinstance(d, dict) and d.get("id") == doc_id), None)
         if not doc:
             raise HTTPException(404, "Не найдено")
-        entry["documents"] = [d for d in entry.get("documents", []) if d["id"] != doc_id]
+        entry["documents"] = [d for d in docs if not (isinstance(d, dict) and d.get("id") == doc_id)]
         return doc
 
     doc = update_json_transaction(OBJECT_INFO_FILE, {}, _mutator)
-    fpath = os.path.join(OBJECT_DOC_DIR, doc["file"])
-    if os.path.exists(fpath):
+    fpath = os.path.join(OBJECT_DOC_DIR, doc.get("file", ""))
+    if doc.get("file") and os.path.exists(fpath):
         os.remove(fpath)
     return {"status": "ok"}
 
@@ -3031,7 +3050,9 @@ def delete_object_document(object_id: str, doc_id: str, user: dict = Depends(get
 @app.get("/api/objects/{object_id}/documents/{fname}/file")
 def get_object_document_file(object_id: str, fname: str, user: dict = Depends(get_current_user), _: None = Depends(require_object_access)):
     entry = _object_info_entry(object_id)
-    doc = next((d for d in entry.get("documents", []) if d["file"] == fname), None)
+    docs = entry.get("documents", []) if isinstance(entry, dict) else []
+    docs = docs if isinstance(docs, list) else []
+    doc = next((d for d in docs if isinstance(d, dict) and d.get("file") == fname), None)
     if not doc:
         raise HTTPException(404, "Файл не найден")
     path = os.path.join(OBJECT_DOC_DIR, fname)

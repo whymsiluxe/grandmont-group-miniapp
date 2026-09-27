@@ -15,7 +15,16 @@ let _touchStartOnExcludedEl = false;
 // period-pills) помечаются этим атрибутом сразу при создании, а не патчатся здесь централизованно.
 function _isExcludedSwipeTarget(target) {
   const el = target instanceof Element ? target : target?.parentElement;
-  return !!el?.closest?.('[data-no-swipe], .mangel-card, .mangel-kanban, .doc-type-switch, .chat-category-tabs, .nav-item-start, #radio-fab, .checkin-status-modal, .feed-photo-img-wrap, #view-object-detail, .obj-filter-row, .filters, .profile-tabs, .profile-period-pills, .wx-city-tabs, .wx-object-tabs, .home-radio-stations-viewport, .chat-bubble');
+  // 27.09 (owner report: skill-add sheet "closing" from a stray tap/scroll):
+  // .bottom-sheet-overlay is a FULL-SCREEN fixed layer -- any tap above the
+  // panel (empty backdrop area) or a horizontal-ish drag while scrolling the
+  // panel's content is still, structurally, a touch on this document-level
+  // listener. It was never excluded, so a swipe-shaped gesture anywhere on an
+  // open bottom sheet (skills, assignment, edit-period/work-type, etc.) could
+  // fire a real view switch underneath it -- looking, to the user, exactly
+  // like the sheet "closing" itself. Excluding the shared overlay class once
+  // here covers every current and future sheet built on it, not just this one.
+  return !!el?.closest?.('[data-no-swipe], .bottom-sheet-overlay, .mangel-card, .mangel-kanban, .doc-type-switch, .chat-category-tabs, .nav-item-start, #radio-fab, .checkin-status-modal, .feed-photo-img-wrap, #view-object-detail, .obj-filter-row, .filters, .profile-tabs, .profile-period-pills, .wx-city-tabs, .wx-object-tabs, .home-radio-stations-viewport, .chat-bubble');
 }
 
 function animateSwipeTransition(fromViewName, toViewName, direction) {

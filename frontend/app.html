@@ -1264,6 +1264,17 @@ header h1 {
   background: transparent;
   padding: 0.5rem 1rem 0.25rem;
 }
+/* 27.09: the skills sheet's list can be long (all groups always expanded, no
+   accordion) -- its primary action stays reachable at the bottom of the
+   panel without needing a scroll-to-bottom, per the modal-close-behavior fix
+   (explicit action button should be easy to reach, not just present). */
+.profile-skills-sheet .form-submit-bar {
+  position: sticky;
+  bottom: 0;
+  background: var(--bg-card);
+  border-top: 1px solid var(--border-color);
+  padding: 0.6rem 1rem calc(0.6rem + env(safe-area-inset-bottom));
+}
 /* .mangel-form по умолчанию рисует себя как отдельную карточку (свой фон/margin/radius) --
    внутри bottom sheet это давало card-в-card (двойной фон, лишние отступы). Sheet сама уже
    карточка, форма внутри неё должна быть просто контентом. */
@@ -4243,39 +4254,39 @@ body.chat-reply-active .chat-messages::after {
   background: var(--accent); color: #000; border: none; border-radius: var(--radius-md);
   padding: 0.4rem 0.9rem; margin-top: 0.5rem; cursor: pointer;
 }
-.skill-picker-featured-label, .skill-picker-all-label {
+.skill-picker-all-label {
   font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
   color: var(--text-light); margin: 0.5rem 0 0.5rem;
 }
-.skill-picker-featured-grid {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; margin-bottom: 0.75rem;
-}
-.skill-picker-featured-card {
-  position: relative; min-height: 64px; display: flex; align-items: center; justify-content: center;
-  text-align: center; padding: 0.8rem; border-radius: var(--radius-md); border: 2px solid var(--border-color);
-  background: var(--bg-card); color: var(--text-main); font-size: 0.92rem; font-weight: 600; cursor: pointer;
-}
-.skill-picker-featured-card.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--bg-card)); }
 .skill-picker-check { position: absolute; top: 6px; right: 8px; color: var(--accent); font-weight: 800; }
 .skill-picker-search-input {
   width: 100%; box-sizing: border-box; padding: 0.7rem 0.9rem; margin-bottom: 0.5rem;
   border: 1px solid var(--border-color); border-radius: var(--radius-md);
   background: var(--bg-card); color: var(--text-main); font-size: 0.95rem;
 }
-.skill-picker-groups { display: flex; flex-direction: column; gap: 0.4rem; }
-.skill-picker-group { border: 1px solid var(--border-color); border-radius: var(--radius-md); overflow: hidden; }
+/* 27.09: redesigned single scrollable grouped list, replaces the old one-open-
+   accordion + separate "Часто используемые" grid. Headers stick to the top of
+   the scrolling sheet while their section's rows scroll underneath. */
+.skill-picker-groups { display: flex; flex-direction: column; gap: 0.15rem; }
+.skill-picker-group { border-bottom: 1px solid var(--border-color); }
+.skill-picker-group:last-child { border-bottom: none; }
 .skill-picker-group-header {
-  width: 100%; display: flex; align-items: center; gap: 0.5rem; padding: 0.75rem 0.9rem;
-  background: var(--bg-card); border: none; color: var(--text-main); font-size: 0.95rem; font-weight: 600;
-  cursor: pointer; text-align: left;
+  position: sticky; top: 0; z-index: 1;
+  display: flex; align-items: center; gap: 0.5rem; padding: 0.55rem 0.4rem;
+  background: var(--bg-card); font-size: 0.85rem; font-weight: 700;
+  color: var(--text-light); text-transform: uppercase; letter-spacing: 0.04em;
 }
-.skill-picker-group-header span:first-child { flex: 1; }
+.skill-picker-group-name { flex: 1; }
+.skill-picker-group-select-all {
+  width: 26px; height: 26px; flex: none; display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-main, var(--bg-card));
+  color: var(--accent); font-size: 1rem; line-height: 1; cursor: pointer; padding: 0;
+}
 .skill-picker-group-badge {
   background: var(--accent); color: #000; font-size: 0.75rem; font-weight: 700;
-  border-radius: 999px; padding: 0.1rem 0.5rem;
+  border-radius: 999px; padding: 0.1rem 0.5rem; text-transform: none; letter-spacing: normal;
 }
-.skill-picker-group-chevron { color: var(--text-light); }
-.skill-picker-group-body { padding: 0.3rem 0.5rem 0.5rem; display: flex; flex-direction: column; gap: 0.25rem; }
+.skill-picker-group-body { padding: 0.1rem 0.1rem 0.4rem; display: flex; flex-direction: column; gap: 0.1rem; }
 .skill-picker-row, .skill-picker-search-results .skill-picker-row {
   display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;
   padding: 0.65rem 0.75rem; border: none; border-radius: var(--radius-sm, 6px);
