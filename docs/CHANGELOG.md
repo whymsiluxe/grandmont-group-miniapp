@@ -1,5 +1,69 @@
 # Changelog
 
+## 2026-09-27 (Grandmont Core workforce shadow integration — worker identity/assignments/absences, disabled by default)
+
+Implements the real HTTP transport in the existing, previously-inert
+`backend/core/grandmont_core_client.py` seam, against the authoritative Core
+contract supplied by the owner (`CORE_BASE_URL`, `X-Core-Service-Token` auth,
+`GET /worker-identity/resolve`, `GET /assignments`, `GET /absences`,
+`POST /commands/absence/create`). Adds `backend/core/workforce_shadow.py`,
+wired as best-effort side effects into `GET /api/my-assignments` and
+`POST /api/abwesenheit`. See `docs/DECISIONS.md` (27.09 entry) for the full
+rationale.
+
+### Added
+- `backend/core/grandmont_core_client.py`: `CoreHttpTransport` (real `httpx`
+  transport, command POST + read GET, `X-Core-Service-Token` header, 4xx ->
+  `REJECTED`, timeout -> `TIMEOUT`, network/5xx -> `UNAVAILABLE`, credential
+  never logged or included in exception messages); `resolve_worker_identity()`,
+  `list_assignments()`, `list_absences()`, `create_absence()` read/command
+  helpers; `CoreIntegrationError.status_code` (used only to distinguish a 404
+  identity-bridge response as a controlled "unmapped worker" state).
+- `backend/core/workforce_shadow.py` (new): `resolve_worker_uuid()` (Telegram
+  user id -> Core Worker UUID via the identity bridge, never auto-creates,
+  never invents a UUID), `shadow_compare_assignments()` (fetches the worker's
+  Core assignments, logs count mismatches, never alters the legacy result),
+  `shadow_create_absence()` (sends a `absence/create` Core command alongside
+  the existing legacy absence write, reusing the legacy entry id as a stable
+  idempotency key). Every function no-ops immediately when
+  `CORE_INTEGRATION_ENABLED` is unset/false, and never raises.
+- `tests/test_core_http_transport.py`, `tests/test_core_workforce_shadow.py`:
+  auth header, credential-never-leaks, 4xx/timeout/5xx classification,
+  identity resolution + 404-unmapped handling, assignment shadow read +
+  mismatch logging + legacy-result-untouched, absence shadow create +
+  idempotency-key stability across retries, disabled-mode zero-network.
+
+### Changed
+- `CoreIntegrationConfig.validate()` now also requires a non-blank
+  `CORE_SERVICE_CREDENTIAL` when enabled (previously only checked
+  `CORE_BASE_URL`/`timeout_seconds`) — fails `CONFIG_INVALID` before any
+  network access.
+- `backend/routes/objects.py` `my_assignments`: after building the existing
+  legacy assignment list, best-effort (try/except-guarded) calls
+  `shadow_compare_assignments` — response shape and legacy behavior
+  unchanged.
+- `backend/main.py` `create_abwesenheit`: after the existing legacy
+  `update_json_transaction` write, best-effort (try/except-guarded) calls
+  `shadow_create_absence` — response shape and legacy behavior unchanged.
+- `tests/test_core_integration_seam.py`: enabled-mode fixtures now supply a
+  `service_credential`, matching the new validation rule; added coverage for
+  the missing-credential case.
+- `requirements-test.txt`: added `httpx==0.28.1` (already a
+  `backend/requirements.txt` dependency; needed here because
+  `tests/test_core_http_transport.py` exercises the real transport via
+  `httpx.MockTransport`, no real network call).
+
+### Verified this pass
+- `python3 -m py_compile backend/main.py backend/routes/objects.py backend/core/grandmont_core_client.py backend/core/workforce_shadow.py`.
+- Targeted: `tests/test_core_integration_seam.py` + `tests/test_core_http_transport.py` + `tests/test_core_workforce_shadow.py` + `tests/test_assignment_lifecycle.py` — 114 passed.
+- Full suite: `1262 passed, 1 skipped`, plus 1 pre-existing unrelated failure
+  (`tests/test_runtime_manifest.py::test_deploy_then_restore_roundtrips_backend_artifact_tree`
+  — `rsync`/deploy-script tooling not installed in this sandbox; confirmed
+  failing identically on the pre-change `HEAD` via `git stash`, not caused by
+  this change).
+- `CORE_INTEGRATION_ENABLED` left unset in this PR — production behavior is
+  unaffected; not deployed, not enabled.
+
 ## 2026-09-27 (live bugfix + worker profile UX — objects/workers/documents load failures, triple critical popup, skills selector redesign, clothing size picker, branch `fix/miniapp-live-load-profile-ux`)
 
 Owner-reported live outage: Objects screen, Workers screen, and the Documents

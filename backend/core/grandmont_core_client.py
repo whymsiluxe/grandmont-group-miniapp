@@ -74,9 +74,10 @@ class CoreIntegrationError(Exception):
     rejection failures. Callers catch this one type and branch on `.kind`
     rather than needing to know the transport-level exception hierarchy."""
 
-    def __init__(self, kind: CoreErrorKind, message: str):
+    def __init__(self, kind: CoreErrorKind, message: str, status_code: int | None = None):
         self.kind = kind
         self.message = message
+        self.status_code = status_code
         super().__init__(f"[{kind.value}] {message}")
 
 
@@ -122,6 +123,11 @@ class CoreIntegrationConfig:
                 CoreErrorKind.CONFIG_INVALID,
                 "CORE_BASE_URL is required when Core integration is enabled",
             )
+        if not self.service_credential.strip():
+            raise CoreIntegrationError(
+                CoreErrorKind.CONFIG_INVALID,
+                "CORE_SERVICE_CREDENTIAL is required when Core integration is enabled",
+            )
         if self.timeout_seconds <= 0:
             raise CoreIntegrationError(
                 CoreErrorKind.CONFIG_INVALID,
@@ -142,10 +148,15 @@ class CoreResult:
 TransportFn = Callable[[str, dict, str, float], dict]
 """Signature a real transport implementation must satisfy:
 (command_name, payload, idempotency_key, timeout_seconds) -> raw response
-dict. Not called anywhere yet -- `transport` defaults to None and disabled
-mode never reaches the point of calling it. This exists purely so a later
-pass can inject a real HTTP transport (or a test fake) without changing
-GrandmontCoreClient's own code.
+dict. Disabled mode never reaches the point of calling it. This exists
+purely so a real HTTP transport (or a test fake) can be injected without
+changing GrandmontCoreClient's own code.
+"""
+
+ReadTransportFn = Callable[[str, dict, float], dict]
+"""Signature for GET-style read calls (identity resolve, list assignments/
+absences): (path, params, timeout_seconds) -> raw response dict. Kept
+separate from TransportFn because reads are not idempotency-keyed commands.
 """
 
 
@@ -173,15 +184,23 @@ class GrandmontCoreClient:
     """
     config: CoreIntegrationConfig = field(default_factory=CoreIntegrationConfig.from_env)
     transport: TransportFn | None = None
+    read_transport: ReadTransportFn | None = None
 
-    def command(self, name: str, payload: dict, idempotency_key: str | None = None) -> CoreResult:
+    def _ensure_enabled(self) -> None:
+        """Shared disabled/config-validation gate for command() and every
+        read helper below -- disabled mode must short-circuit before
+        touching config validation or any transport, for reads exactly as
+        for commands."""
         if not self.config.enabled:
             raise CoreIntegrationError(
                 CoreErrorKind.DISABLED,
                 "Core integration is disabled (CORE_INTEGRATION_ENABLED is not set) "
-                f"-- refusing to attempt command {name!r}",
+                "-- refusing network access",
             )
         self.config.validate()
+
+    def command(self, name: str, payload: dict, idempotency_key: str | None = None) -> CoreResult:
+        self._ensure_enabled()
 
         # Idempotency key must be caller-supplied, never generated here. A
         # silently-generated key defeats the whole point of idempotency: a
@@ -216,6 +235,160 @@ class GrandmontCoreClient:
 
         return CoreResult(ok=True, data=raw, idempotency_key=key)
 
+    def _read(self, path: str, params: dict) -> dict:
+        self._ensure_enabled()
+        if self.read_transport is None:
+            raise CoreIntegrationError(
+                CoreErrorKind.CONFIG_INVALID,
+                "Core integration is enabled but no read transport is configured -- "
+                "real Core endpoints are not implemented yet",
+            )
+        try:
+            return self.read_transport(path, params, self.config.timeout_seconds)
+        except TimeoutError as e:
+            raise CoreIntegrationError(CoreErrorKind.TIMEOUT, str(e)) from e
+        except CoreIntegrationError:
+            raise
+        except Exception as e:
+            raise CoreIntegrationError(CoreErrorKind.UNAVAILABLE, str(e)) from e
+
+    def resolve_worker_identity(self, legacy_id: str) -> CoreResult:
+        """GET /worker-identity/resolve for source_system=miniapp,
+        entity_type=worker. A 404 (no mapping exists, or the mapping isn't
+        visible to this tenant) is a controlled 'unmapped worker' outcome,
+        not an error -- returns CoreResult(ok=False, data=None) instead of
+        raising. Never auto-creates a Worker, never invents a canonical id."""
+        try:
+            raw = self._read('/worker-identity/resolve', {
+                'source_system': 'miniapp',
+                'entity_type': 'worker',
+                'legacy_id': str(legacy_id),
+            })
+        except CoreIntegrationError as e:
+            if e.kind == CoreErrorKind.REJECTED and e.status_code == 404:
+                return CoreResult(ok=False, data=None)
+            raise
+        return CoreResult(ok=True, data=raw)
+
+    def list_assignments(self, *, worker_id: str, project_id: str | None = None,
+                          status: str | None = None, from_at: str | None = None,
+                          to_at: str | None = None) -> CoreResult:
+        """GET /assignments?worker_id=... Worker-facing shadow reads always
+        scope by worker_id (the caller's own resolved Core Worker UUID)."""
+        params: dict = {'worker_id': worker_id}
+        if project_id:
+            params['project_id'] = project_id
+        if status:
+            params['status'] = status
+        if from_at:
+            params['from_at'] = from_at
+        if to_at:
+            params['to_at'] = to_at
+        raw = self._read('/assignments', params)
+        return CoreResult(ok=True, data=raw)
+
+    def list_absences(self, *, worker_id: str, status: str | None = None,
+                       from_at: str | None = None, to_at: str | None = None) -> CoreResult:
+        """GET /absences?worker_id=..."""
+        params: dict = {'worker_id': worker_id}
+        if status:
+            params['status'] = status
+        if from_at:
+            params['from_at'] = from_at
+        if to_at:
+            params['to_at'] = to_at
+        raw = self._read('/absences', params)
+        return CoreResult(ok=True, data=raw)
+
+    def create_absence(self, *, organization_id: str, worker_id: str, type_: str,
+                        starts_at: str, ends_at: str, idempotency_key: str,
+                        note: str | None = None) -> CoreResult:
+        """POST /commands/absence/create via the generic command() path --
+        canonical Worker UUID and organization_id must already be resolved
+        by the caller (see workforce_shadow.resolve_worker_uuid); this
+        method never resolves identity itself."""
+        payload: dict = {
+            'organization_id': organization_id,
+            'worker_id': worker_id,
+            'type': type_,
+            'starts_at': starts_at,
+            'ends_at': ends_at,
+        }
+        if note:
+            payload['note'] = note
+        return self.command('absence/create', payload, idempotency_key=idempotency_key)
+
+
+class CoreHttpTransport:
+    """Real HTTP transport for GrandmontCoreClient against the deployed
+    Grandmont Core service. Only constructed when CORE_INTEGRATION_ENABLED
+    is true (see get_core_client()) -- disabled mode never imports httpx or
+    opens a connection.
+
+    Maps command() calls onto POST {base_url}/commands/{name} with the
+    command envelope Core expects, and read calls onto
+    GET {base_url}{path}?{params}. Auth is a single X-Core-Service-Token
+    header; the credential is never included in a log line or in any raised
+    exception's message -- error messages here are either Core's own
+    response body (`code`/`message`, which Core controls, not us) or a
+    static string, never a formatted transport exception.
+    """
+
+    def __init__(self, config: CoreIntegrationConfig, client=None):
+        import httpx
+
+        self._config = config
+        self._client = client or httpx.Client(base_url=config.base_url, timeout=config.timeout_seconds)
+
+    def _headers(self) -> dict:
+        return {
+            'X-Core-Service-Token': self._config.service_credential,
+            'Content-Type': 'application/json',
+        }
+
+    def _handle_response(self, response) -> dict:
+        if response.status_code < 300:
+            return response.json()
+        try:
+            body = response.json()
+            message = body.get('message') or body.get('code') or f"Core returned HTTP {response.status_code}"
+        except Exception:
+            message = f"Core returned HTTP {response.status_code}"
+        if response.status_code < 500:
+            raise CoreIntegrationError(CoreErrorKind.REJECTED, message, status_code=response.status_code)
+        raise CoreIntegrationError(CoreErrorKind.UNAVAILABLE, message, status_code=response.status_code)
+
+    def __call__(self, name: str, payload: dict, idempotency_key: str, timeout_seconds: float) -> dict:
+        """TransportFn implementation: POST /commands/{name}."""
+        import httpx
+
+        body = {
+            'command_id': idempotency_key,
+            'idempotency_key': idempotency_key,
+            'actor_id': 'service:miniapp',
+            'source': 'miniapp',
+            'payload': payload,
+        }
+        try:
+            response = self._client.post(f'/commands/{name}', json=body, headers=self._headers(), timeout=timeout_seconds)
+        except httpx.TimeoutException as e:
+            raise TimeoutError("Core command request timed out") from e
+        except httpx.HTTPError as e:
+            raise CoreIntegrationError(CoreErrorKind.UNAVAILABLE, "Core command request failed") from e
+        return self._handle_response(response)
+
+    def get(self, path: str, params: dict, timeout_seconds: float) -> dict:
+        """ReadTransportFn implementation: GET {path}?{params}."""
+        import httpx
+
+        try:
+            response = self._client.get(path, params=params, headers=self._headers(), timeout=timeout_seconds)
+        except httpx.TimeoutException as e:
+            raise TimeoutError("Core read request timed out") from e
+        except httpx.HTTPError as e:
+            raise CoreIntegrationError(CoreErrorKind.UNAVAILABLE, "Core read request failed") from e
+        return self._handle_response(response)
+
 
 _default_client: GrandmontCoreClient | None = None
 
@@ -224,10 +397,18 @@ def get_core_client() -> GrandmontCoreClient:
     """Module-level singleton accessor, mirroring the pattern other backend
     singletons in this repo use (e.g. daily_plan_lib's module-level store
     config). Lazily constructed from env on first use so importing this
-    module has no side effects and no env is read at import time."""
+    module has no side effects and no env is read at import time. Only
+    constructs a real CoreHttpTransport (and only then imports httpx / opens
+    a client) when the config is actually enabled -- disabled mode stays
+    100% network-free."""
     global _default_client
     if _default_client is None:
-        _default_client = GrandmontCoreClient(config=CoreIntegrationConfig.from_env())
+        config = CoreIntegrationConfig.from_env()
+        if config.enabled:
+            transport = CoreHttpTransport(config)
+            _default_client = GrandmontCoreClient(config=config, transport=transport, read_transport=transport.get)
+        else:
+            _default_client = GrandmontCoreClient(config=config)
     return _default_client
 
 
