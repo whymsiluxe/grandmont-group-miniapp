@@ -189,6 +189,23 @@ Wizard screen merges are still open.
   revisit if concurrency/reporting needs grow.
 - No CRM layer (clients/leads/deals) — out of scope so far, P3 idea only.
 
+## 2026-09-27 Live load-failure bugfix + profile UX (branch `fix/miniapp-live-load-profile-ux`)
+
+Fresh branch off `main`@`fd30a52` (does NOT include the not-yet-merged Core
+workforce-shadow PR). Fixes real owner-reported outages: `GET /api/objects`
+500 on any malformed assignment record (shared root cause behind Objects,
+Documents gallery, and Start Shift's object picker all failing together),
+`GET /api/workers` 500 on any malformed profile entry (independent cause),
+Documents KeyError crashes on legacy records missing `file`/`id`, the
+critical-alert popup's same-poll-response duplicate-id gap, and a real
+swipe-gesture bug that made bottom sheets (skills-add sheet included) look
+like they closed from a stray tap/scroll. Also redesigns the skills selector
+(no more separate "frequently used" block, tri-state section select-all,
+per-device usage-based ordering frozen per open) and replaces free-text
+clothing-size inputs with native pickers. See `docs/CHANGELOG.md` (27.09
+entry) for full detail. Full suite: `1268 passed, 1 skipped`, plus 1
+pre-existing unrelated `rsync`-tooling failure. Not deployed.
+
 ## Where to look next
 
 - Active/actionable work: [BACKLOG.md](BACKLOG.md).

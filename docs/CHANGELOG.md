@@ -1,5 +1,111 @@
 # Changelog
 
+## 2026-09-27 (live bugfix + worker profile UX — objects/workers/documents load failures, triple critical popup, skills selector redesign, clothing size picker, branch `fix/miniapp-live-load-profile-ux`)
+
+Owner-reported live outage: Objects screen, Workers screen, and the Documents
+gallery all failed to load, and Start Shift's object picker failed with "не
+удалось загрузить объекты". Traced to one shared backend root cause plus one
+independent one, both concrete unguarded-dict-access crashes on malformed
+legacy JSON records -- not a data problem, a missing-defense-in-depth
+problem. Also fixes a real frontend gesture-handling bug that made bottom
+sheets (most visibly the skills-add sheet) look like they "closed" from a
+stray tap/scroll, hardens the critical-alert popup queue against a
+same-poll-response duplicate id, and redesigns the skills selector +
+clothing-size input per owner UX request.
+
+### Fixed
+- **`GET /api/objects` 500 (shared root cause for Objects/Documents/Start
+  Shift)**: `routes/objects.py` `list_objects` indexed `a['user_id']`
+  (KeyError on any assignment record missing that key) and called
+  `deps.assignment_status(a)`/`a.get(...)` without checking `a` was even a
+  dict -- ONE malformed `object_assignments.json` record for any object
+  crashed the ENTIRE list for every object, every role. New
+  `_valid_assignments()` skips (and logs, object id + index only, never the
+  record's own content) a non-dict or user_id-less assignment record instead
+  of raising; the whole per-object loop is also wrapped so any other
+  unexpected shape skips just that one object row, not the response.
+  `_serialize_object_for_worker` (main.py) gained the same `isinstance(a,
+  dict)` guard on the worker-facing path. This is why the Documents gallery
+  (`document-gallery.js` loads `GET /api/objects` first) and Start Shift's
+  object picker (`worker-checkin-fab.js` `_openWorkerObjectPicker`, same
+  endpoint) failed together with Objects -- one crash, three symptoms.
+- **`GET /api/workers` 500 (independent root cause)**: `list_workers`
+  called `p.get('name')` etc. on `profiles.get(uid, {})` without checking
+  the profile itself was a dict -- one malformed `worker_profiles.json`
+  entry crashed the whole roster. Now guarded per-uid with a try/except that
+  skips just that uid (logged, uid only, never profile content) and falls
+  back to `{}` for a non-dict `skills`/profile value; valid workers and the
+  existing role-default-to-None access invariant (09.09) are unaffected.
+- **Documents 500s**: `get_object_document_file`/`delete_object_document`
+  indexed `d["file"]`/`d["id"]` (KeyError on a legacy document record
+  missing either key) instead of `.get(...)`; `get_object_documents` didn't
+  guard against a non-dict `object_info.json` entry or non-dict document
+  rows. All three now degrade to skipping the malformed record (or a
+  controlled 404 for a genuinely missing file) instead of a raw 500.
+- **Critical popup shown repeatedly**: `_pollCriticalAlerts()`'s
+  `existingIds` dedup set was computed once before its push loop and never
+  updated inside it, so a single poll response containing the same alert id
+  twice could queue both copies; `_showNextCriticalAlert()` didn't itself
+  refuse to show while a modal was already open, relying entirely on
+  callers. Backend's existing persisted `(kind, target_user_id, ref_id)`
+  dedup is untouched -- no new title/kind-based dedup added.
+- **Skill-add sheet (and every other dynamically-created bottom sheet)
+  "closing" from a stray tap/scroll**: `swipe-nav.js`'s document-level
+  `touchstart`/`touchend` swipe-between-tabs gesture handler never excluded
+  `.bottom-sheet-overlay` -- a horizontal-ish drag while scrolling an open
+  sheet's content (or a tap on the backdrop area above the panel) could
+  register as a real swipe gesture and switch the whole app view underneath
+  the sheet. Added `.bottom-sheet-overlay` to the shared exclusion selector
+  (`_isExcludedSwipeTarget`) -- one fix covers every sheet built on that
+  class (skills, assignment, edit-period/work-type, etc.), not just this one.
+
+### Changed (worker profile UX, owner request)
+- `frontend/js/skill-picker.js`: removed the separate "frequently used"
+  grid (a fixed editorial `featured` flag per work type, not real usage).
+  Replaced with one scrollable list grouped by category, sticky section
+  headers, a tri-state (☐/◐/☑) "select whole section" control per group, and
+  real per-device usage counts (localStorage, not sent to the backend) that
+  only reorder items within a section on the NEXT open -- toggling a skill
+  never re-sorts the list under the user's finger mid-session.
+- `frontend/js/profile.js`: pants/shirt size are now native `<select>`
+  pickers (XS–5XL letter sizes for shirt, 44–60 numeric for pants; shoe size
+  stays free text, out of scope) instead of free-text inputs -- no keyboard
+  opens for a normal size pick. A legacy/custom stored value that isn't one
+  of the predefined options is injected as its own selected option instead
+  of being silently dropped, so it stays visible and replaceable.
+- `frontend/app.html`: the skills sheet's primary action bar is now sticky
+  at the bottom of the panel (was in normal scroll flow) since the redesigned
+  list has no accordion collapse and can be longer to scroll through.
+
+### Added
+- `tests/test_objects_load_resilience.py`, `test_workers_load_resilience.py`,
+  `test_documents_resilience.py`: real route-handler regression tests for
+  every malformed-record crash path above (non-dict assignment, missing
+  user_id, non-dict profile, non-list skills, non-dict document entry,
+  missing file/id key), plus worker-access-scoping and Start-Shift
+  (`GET /api/my-assignments`) coverage.
+- `tests/test_critical_alert_dedup_frontend_contract.py`,
+  `test_skill_picker_redesign_frontend_contract.py`,
+  `test_profile_clothing_size_picker_frontend_contract.py`: static contracts
+  for the frontend fixes (existing `test_*_frontend_contract.py` convention,
+  no JS test runner in this repo).
+- `tests/test_critical_alerts_queue_frontend_contract.py`: one pre-existing
+  assertion updated (exact-line match on the old single-line dedup check) to
+  match the corrected multi-line merge-then-add logic -- same invariant
+  (merge by id, not wholesale replace), not weakened.
+
+### Verified this pass
+- `python3 -m py_compile backend/main.py backend/routes/objects.py`;
+  `node --check` on every changed `frontend/js/*.js` file.
+- Targeted: the 6 new/updated test files above + `test_assignment_lifecycle.py`
+  + `test_object_history.py` -- 95 passed.
+- Full suite: `1268 passed, 1 skipped`, plus 1 pre-existing unrelated failure
+  (`test_runtime_manifest.py` deploy/rsync roundtrip -- `rsync` not installed
+  in this sandbox, confirmed pre-existing on this same branch's base before
+  any change in this pass).
+- Not deployed. No DailyPlan work. No Core/CRM/Website/Google-Sheets/infra
+  changes.
+
 ## 2026-09-26 (Grandmont Group rebrand — code/display/docs wave, branch `rename/grandmont-group-branding`)
 
 Brand "Promonta" -> "Grandmont Group" (slug `grandmont-group`). Legal name

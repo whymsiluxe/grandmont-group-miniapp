@@ -280,8 +280,8 @@ function _renderWorkerSelfProfile(slot) {
         <div class="accordion-header"><span class="accordion-icon profile-icon-sizes" style="background:var(--icon-bg-2)">${PROFILE_ICONS.sizes}</span><span class="accordion-title">Размеры одежды</span><span class="accordion-chevron">▾</span></div>
         <div class="accordion-body collapsed"><div class="accordion-body-inner">
           <div class="profile-sizes-grid">
-            <label>Штаны<input id="profile-size-pants" class="mangel-select" placeholder="напр. 52 / L"></label>
-            <label>Футболка<input id="profile-size-shirt" class="mangel-select" placeholder="напр. XL"></label>
+            <label>Штаны<select id="profile-size-pants" class="mangel-select"></select></label>
+            <label>Футболка<select id="profile-size-shirt" class="mangel-select"></select></label>
             <label>Обувь<input id="profile-size-shoe" class="mangel-select" placeholder="напр. 44"></label>
           </div>
           <button class="submit-btn profile-inline-btn" id="profile-sizes-save-btn" type="button">Сохранить размеры</button>
@@ -582,9 +582,28 @@ async function _loadProfileStats() {
   const bdayInput = document.getElementById('profile-birthday-input');
   if (bdayInput) bdayInput.value = stats.birthday || '';
 
-  document.getElementById('profile-size-pants').value = stats.sizes?.pants || '';
-  document.getElementById('profile-size-shirt').value = stats.sizes?.shirt || '';
+  _fillSizeSelect('profile-size-pants', PROFILE_PANTS_SIZES, stats.sizes?.pants || '');
+  _fillSizeSelect('profile-size-shirt', PROFILE_SHIRT_SIZES, stats.sizes?.shirt || '');
   document.getElementById('profile-size-shoe').value = stats.sizes?.shoe || '';
+}
+
+// 27.09 (owner UX request): clothing size no longer requires typing -- a tap
+// opens the browser/OS's own compact picker (native <select>, no keyboard),
+// per standard upper-body/workwear letter sizes and numeric trouser sizes.
+// A legacy/custom stored value that isn't one of these is kept as its own
+// selected option (never silently dropped/overwritten) so it stays visible
+// and the worker can replace it with a supported size whenever they want.
+const PROFILE_SHIRT_SIZES = ['XS', 'S', 'M', 'L', 'XL', 'XXL', '3XL', '4XL', '5XL'];
+const PROFILE_PANTS_SIZES = ['44', '46', '48', '50', '52', '54', '56', '58', '60'];
+
+function _fillSizeSelect(elId, options, currentValue) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  const opts = [...options];
+  if (currentValue && !opts.includes(currentValue)) opts.unshift(currentValue);
+  el.innerHTML = `<option value="">Не выбрано</option>` +
+    opts.map(v => `<option value="${esc(v)}"${v === currentValue ? ' selected' : ''}>${esc(v)}</option>`).join('');
+  el.value = currentValue || '';
 }
 
 let _profileSkillCatalogByIdCache = null;

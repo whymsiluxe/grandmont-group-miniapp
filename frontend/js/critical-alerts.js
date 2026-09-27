@@ -31,9 +31,18 @@ async function _pollCriticalAlerts() {
     const data = await api('/api/critical-alerts/pending');
     const fresh = (data.alerts || []).filter(a => !_criticalAlertAckedIds.has(a.id));
 
+    // 27.09 (owner report: critical popup shown 3x again): existingIds was a
+    // snapshot taken ONCE before this loop -- if a single poll response ever
+    // contains the same alert id more than once (backend aggregation glitch,
+    // or a stale+fresh copy of the same record), both copies passed this
+    // check and were pushed into the queue, since neither push updated the
+    // set it was itself checked against. Updating it as we go makes this
+    // loop dedup within a single poll response too, not just across polls.
     const existingIds = new Set(_criticalAlertQueue.map(a => a.id));
     for (const alert of fresh) {
-      if (!existingIds.has(alert.id)) _criticalAlertQueue.push(alert);
+      if (existingIds.has(alert.id)) continue;
+      existingIds.add(alert.id);
+      _criticalAlertQueue.push(alert);
     }
     // Reconcile: drop anything from the local queue the server no longer
     // considers pending (acked from another device, resolved, etc.) --
@@ -49,7 +58,12 @@ async function _pollCriticalAlerts() {
 }
 
 function _showNextCriticalAlert() {
-  const next = _criticalAlertQueue.find(a => !_criticalAlertShownIds.has(a.id));
+  // Invariant enforced here, not just by callers: the same alert must never
+  // be presented while a modal is already open, or after it was already
+  // shown/acked this session -- both checked at this single choke point so a
+  // future caller can't reintroduce the bug by forgetting to check first.
+  if (_criticalAlertModalOpen) return;
+  const next = _criticalAlertQueue.find(a => !_criticalAlertShownIds.has(a.id) && !_criticalAlertAckedIds.has(a.id));
   if (!next) return;
   _showCriticalAlertModal(next);
 }

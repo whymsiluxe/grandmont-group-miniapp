@@ -24,6 +24,30 @@ function _allCatalogItems(catalog) {
   return items;
 }
 
+// 27.09 (owner UX request): replaces the old separate "frequently used" grid
+// (a fixed editorial `featured` flag per work type, not real usage) with a
+// real per-device usage count, so items a worker actually picks rise toward the
+// top of their own section over time. Local-only (per device), no backend change.
+const SKILL_USAGE_STORAGE_KEY = 'grandmont-group-skill-usage-v1';
+
+function _loadSkillUsage() {
+  try {
+    const raw = localStorage.getItem(SKILL_USAGE_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return (parsed && typeof parsed === 'object') ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function _bumpSkillUsage(id) {
+  try {
+    const usage = _loadSkillUsage();
+    usage[id] = (usage[id] || 0) + 1;
+    localStorage.setItem(SKILL_USAGE_STORAGE_KEY, JSON.stringify(usage));
+  } catch (e) {}
+}
+
 /**
  * createSkillPicker(container, opts)
  *   opts.initialSelected -- Set<string> skill_id, предвыбранные навыки
@@ -42,11 +66,11 @@ async function createSkillPicker(container, opts = {}) {
   // следующего рендера). Теперь single-select -- встроенный режим: toggle() сам
   // снимает предыдущий выбор перед добавлением нового, picker никогда не уничтожается.
   const singleSelect = !!opts.singleSelect;
-  // 09.09: hideFeatured -- owner попросил убрать "Часто используемые" именно из
-  // Assignment Sheet (шаг выбора вида работ) -- список фичатуренных карточек там не
-  // нужен, но онбординг/профиль (два других вызывающих места) его используют,
-  // поэтому опция, не безусловное удаление секции из компонента.
-  const hideFeatured = !!opts.hideFeatured;
+  // 09.09: hideFeatured used to hide the old separate frequently-used grid
+  // for Assignment Sheet specifically. 27.09: that whole grid was removed
+  // for every caller (see the redesign above) -- kept as an accepted, now
+  // no-op option so existing call sites passing it don't need to change.
+  const hideFeatured = !!opts.hideFeatured; // eslint-disable-line no-unused-vars
   // 09.09: allLabel -- owner попросил "Все навыки" -> "Виды работ" в контексте
   // Assignment Sheet (это ровно то же понятие, что owner уже переименовал в других
   // местах интерфейса по исходному 15-пунктному плану) -- опция вместо жёсткой
@@ -64,8 +88,18 @@ async function createSkillPicker(container, opts = {}) {
     return { getSelected: () => selected, destroy: () => {} };
   }
 
-  let openGroupId = null;
   let searchQuery = '';
+  // 27.09: frozen once per picker instance (i.e. once per open) -- toggling a
+  // skill bumps the persisted usage count immediately (see toggle()), but the
+  // ORDER used by this render() never changes mid-session from that, so the
+  // list can never jump under the user's finger while they're selecting.
+  // Reopening the picker (a fresh createSkillPicker() call) reads a new
+  // snapshot and re-sorts.
+  const usageSnapshot = _loadSkillUsage();
+  const sortedGroups = catalog.groups.map(g => ({
+    ...g,
+    items: [...g.items].sort((a, b) => (usageSnapshot[b.id] || 0) - (usageSnapshot[a.id] || 0)),
+  }));
 
   function isSelected(id) { return selected.has(id); }
 
@@ -75,8 +109,31 @@ async function createSkillPicker(container, opts = {}) {
     } else if (singleSelect) {
       selected.clear();
       selected.add(id);
+      _bumpSkillUsage(id);
     } else {
       selected.add(id);
+      _bumpSkillUsage(id);
+    }
+    render();
+    onChange(selected);
+  }
+
+  // 27.09: whole-section select. State is a simple tri-state derived from
+  // how many of the group's own items are currently selected -- no separate
+  // stored flag to drift out of sync with individual toggles.
+  function _groupState(g) {
+    const count = g.items.filter(w => isSelected(w.id)).length;
+    if (count === 0) return 'none';
+    if (count === g.items.length) return 'all';
+    return 'partial';
+  }
+
+  function toggleGroup(g) {
+    const state = _groupState(g);
+    if (state === 'all') {
+      g.items.forEach(w => selected.delete(w.id));
+    } else {
+      g.items.forEach(w => { if (!selected.has(w.id)) _bumpSkillUsage(w.id); selected.add(w.id); });
     }
     render();
     onChange(selected);
@@ -84,12 +141,6 @@ async function createSkillPicker(container, opts = {}) {
 
   function render() {
     const q = searchQuery.trim().toLowerCase();
-    const featuredHtml = catalog.featured.map(w => `
-      <button type="button" class="skill-picker-featured-card${isSelected(w.id) ? ' selected' : ''}" data-skill-id="${w.id}">
-        ${isSelected(w.id) ? '<span class="skill-picker-check">✓</span>' : ''}
-        <span class="skill-picker-featured-name">${_escSkill(w.name)}</span>
-      </button>
-    `).join('');
 
     let groupsHtml;
     if (q) {
@@ -98,17 +149,20 @@ async function createSkillPicker(container, opts = {}) {
       );
       groupsHtml = `<div class="skill-picker-search-results">${matches.map(w => _skillRowHtml(w, isSelected(w.id))).join('') || '<div class="skill-picker-empty">Ничего не найдено</div>'}</div>`;
     } else {
-      groupsHtml = catalog.groups.map(g => {
-        const isOpen = openGroupId === g.id;
+      groupsHtml = sortedGroups.map(g => {
+        const state = _groupState(g);
+        const stateGlyph = state === 'all' ? '☑' : (state === 'partial' ? '◐' : '☐');
         const selectedCount = g.items.filter(w => isSelected(w.id)).length;
         return `
-          <div class="skill-picker-group${isOpen ? ' open' : ''}">
-            <button type="button" class="skill-picker-group-header" data-group-id="${g.id}">
-              <span>${_escSkill(g.name)}</span>
+          <div class="skill-picker-group">
+            <div class="skill-picker-group-header">
+              <button type="button" class="skill-picker-group-select-all" data-group-select="${g.id}"
+                      title="${state === 'all' ? 'Снять весь раздел' : 'Выбрать весь раздел'}"
+                      aria-label="${state === 'all' ? 'Снять весь раздел' : 'Выбрать весь раздел'}">${stateGlyph}</button>
+              <span class="skill-picker-group-name">${_escSkill(g.name)}</span>
               ${selectedCount ? `<span class="skill-picker-group-badge">${selectedCount}</span>` : ''}
-              <span class="skill-picker-group-chevron">${isOpen ? '▾' : '▸'}</span>
-            </button>
-            ${isOpen ? `<div class="skill-picker-group-body">${g.items.map(w => _skillRowHtml(w, isSelected(w.id))).join('')}</div>` : ''}
+            </div>
+            <div class="skill-picker-group-body">${g.items.map(w => _skillRowHtml(w, isSelected(w.id))).join('')}</div>
           </div>
         `;
       }).join('');
@@ -125,10 +179,6 @@ async function createSkillPicker(container, opts = {}) {
     const prevSelectionEnd = prevSearchInput ? prevSearchInput.selectionEnd : null;
 
     container.innerHTML = `
-      ${hideFeatured ? '' : `
-      <div class="skill-picker-featured-label">Часто используемые</div>
-      <div class="skill-picker-featured-grid">${featuredHtml}</div>
-      `}
       <div class="skill-picker-all-label">${_escSkill(allLabel)}</div>
       <input type="search" class="skill-picker-search-input" placeholder="Поиск..." value="${_escSkill(searchQuery)}">
       <div class="skill-picker-groups">${groupsHtml}</div>
@@ -137,11 +187,12 @@ async function createSkillPicker(container, opts = {}) {
     container.querySelectorAll('[data-skill-id]').forEach(el => {
       el.addEventListener('click', () => toggle(el.dataset.skillId));
     });
-    container.querySelectorAll('[data-group-id]').forEach(el => {
-      el.addEventListener('click', () => {
-        const gid = el.dataset.groupId;
-        openGroupId = openGroupId === gid ? null : gid; // одновременно раскрыта только одна группа
-        render();
+    container.querySelectorAll('[data-group-select]').forEach(el => {
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const gid = el.dataset.groupSelect;
+        const g = sortedGroups.find(x => x.id === gid);
+        if (g) toggleGroup(g);
       });
     });
     const searchInput = container.querySelector('.skill-picker-search-input');
