@@ -6,6 +6,7 @@ router and re-exports the handlers for legacy direct-call tests.
 """
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -118,6 +119,27 @@ class ObjectsRouteDeps:
     shadow_compare_assignments: Callable | None = None
 
 
+_logger = logging.getLogger('grandmont.objects')
+
+
+def _valid_assignments(assignments, oid: str) -> list[dict]:
+    """One malformed legacy assignment record (not a dict, or missing the
+    user_id every downstream consumer indexes by) must not take down the
+    whole /api/objects response -- skip just that record, log enough to find
+    it (object id + index, never the record's own content, which could carry
+    a worker's task_note/decline_reason free text)."""
+    raw = assignments.get(oid) if isinstance(assignments, dict) else None
+    if not isinstance(raw, list):
+        return []
+    valid = []
+    for idx, a in enumerate(raw):
+        if not isinstance(a, dict) or not a.get('user_id'):
+            _logger.warning("objects: skipping malformed assignment object_id=%s index=%s", oid, idx)
+            continue
+        valid.append(a)
+    return valid
+
+
 def create_objects_router(deps: ObjectsRouteDeps):
     router = APIRouter()
 
@@ -134,7 +156,9 @@ def create_objects_router(deps: ObjectsRouteDeps):
         stages_by_object = o.all_stages_grouped()
 
         def _user_info(uid: str, assignment: dict | None = None) -> dict:
-            p = profiles.get(str(uid), {})
+            p = profiles.get(str(uid)) if isinstance(profiles, dict) else None
+            if not isinstance(p, dict):
+                p = {}
             info = {
                 "user_id": str(uid),
                 "name": deps.sanitize_display_name(p.get('name'), str(uid)),
@@ -155,6 +179,9 @@ def create_objects_router(deps: ObjectsRouteDeps):
 
         def _stage_summary(oid: str) -> dict | None:
             stages = stages_by_object.get(oid.upper())
+            if not isinstance(stages, list) or not stages:
+                return None
+            stages = [s for s in stages if isinstance(s, dict)]
             if not stages:
                 return None
             completed = [s.get('Название этапа', '') for s in stages if s.get('Статус') == 'готово']
@@ -174,35 +201,42 @@ def create_objects_router(deps: ObjectsRouteDeps):
 
         objects = []
         for r in data:
-            obj = dict(zip(header, r))
-            oid = str(obj.get('ID объекта', ''))
-            obj_assignments = assignments.get(oid, [])
-            if role == 'owner':
-                today_str = deps.business_today_str()
-                seen_uids = set()
-                deduped_users = []
-                detail_users = []
-                for a in obj_assignments:
-                    if deps.assignment_status(a) == 'declined':
-                        continue
-                    a_from, a_to = a.get('date_from', ''), a.get('date_to', '')
-                    is_dated = bool(a_from and a_to)
-                    if is_dated and not (a_from <= today_str <= a_to):
-                        continue
-                    uid = str(a['user_id'])
-                    detail_users.append(_user_info(uid, a))
-                    if uid in seen_uids:
-                        continue
-                    seen_uids.add(uid)
-                    deduped_users.append(_user_info(uid, a))
-                obj['assigned_users'] = deduped_users
-                obj['assigned_users_detail'] = detail_users
-                obj['photo_count'] = len(images.get(oid) or [])
-                obj['stage_summary'] = _stage_summary(oid)
-            else:
-                obj = deps.serialize_object_for_worker(
-                    obj, str(user['id']), obj_assignments, _user_info, _stage_summary, images
-                )
+            obj = None
+            try:
+                obj = dict(zip(header, r))
+                oid = str(obj.get('ID объекта', ''))
+                obj_assignments = _valid_assignments(assignments, oid)
+                if role == 'owner':
+                    today_str = deps.business_today_str()
+                    seen_uids = set()
+                    deduped_users = []
+                    detail_users = []
+                    for a in obj_assignments:
+                        if deps.assignment_status(a) == 'declined':
+                            continue
+                        a_from = str(a.get('date_from') or '')
+                        a_to = str(a.get('date_to') or '')
+                        is_dated = bool(a_from and a_to)
+                        if is_dated and not (a_from <= today_str <= a_to):
+                            continue
+                        uid = str(a.get('user_id'))
+                        detail_users.append(_user_info(uid, a))
+                        if uid in seen_uids:
+                            continue
+                        seen_uids.add(uid)
+                        deduped_users.append(_user_info(uid, a))
+                    obj['assigned_users'] = deduped_users
+                    obj['assigned_users_detail'] = detail_users
+                    obj['photo_count'] = len(images.get(oid) or [])
+                    obj['stage_summary'] = _stage_summary(oid)
+                else:
+                    obj = deps.serialize_object_for_worker(
+                        obj, str(user['id']), obj_assignments, _user_info, _stage_summary, images
+                    )
+            except Exception:
+                bad_oid = obj.get('ID объекта') if isinstance(obj, dict) else '?'
+                _logger.exception("objects: skipping malformed object row ID=%r", bad_oid)
+                continue
             objects.append(obj)
         return {"objects": objects}
 
@@ -220,9 +254,9 @@ def create_objects_router(deps: ObjectsRouteDeps):
                 names[oid_key] = obj.get('Объект') or obj.get('Название') or obj.get('Адрес') or oid_key
 
         result = []
-        for oid, lst in assignments.items():
-            for a in lst:
-                if a.get('user_id') != uid:
+        for oid, lst in (assignments.items() if isinstance(assignments, dict) else []):
+            for a in (lst if isinstance(lst, list) else []):
+                if not isinstance(a, dict) or a.get('user_id') != uid:
                     continue
                 work_type_id = a.get('work_type_id', '')
                 result.append({

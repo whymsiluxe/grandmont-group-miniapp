@@ -46,7 +46,16 @@ def test_poll_merges_by_id_instead_of_wholesale_replacing_the_queue():
         "resurrect or duplicate an alert already queued/shown"
     )
     assert "existingIds" in body
-    assert "if (!existingIds.has(alert.id)) _criticalAlertQueue.push(alert);" in body
+    # 27.09: existingIds must now be UPDATED inside the loop too, not just
+    # read -- the original one-line form left it a snapshot taken before the
+    # loop, so a poll response containing the same id twice (backend
+    # aggregation glitch, or a stale+fresh copy) pushed both copies, since
+    # neither push updated the set the other was checked against.
+    assert "existingIds.add(alert.id)" in body
+    assert "_criticalAlertQueue.push(alert)" in body
+    add_idx = body.index("existingIds.add(alert.id)")
+    push_idx = body.index("_criticalAlertQueue.push(alert)")
+    assert add_idx < push_idx, "existingIds must be marked before the push, not after"
 
 
 def test_poll_filters_out_already_acked_alerts_before_merging():

@@ -189,20 +189,37 @@ Wizard screen merges are still open.
   revisit if concurrency/reporting needs grow.
 - No CRM layer (clients/leads/deals) — out of scope so far, P3 idea only.
 
-## 2026-09-27 Core workforce shadow integration
+## 2026-09-27 Live load-failure bugfix + profile UX (merged to `main` as PR #20)
 
-Branch `claude/admiring-fermi-wrjyrm` off `main`@`fd30a52` implements the real
-HTTP transport in `backend/core/grandmont_core_client.py` (previously an
-inert seam, disabled by default) against the authoritative Grandmont Core
-API contract, plus a new `backend/core/workforce_shadow.py` wired as
-best-effort shadow reads/writes into `GET /api/my-assignments` and
+Fixed real owner-reported outages: `GET /api/objects` 500 on any malformed
+assignment record (shared root cause behind Objects, Documents gallery, and
+Start Shift's object picker all failing together), `GET /api/workers` 500 on
+any malformed profile entry (independent cause), Documents KeyError crashes
+on legacy records missing `file`/`id`, the critical-alert popup's
+same-poll-response duplicate-id gap, and a real swipe-gesture bug that made
+bottom sheets (skills-add sheet included) look like they closed from a stray
+tap/scroll. Also redesigns the skills selector (no more separate "frequently
+used" block, tri-state section select-all, per-device usage-based ordering
+frozen per open) and replaces free-text clothing-size inputs with native
+pickers. See `docs/CHANGELOG.md` (27.09 entry) for full detail. Full suite at
+merge time: `1268 passed, 1 skipped`, plus 1 pre-existing unrelated
+`rsync`-tooling failure. Not deployed.
+
+## 2026-09-27 Core workforce shadow integration (branch `claude/admiring-fermi-wrjyrm`, rebased onto the above)
+
+Implements the real HTTP transport in `backend/core/grandmont_core_client.py`
+(previously an inert seam, disabled by default) against the authoritative
+Grandmont Core API contract, plus a new `backend/core/workforce_shadow.py`
+wired as best-effort shadow reads/writes into `GET /api/my-assignments` and
 `POST /api/abwesenheit`. `CORE_INTEGRATION_ENABLED` stays unset — no
 production behavior change, nothing deployed. Scope: worker identity
 resolution (Telegram id -> Core Worker UUID), worker-facing assignment
 shadow reads, worker-created absence shadow create. DailyPlan, checkin,
-execution, and CRM are untouched. See `docs/DECISIONS.md` (27.09 entry) and
-`docs/CHANGELOG.md` (27.09 entry) for full detail. Full suite: `1262 passed,
-1 skipped`, plus 1 pre-existing unrelated `rsync`-tooling failure.
+execution, and CRM are untouched. Originally branched off `main`@`fd30a52`,
+merged forward onto `main`@`5aa8b3f` (the live-load-failure bugfix above) to
+pick up its resilience fixes to the same files (`backend/main.py`,
+`backend/routes/objects.py`) before this PR merges. See `docs/DECISIONS.md`
+(27.09 entry) and `docs/CHANGELOG.md` (27.09 entry) for full detail.
 
 ## Where to look next
 
