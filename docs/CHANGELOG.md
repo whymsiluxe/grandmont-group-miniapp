@@ -1,5 +1,48 @@
 # Changelog
 
+## 2026-09-27 (worker-profile RMW races + Finish-outbox periodic retry, branch `fix/miniapp-profile-rmw-outbox-retry`)
+
+Two reliability fixes, no behavior/UI redesign.
+
+### Fixed
+- **worker_profiles.json lost-update races**: four request-path mutation sites
+  (`_get_worker_skills_v2` legacy skills_v2 migration, `update_my_profile` PATCH
+  `/api/profile/me`, `verify_worker_skill` owner verification, `upload_my_avatar`
+  avatar flag/name update) used the unsafe `load -> mutate -> save` pattern
+  `storage.py` explicitly documents as NOT atomic (`_atomic_write_json` only makes
+  the write crash-safe, not the read-modify-write atomic). Two concurrent requests
+  touching the same profile (e.g. owner verifying a skill while the worker PATCHes
+  their profile) could silently lose one of the two changes. Converted all four to
+  `update_json_transaction(WORKER_PROFILES_FILE, {}, mutator)` — the whole
+  read+mutate+write now happens under one file lock. All existing behavior
+  preserved (verified-preservation semantics, onboarding validation, name
+  sanitation, birthday handling, avatar flag, legacy skills_v2 normalization,
+  response shapes). New tests: `tests/test_worker_profile_rmw_race.py`.
+- **Finish-outbox retry liveness**: `_retry_pending_outbox_events()` (durable
+  pending -> retrying -> applied/dead_letter state machine for
+  DailyExecution projection) was only ever invoked once, at FastAPI startup — a
+  transient failure occurring after startup left the event stuck in `retrying`
+  until the next process restart, which on a stable long-running service could be
+  days. Added a small periodic asyncio background sweep (no new queue framework):
+  `_outbox_retry_sweep_loop` (60s interval, `OUTBOX_RETRY_SWEEP_INTERVAL_SECONDS`)
+  started from `_on_startup` and cancelled from `_on_shutdown`, reusing
+  `_retry_pending_outbox_events()` as-is via `asyncio.to_thread` so the sweep never
+  blocks request handling. A plain in-progress flag (`_outbox_sweep_in_progress`,
+  reset in `finally`) guarantees overlapping ticks skip rather than run
+  concurrently. `dead_letter` events remain excluded from automatic retry;
+  `OUTBOX_MAX_ATTEMPTS`, `acceptance_id` validation, and crash-window
+  reconciliation are unchanged. New tests: `tests/test_outbox_retry_liveness.py`.
+
+### Test infra
+- `tests/test_assignment_lifecycle.py`: 12 tests across
+  `SkillVerificationTests`/`VerifiedPreservationTests`/`ProfileStatsSkillsV2Tests`
+  mocked `_load_worker_profiles`/`_save_worker_profiles` to seed/observe fixture
+  state for `update_my_profile`/`verify_worker_skill`/`profile_stats` — no longer
+  honored now that those functions read `WORKER_PROFILES_FILE` directly inside
+  `update_json_transaction`. Switched to seeding real state into an isolated temp
+  file (same reassign-and-restore pattern already used by
+  `test_ui_fix_round_tofu_names.py`).
+
 ## 2026-09-27 (Grandmont Core workforce shadow integration — worker identity/assignments/absences, disabled by default)
 
 Implements the real HTTP transport in the existing, previously-inert

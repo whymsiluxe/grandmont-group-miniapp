@@ -2,6 +2,7 @@
 """Grandmont Group Mini App — FastAPI backend. Фаза 2 плана: скелет + initData-auth + roles.
 Запуск: uvicorn main:app --host 127.0.0.1 --port 8001
 """
+import asyncio
 import copy
 import csv
 import hashlib
@@ -421,6 +422,19 @@ dpl.configure(DAILY_PLAN_STORE_FILE, PLAN_SYNC_STATE_FILE, WORK_CALENDAR_FILE)
 # moved to core/paths.py -- FINISH_OUTBOX_FILE
 _finish_outbox_lock = __import__('threading').Lock()
 
+# Periodic outbox-retry liveness fix (fix/miniapp-profile-rmw-outbox-retry): startup-only
+# retry left a transiently-failed event stuck in "retrying" until the next process
+# restart, which on a stable long-running service could be days. `_outbox_retry_task`
+# is populated by _on_startup/_on_shutdown below. `_outbox_sweep_in_progress` is a
+# plain bool flag, not an asyncio.Lock -- the check-then-set in
+# _run_outbox_retry_sweep_once has no `await` between them, so it is atomic under
+# asyncio's single-threaded cooperative scheduling (no other coroutine can run
+# between the check and the set); a flag makes that guarantee obvious to read,
+# where a Lock's acquire()/release() pair could tempt a future edit to add an
+# await in between and reintroduce the exact race this exists to prevent.
+_outbox_retry_task: "asyncio.Task | None" = None
+_outbox_sweep_in_progress: bool = False
+
 # Contract ingestion state (Round 5 — Drive scope gated)
 # moved to core/paths.py -- CONTRACT_INGEST_STATE_FILE
 _CONTRACT_INGEST_LOCK = __import__('threading').Lock()
@@ -481,6 +495,30 @@ async def _on_startup():
             print(f"[startup] Migrated {migrated} legacy abwesenheit id(s)")
     except Exception as e:
         print(f"[startup] abwesenheit legacy-id migration failed: {e}")
+
+    # Liveness fix: the retry above only ever runs once, at process startup --
+    # a transient failure (network blip, momentary lock contention) after that
+    # left the event stuck in "retrying" until the next restart, which on a
+    # stable service could be days. Start a small periodic sweep so pending/
+    # retrying events get another chance without needing a restart.
+    global _outbox_sweep_in_progress, _outbox_retry_task
+    _outbox_sweep_in_progress = False
+    _outbox_retry_task = asyncio.create_task(_outbox_retry_sweep_loop())
+
+
+@app.on_event("shutdown")
+async def _on_shutdown():
+    """Stop the periodic outbox-retry sweep cleanly -- cancel and await it so
+    it doesn't log a "Task was destroyed but it is pending" warning or leak
+    into the next test/process."""
+    global _outbox_retry_task
+    if _outbox_retry_task is not None:
+        _outbox_retry_task.cancel()
+        try:
+            await _outbox_retry_task
+        except asyncio.CancelledError:
+            pass
+        _outbox_retry_task = None
 
 
 @app.exception_handler(CorruptJsonError)
@@ -916,16 +954,22 @@ def get_work_types(user: dict = Depends(get_current_user)):
 def _get_worker_skills_v2(user_id) -> list:
     """Профиль работника -> нормализованный skills_v2, с idempotent миграцией
     legacy 'skills' (список названий) при первом обращении -- ТОЛЬКО если реально
-    нужна миграция (skills_v2 отсутствует), файл не переписывается на каждый read."""
-    profiles = _load_worker_profiles()
+    нужна миграция (skills_v2 отсутствует), файл не переписывается на каждый read.
+
+    RMW под update_json_transaction (не load->mutate->save по отдельности) --
+    иначе конкурентный update_my_profile/verify_worker_skill на том же профиле
+    мог тихо затереться этой миграцией или наоборот (см. storage.py docstring)."""
     key = str(user_id)
-    profile = profiles.get(key, {"skills": [], "quiz_completed": False})
-    skills_v2, changed = pskills.normalize_profile_skills(profile)
-    if changed:
-        profile['skills_v2'] = skills_v2
-        profiles[key] = profile
-        _save_worker_profiles(profiles)
-    return skills_v2
+
+    def _mutator(profiles):
+        profile = profiles.get(key, {"skills": [], "quiz_completed": False})
+        skills_v2, changed = pskills.normalize_profile_skills(profile)
+        if changed:
+            profile['skills_v2'] = skills_v2
+            profiles[key] = profile
+        return skills_v2
+
+    return update_json_transaction(WORKER_PROFILES_FILE, {}, _mutator)
 
 
 # moved to core/constants.py -- _INVISIBLE_FILLER_CHARS
@@ -1153,9 +1197,12 @@ class ProfileUpdateBody(BaseModel):
 
 @app.patch("/api/profile/me")
 def update_my_profile(body: ProfileUpdateBody, user: dict = Depends(get_current_user)):
-    profiles = _load_worker_profiles()
+    """RMW под update_json_transaction -- profile-зависимая часть (existing_by_id
+    для skills_v2 verified-preservation, onboarding merge-check против сохранённых
+    полей, финальный update+save) выполняется ВНУТРИ мутатора на одном захвате
+    лока, иначе конкурентный verify_worker_skill/avatar-upload/skills_v2-миграция
+    на том же профиле мог тихо затереться этим PATCH или наоборот (storage.py)."""
     key = str(user['id'])
-    profile = profiles.get(key, {"skills": [], "quiz_completed": False})
     role = _load_roles().get(key, 'worker')
     updates = body.dict(exclude_unset=True)
     if 'name' in updates:
@@ -1170,51 +1217,56 @@ def update_my_profile(body: ProfileUpdateBody, user: dict = Depends(get_current_
         for s in updates['skills_v2']:
             if s.get('level') not in pskills.SKILL_LEVELS:
                 raise HTTPException(400, f"Недопустимый уровень навыка: {s.get('level')!r}")
-        # 01.08 (доп.раунд П3): было -- ЛЮБОЙ PATCH skills_v2 сбрасывал verified=False
-        # для ВСЕГО списка, включая навыки, которые вообще не менялись (реальный баг:
-        # owner подтверждает 3 навыка, worker меняет уровень 4-го -- все 3 подтверждения
-        # молча слетали). Теперь: verified сохраняется, если И skill_id, И level
-        # совпадают с тем, что уже было в сохранённом профиле; новый/изменённый навык
-        # получает verified=False (worker всё ещё не может сам его подтвердить -- см.
-        # verify_worker_skill ниже, единственный способ поставить True).
-        existing_by_id = {s['skill_id']: s for s in (profile.get('skills_v2') or []) if 'skill_id' in s}
-        normalized = []
-        for s in updates['skills_v2']:
-            prior = existing_by_id.get(s.get('skill_id'))
-            unchanged = prior is not None and prior.get('level') == s.get('level')
-            normalized.append({
-                "skill_id": s.get('skill_id'),
-                "level": s.get('level'),
-                "verified": bool(prior.get('verified')) if unchanged else False,
-            })
-        updates['skills_v2'] = normalized
-    # 01.08 (спека п.3): onboarding_completed нельзя установить, пока обязательные
-    # условия не выполнены -- проверяем на РЕЗУЛЬТИРУЮЩЕМ профиле (после merge с
-    # уже сохранёнными полями), не только на этом одном PATCH-запросе, т.к. frontend
-    # сохраняет профиль по шагам (спека: "Сначала сохранить профиль, затем
-    # установить onboarding_completed: true").
-    if updates.get('onboarding_completed'):
-        merged_name = updates.get('name', profile.get('name'))
-        merged_skills = updates.get('skills_v2', profile.get('skills_v2', []))
-        merged_birthday = updates.get('birthday', profile.get('birthday'))
-        if not _sanitize_display_name(merged_name, ''):
-            raise HTTPException(400, "Укажите имя, чтобы завершить регистрацию")
-        # Раунд 6 §3.1: дата рождения обязательна для Worker (Owner — нет).
-        if role == 'worker' and not merged_birthday:
-            raise HTTPException(400, "Укажите дату рождения, чтобы завершить регистрацию")
-        if not merged_skills:
-            raise HTTPException(400, "Выберите хотя бы один навык")
-        for s in merged_skills:
-            level = s.get('level') if isinstance(s, dict) else None
-            if level not in pskills.SKILL_LEVELS:
-                raise HTTPException(400, "Укажите уровень для каждого выбранного навыка")
-        updates['onboarding_completed_at'] = datetime.utcnow().isoformat() + 'Z'
-        updates['onboarding_version'] = 2
-        updates['quiz_completed'] = True  # legacy-совместимость (спека п.3)
-    profile.update(updates)
-    profiles[key] = profile
-    _save_worker_profiles(profiles)
-    return profile
+
+    def _mutator(profiles):
+        profile = profiles.get(key, {"skills": [], "quiz_completed": False})
+        if 'skills_v2' in updates:
+            # 01.08 (доп.раунд П3): было -- ЛЮБОЙ PATCH skills_v2 сбрасывал verified=False
+            # для ВСЕГО списка, включая навыки, которые вообще не менялись (реальный баг:
+            # owner подтверждает 3 навыка, worker меняет уровень 4-го -- все 3 подтверждения
+            # молча слетали). Теперь: verified сохраняется, если И skill_id, И level
+            # совпадают с тем, что уже было в сохранённом профиле; новый/изменённый навык
+            # получает verified=False (worker всё ещё не может сам его подтвердить -- см.
+            # verify_worker_skill ниже, единственный способ поставить True).
+            existing_by_id = {s['skill_id']: s for s in (profile.get('skills_v2') or []) if 'skill_id' in s}
+            normalized = []
+            for s in updates['skills_v2']:
+                prior = existing_by_id.get(s.get('skill_id'))
+                unchanged = prior is not None and prior.get('level') == s.get('level')
+                normalized.append({
+                    "skill_id": s.get('skill_id'),
+                    "level": s.get('level'),
+                    "verified": bool(prior.get('verified')) if unchanged else False,
+                })
+            updates['skills_v2'] = normalized
+        # 01.08 (спека п.3): onboarding_completed нельзя установить, пока обязательные
+        # условия не выполнены -- проверяем на РЕЗУЛЬТИРУЮЩЕМ профиле (после merge с
+        # уже сохранёнными полями), не только на этом одном PATCH-запросе, т.к. frontend
+        # сохраняет профиль по шагам (спека: "Сначала сохранить профиль, затем
+        # установить onboarding_completed: true").
+        if updates.get('onboarding_completed'):
+            merged_name = updates.get('name', profile.get('name'))
+            merged_skills = updates.get('skills_v2', profile.get('skills_v2', []))
+            merged_birthday = updates.get('birthday', profile.get('birthday'))
+            if not _sanitize_display_name(merged_name, ''):
+                raise HTTPException(400, "Укажите имя, чтобы завершить регистрацию")
+            # Раунд 6 §3.1: дата рождения обязательна для Worker (Owner — нет).
+            if role == 'worker' and not merged_birthday:
+                raise HTTPException(400, "Укажите дату рождения, чтобы завершить регистрацию")
+            if not merged_skills:
+                raise HTTPException(400, "Выберите хотя бы один навык")
+            for s in merged_skills:
+                level = s.get('level') if isinstance(s, dict) else None
+                if level not in pskills.SKILL_LEVELS:
+                    raise HTTPException(400, "Укажите уровень для каждого выбранного навыка")
+            updates['onboarding_completed_at'] = datetime.utcnow().isoformat() + 'Z'
+            updates['onboarding_version'] = 2
+            updates['quiz_completed'] = True  # legacy-совместимость (спека п.3)
+        profile.update(updates)
+        profiles[key] = profile
+        return profile
+
+    return update_json_transaction(WORKER_PROFILES_FILE, {}, _mutator)
 
 
 class SkillVerificationBody(BaseModel):
@@ -1226,19 +1278,25 @@ def verify_worker_skill(user_id: str, skill_id: str, body: SkillVerificationBody
                          user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
     """01.08 (спека п.4): только Owner подтверждает навык работника. Worker не может
     сам выставить verified: true -- см. update_my_profile выше, self-service PATCH
-    всегда сбрасывает verified в False."""
-    profiles = _load_worker_profiles()
+    всегда сбрасывает verified в False.
+
+    RMW под update_json_transaction -- read+normalize+set_verification+save на
+    одном захвате лока, иначе конкурентный update_my_profile/avatar-upload на том
+    же профиле мог тихо затереться этим подтверждением или наоборот (storage.py)."""
     key = str(user_id)
-    profile = profiles.get(key)
-    if not profile:
-        raise HTTPException(404, "Профиль не найден")
-    skills_v2, _changed = pskills.normalize_profile_skills(profile)
-    skills_v2, found = pskills.set_skill_verification(skills_v2, skill_id, body.verified)
-    if not found:
-        raise HTTPException(404, "У работника нет такого навыка")
-    profile['skills_v2'] = skills_v2
-    profiles[key] = profile
-    _save_worker_profiles(profiles)
+
+    def _mutator(profiles):
+        profile = profiles.get(key)
+        if not profile:
+            raise HTTPException(404, "Профиль не найден")
+        skills_v2, _changed = pskills.normalize_profile_skills(profile)
+        skills_v2, found = pskills.set_skill_verification(skills_v2, skill_id, body.verified)
+        if not found:
+            raise HTTPException(404, "У работника нет такого навыка")
+        profile['skills_v2'] = skills_v2
+        profiles[key] = profile
+
+    update_json_transaction(WORKER_PROFILES_FILE, {}, _mutator)
     return {"skill_id": skill_id, "verified": body.verified}
 
 
@@ -1264,13 +1322,19 @@ async def upload_my_avatar(file: UploadFile = File(...), user: dict = Depends(ge
             os.remove(os.path.join(AVATAR_DIR, fname))
     with open(os.path.join(AVATAR_DIR, f"{uid}.{ext}"), 'wb') as f:
         f.write(raw)
-    profiles = _load_worker_profiles()
-    profile = profiles.get(uid, {"skills": [], "quiz_completed": False})
-    profile['avatar'] = True
-    if not profile.get('name'):
-        profile['name'] = user.get('first_name', uid)
-    profiles[uid] = profile
-    _save_worker_profiles(profiles)
+
+    # RMW под update_json_transaction -- иначе конкурентный update_my_profile/
+    # verify_worker_skill на том же профиле мог тихо затереться этим avatar-флагом
+    # или наоборот (storage.py). Файл на диске (сам аватар) пишется вне лока
+    # профилей -- отдельный ресурс, гонка с ним тут не в скоупе этого фикса.
+    def _mutator(profiles):
+        profile = profiles.get(uid, {"skills": [], "quiz_completed": False})
+        profile['avatar'] = True
+        if not profile.get('name'):
+            profile['name'] = user.get('first_name', uid)
+        profiles[uid] = profile
+
+    update_json_transaction(WORKER_PROFILES_FILE, {}, _mutator)
     return {"status": "ok"}
 
 
@@ -6717,6 +6781,16 @@ def _outbox_save(outbox: dict) -> None:
 # -- never silently dropped, never silently retried forever either.
 OUTBOX_MAX_ATTEMPTS = 10
 
+# Periodic sweep interval for the liveness fix (fix/miniapp-profile-rmw-outbox-retry):
+# this is a small internal app (single-VPS, low request volume, no queue framework) --
+# a plain asyncio background task polling every 60s is more than fast enough to notice
+# a transient failure well before OUTBOX_MAX_ATTEMPTS (10 attempts) would exhaust itself,
+# without busy-looping or adding load. No existing outbox-specific interval constant to
+# match against (this is the first periodic task in the codebase); 60s sits inside the
+# 30-120s band the task called out and is symmetric with the exponential-ish but bounded
+# total budget: 10 attempts * 60s ≈ worst case a few minutes to dead_letter, not hours.
+OUTBOX_RETRY_SWEEP_INTERVAL_SECONDS = 60
+
 
 def _outbox_write_pending(session_id: str, plan_id: str, plan_version: int,
                           worker_id: str, date_str: str, object_id: str,
@@ -6827,6 +6901,52 @@ def _retry_pending_outbox_events() -> int:
         except Exception as e:
             _outbox_mark_failed(session_id, str(e))
     return retried
+
+
+async def _run_outbox_retry_sweep_once() -> int | None:
+    """One tick of the periodic liveness fix: reuses _retry_pending_outbox_events()
+    as-is (no reimplementation of the state machine) via asyncio.to_thread so the
+    (synchronous, file-I/O-bound) sweep never blocks the event loop / normal request
+    handling. Returns None (instead of running) if a sweep is already in flight.
+
+    The check-then-set on _outbox_sweep_in_progress below has no `await` between
+    them, so no other coroutine can interleave there under asyncio's cooperative
+    scheduling -- two callers racing this function (e.g. two overlapping scheduler
+    ticks, or a test firing it twice concurrently) always have exactly one of them
+    see False and proceed, never both. The one that proceeds always resets the flag
+    in `finally`, including if _retry_pending_outbox_events() itself raises -- a
+    failed sweep must not permanently wedge every future tick into "skip"."""
+    global _outbox_sweep_in_progress
+    if _outbox_sweep_in_progress:
+        return None
+    _outbox_sweep_in_progress = True
+    try:
+        return await asyncio.to_thread(_retry_pending_outbox_events)
+    finally:
+        _outbox_sweep_in_progress = False
+
+
+async def _outbox_retry_sweep_loop():
+    """Runtime counterpart to the startup-only retry above (Issue 2 liveness fix,
+    fix/miniapp-profile-rmw-outbox-retry): without this, a transient failure after
+    startup left an event stuck in "retrying" until the next process restart, which
+    on a stable long-running service could be days. Started from _on_startup,
+    cancelled from _on_shutdown -- never left running after the app stops.
+
+    A sweep failure is logged and MUST NOT crash the app or stop future ticks --
+    the whole point of this loop is resilience against transient failures, so an
+    unexpected exception inside one tick is exactly the kind of thing it exists to
+    survive."""
+    while True:
+        try:
+            await asyncio.sleep(OUTBOX_RETRY_SWEEP_INTERVAL_SECONDS)
+            retried = await _run_outbox_retry_sweep_once()
+            if retried:
+                print(f"[outbox-sweep] Retried {retried} pending finish-outbox event(s)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[outbox-sweep] tick failed (will retry next interval): {e}")
 
 
 def _outbox_dead_letter_count() -> int:
