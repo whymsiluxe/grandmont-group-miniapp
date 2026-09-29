@@ -95,6 +95,7 @@ class CoreIntegrationConfig:
     base_url: str = ''
     service_credential: str = ''
     timeout_seconds: float = 5.0
+    organization_id: str = ''
 
     @classmethod
     def from_env(cls) -> 'CoreIntegrationConfig':
@@ -102,12 +103,21 @@ class CoreIntegrationConfig:
         -- off unless explicitly set truthy. No legacy PROMONTA_* name for
         this: Core integration did not exist before the rebrand, so there is
         nothing to stay backward-compatible with here (unlike AGENT_ROOT).
+
+        organization_id (30.09, invite flow): same CORE_ORGANIZATION_ID env
+        var CRM's core_client.py already reads -- single-tenant install, one
+        organization for the whole Grandmont Group deployment. Needed here
+        only for invite-consume/onboarding-request, where no existing
+        identity mapping exists yet to resolve an org id from (contrast
+        core/workforce_shadow.py's resolve_worker_uuid, which gets org_id
+        from an ALREADY-mapped worker).
         """
         return cls(
             enabled=_env_bool('CORE_INTEGRATION_ENABLED', 'CORE_INTEGRATION_ENABLED', False),
             base_url=_env_compat('CORE_BASE_URL', 'CORE_BASE_URL', '') or '',
             service_credential=_env_compat('CORE_SERVICE_CREDENTIAL', 'CORE_SERVICE_CREDENTIAL', '') or '',
             timeout_seconds=_env_float('CORE_TIMEOUT_SECONDS', 'CORE_TIMEOUT_SECONDS', 5.0),
+            organization_id=_env_compat('CORE_ORGANIZATION_ID', 'CORE_ORGANIZATION_ID', '') or '',
         )
 
     def validate(self) -> None:
@@ -162,12 +172,13 @@ separate from TransportFn because reads are not idempotency-keyed commands.
 
 @dataclass
 class GrandmontCoreClient:
-    """Adapter boundary for the future Grandmont Core integration.
-
-    Nothing in the current Mini App calls this yet. It exists so that once
-    Core is production-ready, the real integration work is "implement
-    `transport` and flip CORE_INTEGRATION_ENABLED=true", not "go rewrite
-    daily_plan_lib.py/assignment_matching.py from scratch".
+    """Adapter boundary for the Grandmont Core integration. CoreHttpTransport
+    below is a real httpx-based implementation, wired in by get_core_client()
+    whenever CORE_INTEGRATION_ENABLED=true -- this is not a scaffold. Callers
+    already using it: create_absence, resolve_worker_identity,
+    consume_worker_invite, create_worker_onboarding_request. Disabled mode
+    (the default) still short-circuits before any network code runs, so
+    importing this module or leaving the flag unset has zero side effects.
 
     generic `command()` method:
       - raises CoreIntegrationError(DISABLED, ...) immediately when
@@ -317,6 +328,38 @@ class GrandmontCoreClient:
         if note:
             payload['note'] = note
         return self.command('absence/create', payload, idempotency_key=idempotency_key)
+
+
+    def consume_worker_invite(self, *, organization_id: str, token_hash: str,
+                               telegram_user_id: str, idempotency_key: str) -> CoreResult:
+        """POST /commands/worker-invite/consume. telegram_user_id must already
+        be the server-verified Telegram user id from this session's validated
+        initData -- never a client-asserted value. token_hash is the SHA-256
+        of the raw opaque token from the deep-link's startapp parameter,
+        computed by the caller; the raw token itself is never sent to Core."""
+        payload = {
+            'organization_id': organization_id,
+            'token_hash': token_hash,
+            'telegram_user_id': telegram_user_id,
+        }
+        return self.command('worker-invite/consume', payload, idempotency_key=idempotency_key)
+
+    def create_worker_onboarding_request(self, *, organization_id: str, telegram_user_id: str,
+                                          telegram_username: str | None, first_name: str,
+                                          last_name: str, phone: str, idempotency_key: str) -> CoreResult:
+        """POST /commands/worker-onboarding/request -- Flow B (Miniapp-first):
+        worker opened the Mini App with no invite token. Creates a PENDING
+        request for CRM admin review; never creates a Worker itself (that
+        only happens on worker-onboarding/approve, admin-triggered)."""
+        payload = {
+            'organization_id': organization_id,
+            'telegram_user_id': telegram_user_id,
+            'telegram_username': telegram_username,
+            'first_name': first_name,
+            'last_name': last_name,
+            'phone': phone,
+        }
+        return self.command('worker-onboarding/request', payload, idempotency_key=idempotency_key)
 
 
 class CoreHttpTransport:

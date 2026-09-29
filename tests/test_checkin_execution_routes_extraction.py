@@ -93,9 +93,17 @@ def test_route_count_invariant():
     # GET /api/bridge/shift/history (item 4's read-only canonical shift
     # bridge -- CRM never starts/stops a shift). All five are registered
     # exactly once via the single app.include_router(_service_bridge_router)
-    # call in main.py. Bump this number again, with the same explanation
-    # discipline, the next time a route is added or removed.
-    assert len(list(iter_app_routes(backend.app))) == 191
+    # call in main.py.
+    # 191 -> 193: routes/auth.py added 2 POST routes for the worker
+    # onboarding invite flow: POST /api/invite/consume (Flow A, CRM-first --
+    # consume an opaque invite token from a t.me deep-link) and POST
+    # /api/onboarding/request (Flow B, Miniapp-first -- create a pending
+    # onboarding request for CRM admin review). Both depend on
+    # get_verified_telegram_user, not get_current_user, since the calling
+    # Telegram user is by definition not in roles.json yet.
+    # Bump this number again, with the same explanation discipline, the next
+    # time a route is added or removed.
+    assert len(list(iter_app_routes(backend.app))) == 193
 
 
 def test_checkin_router_has_no_main_import():
