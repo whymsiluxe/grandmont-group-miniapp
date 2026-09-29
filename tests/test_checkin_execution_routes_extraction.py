@@ -85,7 +85,7 @@ def test_no_duplicate_routes_anywhere_in_the_app():
 
 
 def test_route_count_invariant():
-    assert len(list(iter_app_routes(backend.app))) == 186
+    assert len(list(iter_app_routes(backend.app))) == 191
 
 
 def test_checkin_router_has_no_main_import():
