@@ -85,7 +85,17 @@ def test_no_duplicate_routes_anywhere_in_the_app():
 
 
 def test_route_count_invariant():
-    assert len(list(iter_app_routes(backend.app))) == 186
+    # 186 -> 191: routes/service_bridge.py added 5 GET/POST routes for the
+    # CRM Worker Operations integration (none of it was on main before this
+    # branch): GET /api/bridge/daily-plan, POST /api/bridge/daily-plan/{id}/
+    # accept, POST /api/bridge/daily-plan/{id}/amendments/{id}/accept (the
+    # DailyPlan/acceptance bridge), plus GET /api/bridge/shift/active and
+    # GET /api/bridge/shift/history (item 4's read-only canonical shift
+    # bridge -- CRM never starts/stops a shift). All five are registered
+    # exactly once via the single app.include_router(_service_bridge_router)
+    # call in main.py. Bump this number again, with the same explanation
+    # discipline, the next time a route is added or removed.
+    assert len(list(iter_app_routes(backend.app))) == 191
 
 
 def test_checkin_router_has_no_main_import():

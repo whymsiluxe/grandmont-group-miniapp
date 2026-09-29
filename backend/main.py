@@ -8137,6 +8137,28 @@ _execution_summary = _daily_plan_handlers.execution_summary
 _compute_risk_level = _daily_plan_handlers.compute_risk_level
 
 
+# ── CRM Worker-Operations service bridge (additive, narrow scope) ──────────
+# See routes/service_bridge.py module docstring: exposes DailyPlan read +
+# Acceptance/Amendment-ack write to the CRM backend over a shared service
+# token, so CRM's Worker Operations workspace reads/writes the SAME
+# DailyPlan store this app's own /api/daily-plan/* routes use, instead of
+# maintaining a second one. Disabled (503) unless MINIAPP_SERVICE_TOKEN is set.
+try:
+    from .routes.service_bridge import ServiceBridgeRouteDeps, create_service_bridge_router
+except ImportError:
+    from routes.service_bridge import ServiceBridgeRouteDeps, create_service_bridge_router  # noqa: E402
+
+_service_bridge_router, _service_bridge_handlers = create_service_bridge_router(ServiceBridgeRouteDeps(
+    business_today=lambda: business_today(),
+    load_roles=lambda: _load_roles(),
+    load_checkin_meta=lambda: _load_checkin_meta(),
+    is_active_photo_checkin_session=lambda s: _is_active_photo_checkin_session(s),
+    hours_from_session=lambda s: _hours_from_session(s),
+    session_hours_live=lambda s: _session_hours_live(s),
+))
+app.include_router(_service_bridge_router)
+
+
 # ── Contract ingestion routes (Round 5 — Drive scope gated) ─────────────────
 
 # moved to core/constants.py -- _EMPTY_CONTRACT_STORE

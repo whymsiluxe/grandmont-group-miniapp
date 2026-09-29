@@ -723,7 +723,7 @@ class ProductionPackageImportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         out = result.stdout
 
-        self.assertIn('ROUTES 186', out, out)  # 20.09: +1 for GET /api/checkin/{session_id}/finish-context (frozen accepted-plan snapshot)
+        self.assertIn('ROUTES 191', out, out)  # 186 -> 191: routes/service_bridge.py's 5 CRM Worker Operations bridge routes (DailyPlan read/accept/amendment-accept + read-only shift active/history, item 4) -- see test_checkin_execution_routes_extraction.py::test_route_count_invariant for the itemized list.
 
         self.assertIn('MINIAPP_FILE', out)
         miniapp_file_line = next(l for l in out.splitlines() if l.startswith('MINIAPP_FILE'))
