@@ -10763,6 +10763,44 @@ async function initApp() {
 
   showSplash();
 
+  // 30.09: worker onboarding invite (Flow A). This Mini App launches via a
+  // Telegram Menu Button web_app URL (setChatMenuButton), NOT an attached
+  // Mini App opened via t.me/<bot>/<app>?startapp=<token> -- Menu Button
+  // web_apps have no Telegram-native start_param mechanism, so the invite
+  // token travels as an ordinary URL query parameter on the menu button's
+  // own URL (CRM builds it as .../app.html?invite=<token>) and is read here
+  // from location.search, not from Telegram.WebApp.initDataUnsafe. Consumed
+  // exactly once, before the normal auth bootstrap (fetchRole) -- a
+  // not-yet-whitelisted worker must be able to redeem the invite and gain
+  // access without any manual roles.json edit.
+  try {
+    const _inviteToken = new URLSearchParams(window.location.search).get('invite');
+    if (_inviteToken) {
+      const res = await fetch(API_BASE + '/api/invite/consume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Telegram-Init-Data': initData },
+        body: JSON.stringify({ token: _inviteToken }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        _hideSplashError?.();
+        document.body.innerHTML = '<div style="padding:2rem 1rem;text-align:center;color:var(--text-light)">Приглашение недействительно или уже использовано' + (body.detail ? ': ' + body.detail : '') + '</div>';
+        return;
+      }
+      // Strip the token from the visible URL -- it is single-use and must
+      // not be replayed via browser back/forward or an accidental reload
+      // hitting an already-consumed (now-rejected) invite.
+      try {
+        const cleanUrl = window.location.pathname + window.location.hash;
+        window.history.replaceState({}, '', cleanUrl);
+      } catch (e) {}
+    }
+  } catch (e) {
+    // Best-effort: if invite consume itself fails unexpectedly, fall through
+    // to normal auth -- an existing whitelisted worker opening a stale link
+    // must not be locked out by an invite-handling bug.
+  }
+
   // Раунд 5 §2: авторизация — критическая bootstrap-задача. При сбое показываем
   // экран ошибки с "Повторить" (не открываем сломанное приложение). fetchRole нужна
   // до prefetch (endpoint абвезенхайт зависит от роли).
