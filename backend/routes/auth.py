@@ -17,11 +17,15 @@ model/response shapes/permission checks/side effects are byte-for-byte the
 same as the endpoints previously defined directly on `app` in main.py --
 this is code motion, not a behavior change.
 """
+import hashlib
+
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 try:
     from ..core.permissions import (
         get_current_user,
+        get_verified_telegram_user,
         require_owner,
         _load_roles,
         _save_roles,
@@ -30,9 +34,11 @@ try:
     )
     from ..core.profiles import _load_worker_profiles, _sanitize_display_name
     from ..core.telegram import send_telegram_message
+    from ..core.grandmont_core_client import get_core_client, CoreIntegrationError, CoreErrorKind
 except ImportError:
     from core.permissions import (  # noqa: E402
         get_current_user,
+        get_verified_telegram_user,
         require_owner,
         _load_roles,
         _save_roles,
@@ -41,6 +47,7 @@ except ImportError:
     )
     from core.profiles import _load_worker_profiles, _sanitize_display_name  # noqa: E402
     from core.telegram import send_telegram_message  # noqa: E402
+    from core.grandmont_core_client import get_core_client, CoreIntegrationError, CoreErrorKind  # noqa: E402
 
 
 router = APIRouter()
@@ -104,3 +111,108 @@ def revoke_role(target_user_id: str, user: dict = Depends(get_current_user), _: 
     roles.pop(target_user_id, None)
     _save_roles(roles)
     return {"status": "ok"}
+
+
+class InviteConsumeBody(BaseModel):
+    token: str
+
+
+class OnboardingRequestBody(BaseModel):
+    first_name: str
+    last_name: str = ''
+    phone: str = ''
+
+
+@router.post("/api/invite/consume")
+def consume_invite(
+    body: InviteConsumeBody,
+    user: dict = Depends(get_verified_telegram_user),
+):
+    """Flow A (CRM-first): worker opened the Mini App via a t.me deep-link
+    (?startapp=<token>) after an admin created them in CRM and generated an
+    invite. Depends on get_verified_telegram_user, NOT get_current_user --
+    this user is by definition not in roles.json yet, so the whitelist gate
+    in get_current_user would 403 before this code ever ran.
+
+    telegram_user_id comes from `user` (server-verified via HMAC initData
+    check), never from the request body -- the frontend cannot assert who it
+    is. The raw token is hashed here; only the hash ever reaches Core.
+    """
+    client = get_core_client()
+    if not client.config.enabled:
+        raise HTTPException(503, "Интеграция с Core отключена")
+    if not client.config.organization_id:
+        raise HTTPException(503, "CORE_ORGANIZATION_ID не настроен")
+
+    token_hash = hashlib.sha256(body.token.encode()).hexdigest()
+    telegram_user_id = str(user['id'])
+    idempotency_key = f"miniapp-invite-consume-{token_hash}-{telegram_user_id}"
+
+    try:
+        result = client.consume_worker_invite(
+            organization_id=client.config.organization_id,
+            token_hash=token_hash,
+            telegram_user_id=telegram_user_id,
+            idempotency_key=idempotency_key,
+        )
+    except CoreIntegrationError as e:
+        if e.kind == CoreErrorKind.REJECTED:
+            raise HTTPException(409, "Приглашение недействительно, истекло или уже использовано")
+        raise HTTPException(503, "Core недоступен, попробуйте позже")
+
+    if not result.ok:
+        raise HTTPException(409, "Приглашение недействительно, истекло или уже использовано")
+
+    # Successful Core-side consume is the authorization decision. roles.json
+    # stays the LOCAL authorization representation get_current_user already
+    # reads on every request -- Core's legacy_maps stays the canonical
+    # identity link; this write only mirrors that decision into the
+    # whitelist gate so the worker does not need a manual SSH/roles.json
+    # edit to get in.
+    roles = _load_roles()
+    if telegram_user_id not in roles:
+        roles[telegram_user_id] = 'worker'
+        _save_roles(roles)
+
+    worker = (result.data or {}).get('worker') or {}
+    return {"status": "ok", "worker_id": worker.get('id')}
+
+
+@router.post("/api/onboarding/request")
+def request_onboarding(
+    body: OnboardingRequestBody,
+    user: dict = Depends(get_verified_telegram_user),
+):
+    """Flow B (Miniapp-first): worker opened the Mini App with no invite
+    token and is not yet whitelisted. Creates a PENDING onboarding request in
+    Core for CRM admin review -- never auto-creates a canonical Worker, never
+    grants Miniapp access by itself. Depends on get_verified_telegram_user
+    for the same reason as consume_invite above.
+    """
+    client = get_core_client()
+    if not client.config.enabled:
+        raise HTTPException(503, "Интеграция с Core отключена")
+    if not client.config.organization_id:
+        raise HTTPException(503, "CORE_ORGANIZATION_ID не настроен")
+
+    telegram_user_id = str(user['id'])
+    idempotency_key = f"miniapp-onboarding-request-{telegram_user_id}"
+
+    try:
+        result = client.create_worker_onboarding_request(
+            organization_id=client.config.organization_id,
+            telegram_user_id=telegram_user_id,
+            telegram_username=user.get('username'),
+            first_name=body.first_name,
+            last_name=body.last_name,
+            phone=body.phone,
+            idempotency_key=idempotency_key,
+        )
+    except CoreIntegrationError:
+        raise HTTPException(503, "Core недоступен, попробуйте позже")
+
+    if not result.ok:
+        raise HTTPException(409, "Не удалось создать заявку")
+
+    request_data = (result.data or {}).get('request') or {}
+    return {"status": "pending", "request_id": request_data.get('id')}

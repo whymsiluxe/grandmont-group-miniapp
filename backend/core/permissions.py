@@ -95,9 +95,15 @@ def validate_init_data(init_data: str) -> dict:
         raise HTTPException(401, "initData: invalid signature")
 
     try:
-        return json.loads(parsed['user'])
+        user = json.loads(parsed['user'])
     except (KeyError, json.JSONDecodeError):
         raise HTTPException(401, "initData: no user")
+    # start_param carries the invite token from a t.me deep-link
+    # (?startapp=<token>) -- Telegram signs it as part of initData, so this
+    # value is as trustworthy as the user id itself. None when the Mini App
+    # was opened without a deep-link (normal menu-button open).
+    user['_start_param'] = parsed.get('start_param')
+    return user
 
 
 def _session_secret() -> bytes:
@@ -184,6 +190,33 @@ def _notify_owner_new_user(user: dict, roles: dict):
     _save_notified_users(notified)
 
 
+def get_verified_telegram_user(
+    authorization: str | None = Header(default=None),
+    x_telegram_init_data: str | None = Header(default=None),
+) -> dict:
+    """Auth-only half of the old get_current_user: proves WHO is calling
+    (valid session token or HMAC-valid Telegram initData), without requiring
+    that identity to already be in roles.json. Split out (30.09, worker
+    invite flow) because invite/onboarding-request consumption must run for
+    a Telegram user who is, by definition, not whitelisted yet -- the old
+    combined function 403'd before that code could ever run. get_current_user
+    below still does full auth+whitelist for every other route; this is not
+    a relaxation of any existing endpoint's protection."""
+    if authorization and authorization.lower().startswith('bearer '):
+        token = authorization[7:].strip()
+        user_id = verify_session_token(token)
+        user = {'id': int(user_id)} if user_id.lstrip('-').isdigit() else {'id': user_id}
+        user['_auth_source'] = 'bearer'
+        user['_start_param'] = None
+        return user
+    elif x_telegram_init_data:
+        user = validate_init_data(x_telegram_init_data)
+        user['_auth_source'] = 'telegram_init_data'
+        return user
+    else:
+        raise HTTPException(401, "Нет initData и нет session token")
+
+
 def get_current_user(
     authorization: str | None = Header(default=None),
     x_telegram_init_data: str | None = Header(default=None),
@@ -192,18 +225,20 @@ def get_current_user(
     12-часовой backend-token, не требует свежего initData на каждый запрос.
     X-Telegram-Init-Data остаётся как fallback для обратной совместимости со старыми
     клиентами/вкладками, которые ещё не обновились на новый auth-путь -- временно,
-    убрать после того, как весь трафик перейдёт на токены (см. PROJECT_STATE.md)."""
-    auth_source = ''
-    if authorization and authorization.lower().startswith('bearer '):
-        token = authorization[7:].strip()
-        user_id = verify_session_token(token)
-        user = {'id': int(user_id)} if user_id.lstrip('-').isdigit() else {'id': user_id}
-        auth_source = 'bearer'
-    elif x_telegram_init_data:
-        user = validate_init_data(x_telegram_init_data)
-        auth_source = 'telegram_init_data'
-    else:
-        raise HTTPException(401, "Нет initData и нет session token")
+    убрать после того, как весь трафик перейдёт на токены (см. PROJECT_STATE.md).
+
+    30.09: identity verification itself moved to get_verified_telegram_user,
+    but this function KEEPS the original (authorization, x_telegram_init_data)
+    header params and calls get_verified_telegram_user as a plain function
+    (not via Depends) -- main.py's create_session and 15+ test files call
+    get_current_user(authorization=..., x_telegram_init_data=...) directly,
+    bypassing FastAPI's DI resolution entirely, so changing this signature
+    to `user: dict = Depends(...)` broke every direct caller with a
+    TypeError. This function now only adds the whitelist/role gate on top of
+    get_verified_telegram_user's identity check -- same 401/403 behavior as
+    before the split, unchanged for every existing caller."""
+    user = get_verified_telegram_user(authorization=authorization, x_telegram_init_data=x_telegram_init_data)
+    auth_source = user['_auth_source']
 
     # Whitelist (Фаза 10.1): доступ только тем, кого владелец явно добавил в roles.json —
     # раньше любой Telegram user_id молча получал worker-права по умолчанию (см. get_role ниже).
@@ -212,7 +247,7 @@ def get_current_user(
     # немедленно, даже если у клиента ещё живой 12-часовой токен.
     roles = _load_roles()
     if str(user['id']) not in roles:
-        if x_telegram_init_data and not (authorization and authorization.lower().startswith('bearer ')):
+        if auth_source == 'telegram_init_data':
             _notify_owner_new_user(user, roles)
         raise HTTPException(403, "Доступ не предоставлен. Обратитесь к владельцу.")
     _auth_audit_context.set({
