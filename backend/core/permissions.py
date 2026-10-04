@@ -42,12 +42,12 @@ try:
     from .limits import INIT_DATA_MAX_AGE, SESSION_TOKEN_MAX_AGE, NOTIFIED_USERS_TTL
     from .paths import ROLES_FILE, NOTIFIED_USERS_FILE
     from .storage import _safe_load_json, _atomic_write_json
-    from .telegram import BOT_TOKEN, BOT_TOKEN_NEW, send_telegram_message
+    from .telegram import BOT_TOKEN, BOT_TOKEN_OLD, send_telegram_message
 except ImportError:
     from limits import INIT_DATA_MAX_AGE, SESSION_TOKEN_MAX_AGE, NOTIFIED_USERS_TTL  # noqa: E402
     from paths import ROLES_FILE, NOTIFIED_USERS_FILE  # noqa: E402
     from storage import _safe_load_json, _atomic_write_json  # noqa: E402
-    from telegram import BOT_TOKEN, BOT_TOKEN_NEW, send_telegram_message  # noqa: E402
+    from telegram import BOT_TOKEN, BOT_TOKEN_OLD, send_telegram_message  # noqa: E402
 
 from urllib.parse import parse_qsl
 import json
@@ -73,12 +73,12 @@ def validate_init_data(init_data: str) -> dict:
     """HMAC-валидация Telegram WebApp initData.
     https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
 
-    Bot token migration (2026-10): while BOT_TOKEN_NEW is set, initData signed
-    by EITHER the old bot (BOT_TOKEN) or the new bot (BOT_TOKEN_NEW) is
-    accepted -- lets both Telegram bots serve the same Mini App during
-    cutover. Outbound sends (core/telegram.py) stay on the old BOT_TOKEN
-    until the migration is confirmed complete; only inbound verification is
-    dual here. Remove the BOT_TOKEN_NEW fallback once cutover is final.
+    Bot token migration -- FINAL CUTOVER (2026-10-04): BOT_TOKEN is now the
+    NEW bot (@GrandMont_bot), checked first. BOT_TOKEN_OLD (retired
+    @promonta_bot) is still accepted as a fallback ONLY so any Mini App
+    instance still holding an old-bot-signed initData (e.g. a stale cached
+    page) keeps working through the migration window -- see
+    core/telegram.py's BOT_TOKEN_OLD docstring for the removal window.
     """
     try:
         parsed = dict(parse_qsl(init_data, strict_parsing=True))
@@ -101,8 +101,8 @@ def validate_init_data(init_data: str) -> dict:
     data_check_string = '\n'.join(f'{k}={v}' for k, v in sorted(parsed.items()))
 
     candidate_tokens = [BOT_TOKEN]
-    if BOT_TOKEN_NEW:
-        candidate_tokens.append(BOT_TOKEN_NEW)
+    if BOT_TOKEN_OLD:
+        candidate_tokens.append(BOT_TOKEN_OLD)
 
     if not any(
         hmac.compare_digest(
@@ -125,16 +125,22 @@ def validate_init_data(init_data: str) -> dict:
     return user
 
 
-def _session_secret() -> bytes:
+def _session_secret(bot_token: str = BOT_TOKEN) -> bytes:
     """Домен-разделённый от _secret_key() (initData HMAC) -- разный "usage" в HMAC над
-    тем же BOT_TOKEN, так что компрометация одного не равна компрометации другого."""
-    return hmac.new(b"SessionToken", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    тем же bot_token, так что компрометация одного не равна компрометации другого.
+    Default stays the new primary BOT_TOKEN -- see verify_session_token for the
+    dual-verify fallback during the cutover migration window."""
+    return hmac.new(b"SessionToken", bot_token.encode(), hashlib.sha256).digest()
 
 
 def create_session_token(user_id) -> str:
     """Token = base64url(user_id.exp).hex(hmac). Полезная нагрузка содержит ТОЛЬКО
     user_id и unix-время истечения -- никаких паролей/ключей/ролей внутри, роль каждый
-    раз проверяется заново по актуальному roles.json (см. get_current_user)."""
+    раз проверяется заново по актуальному roles.json (см. get_current_user).
+
+    Bot token migration -- FINAL CUTOVER: always signs with the NEW primary
+    secret (_session_secret() default) only. Never signs with BOT_TOKEN_OLD --
+    old secret is verify-only, see verify_session_token."""
     exp = int(time.time()) + SESSION_TOKEN_MAX_AGE
     payload = f"{user_id}.{exp}"
     payload_b64 = base64.urlsafe_b64encode(payload.encode()).decode().rstrip('=')
@@ -144,14 +150,31 @@ def create_session_token(user_id) -> str:
 
 def verify_session_token(token: str) -> str:
     """Возвращает user_id (str) при валидной подписи и не истёкшем токене, иначе 401.
-    hmac.compare_digest -- constant-time сравнение, не `==` (timing-attack защита)."""
+    hmac.compare_digest -- constant-time сравнение, не `==` (timing-attack защита).
+
+    Bot token migration -- FINAL CUTOVER (2026-10-04): accepts a signature
+    from EITHER the new primary secret OR the old secret (BOT_TOKEN_OLD) as a
+    fallback -- this is what lets a session token created BEFORE cutover
+    keep working for the rest of its 12h TTL without forcing a re-login.
+    create_session_token() above never uses the old secret; this is verify-only.
+    Remove the BOT_TOKEN_OLD fallback branch here once the migration window
+    closes (see core/telegram.py's BOT_TOKEN_OLD docstring)."""
     try:
         payload_b64, sig = token.rsplit('.', 1)
     except ValueError:
         raise HTTPException(401, "session token: malformed")
 
-    expected_sig = hmac.new(_session_secret(), payload_b64.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected_sig, sig):
+    candidate_secrets = [_session_secret()]
+    if BOT_TOKEN_OLD:
+        candidate_secrets.append(_session_secret(BOT_TOKEN_OLD))
+
+    if not any(
+        hmac.compare_digest(
+            hmac.new(secret, payload_b64.encode(), hashlib.sha256).hexdigest(),
+            sig,
+        )
+        for secret in candidate_secrets
+    ):
         raise HTTPException(401, "session token: invalid signature")
 
     try:
