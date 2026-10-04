@@ -42,12 +42,12 @@ try:
     from .limits import INIT_DATA_MAX_AGE, SESSION_TOKEN_MAX_AGE, NOTIFIED_USERS_TTL
     from .paths import ROLES_FILE, NOTIFIED_USERS_FILE
     from .storage import _safe_load_json, _atomic_write_json
-    from .telegram import BOT_TOKEN, send_telegram_message
+    from .telegram import BOT_TOKEN, BOT_TOKEN_NEW, send_telegram_message
 except ImportError:
     from limits import INIT_DATA_MAX_AGE, SESSION_TOKEN_MAX_AGE, NOTIFIED_USERS_TTL  # noqa: E402
     from paths import ROLES_FILE, NOTIFIED_USERS_FILE  # noqa: E402
     from storage import _safe_load_json, _atomic_write_json  # noqa: E402
-    from telegram import BOT_TOKEN, send_telegram_message  # noqa: E402
+    from telegram import BOT_TOKEN, BOT_TOKEN_NEW, send_telegram_message  # noqa: E402
 
 from urllib.parse import parse_qsl
 import json
@@ -62,13 +62,23 @@ _auth_audit_context: ContextVar[dict | None] = ContextVar('grandmont_group_auth_
 _last_seen: dict = {}
 
 
-def _secret_key() -> bytes:
-    return hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+def _secret_key(bot_token: str = BOT_TOKEN) -> bytes:
+    """Default stays the old BOT_TOKEN -- existing callers (main.py's
+    re-export, tests/test_access_control.py's backend._secret_key()) that
+    call this with zero args are unaffected by the migration below."""
+    return hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
 
 
 def validate_init_data(init_data: str) -> dict:
     """HMAC-валидация Telegram WebApp initData.
     https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
+
+    Bot token migration (2026-10): while BOT_TOKEN_NEW is set, initData signed
+    by EITHER the old bot (BOT_TOKEN) or the new bot (BOT_TOKEN_NEW) is
+    accepted -- lets both Telegram bots serve the same Mini App during
+    cutover. Outbound sends (core/telegram.py) stay on the old BOT_TOKEN
+    until the migration is confirmed complete; only inbound verification is
+    dual here. Remove the BOT_TOKEN_NEW fallback once cutover is final.
     """
     try:
         parsed = dict(parse_qsl(init_data, strict_parsing=True))
@@ -89,9 +99,18 @@ def validate_init_data(init_data: str) -> dict:
         raise HTTPException(401, "initData: malformed auth_date")
 
     data_check_string = '\n'.join(f'{k}={v}' for k, v in sorted(parsed.items()))
-    computed_hash = hmac.new(_secret_key(), data_check_string.encode(), hashlib.sha256).hexdigest()
 
-    if not hmac.compare_digest(computed_hash, received_hash):
+    candidate_tokens = [BOT_TOKEN]
+    if BOT_TOKEN_NEW:
+        candidate_tokens.append(BOT_TOKEN_NEW)
+
+    if not any(
+        hmac.compare_digest(
+            hmac.new(_secret_key(tok), data_check_string.encode(), hashlib.sha256).hexdigest(),
+            received_hash,
+        )
+        for tok in candidate_tokens
+    ):
         raise HTTPException(401, "initData: invalid signature")
 
     try:

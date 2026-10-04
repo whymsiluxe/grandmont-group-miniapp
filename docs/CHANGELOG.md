@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-10-04 (Telegram bot token migration, branch `feat/bot-token-migration`)
+
+Owner is moving the Mini App from the old bot (`@promonta_bot`) to a new one
+(`@GrandMont_bot`) without any user/identity disruption. See
+`docs/SECURITY.md` and `docs/DECISIONS.md` for the reasoning.
+
+### Added
+- `BOT_TOKEN_NEW` env var (`backend/core/telegram.py`) — optional, empty
+  string when unset. While set, `validate_init_data()`
+  (`backend/core/permissions.py`) accepts Telegram WebApp initData signed by
+  EITHER `BOT_TOKEN` (old bot) or `BOT_TOKEN_NEW` (new bot). This is the
+  dual-token migration window: both bots' Mini App launches work
+  simultaneously, no production downtime, no forced re-auth.
+- `tests/test_bot_token_migration.py` — 6 regression tests: old-bot initData
+  accepted, new-bot initData accepted, same `telegram_user_id` resolves
+  identically regardless of signer (confirms canonical identity is
+  unaffected), a third unrelated token is still rejected (dual-token ≠
+  accept-anything), tampered new-bot signature still rejected, and
+  `BOT_TOKEN_NEW` unset correctly closes the window (new-bot initData stops
+  validating once migration is marked complete).
+
+### Explicitly unchanged (by design, this phase)
+- Outbound sends (`send_telegram_message`/`send_pdf_to_chat`,
+  `core/telegram.py` + `main.py:2880`) stay on the OLD `BOT_TOKEN` — only
+  INBOUND initData verification is dual. Flipping outbound sends to the new
+  bot is a separate, deliberate cutover step, not automatic from this change.
+- Session tokens (`_session_secret()`/`create_session_token`/
+  `verify_session_token`) stay keyed on the OLD `BOT_TOKEN` only — these are
+  internal, not Telegram-signed, so there's no "which bot signed this"
+  question for them; switching their key would invalidate every live
+  session for no reason connected to the actual migration.
+- `_secret_key()` keeps its old zero-argument call signature as the default
+  (now `bot_token: str = BOT_TOKEN`) — existing callers (`main.py`'s
+  re-export, `tests/test_access_control.py`) are unaffected.
+- CRM's invite-link generation (`backend/workforce.py` in the CRM repo) —
+  confirmed it already points at the plain HTTPS Mini App URL
+  (`https://app.promonta.fun/app.html?invite=<token>`), never a `t.me/<bot>`
+  link, so no change was needed there for the bot swap.
+
 ## 2026-09-27 (worker-profile RMW races + Finish-outbox periodic retry, branch `fix/miniapp-profile-rmw-outbox-retry`)
 
 Two reliability fixes, no behavior/UI redesign.

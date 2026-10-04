@@ -4,6 +4,15 @@
 
 Telegram WebApp `initData` HMAC-SHA256 validation (`_secret_key()` / signature check in `main.py`), the standard scheme Telegram documents for Mini Apps. No separate password/login, no JWT, no session cookies — the Telegram client itself is the identity provider, `BOT_TOKEN` is the shared secret.
 
+### Bot token migration window (added 2026-10-04, `feat/bot-token-migration`)
+
+Owner is migrating the Mini App to a new Telegram bot (`@GrandMont_bot`, replacing `@promonta_bot`). Flagging this explicitly per this file's own rule (auth change → tell the owner, don't just patch silently):
+
+- `validate_init_data()` in `backend/core/permissions.py` now accepts initData signed by **either** `BOT_TOKEN` (old bot) or the optional `BOT_TOKEN_NEW` (new bot) while the latter is set. This widens the set of valid signers from one to two for the duration of the migration — a deliberate, temporary widening, not a permanent weakening: once `BOT_TOKEN_NEW` is unset again (post-cutover cleanup), only `BOT_TOKEN` validates, same as before this change.
+- This does NOT widen outbound trust: `send_telegram_message`/`send_pdf_to_chat` and session-token signing (`_session_secret()`) stay on the single old `BOT_TOKEN` throughout — only inbound Mini-App-launch verification is dual.
+- Risk during the window: if `BOT_TOKEN_NEW` were ever set to the wrong value (e.g. a stale/leaked token) rather than the actual new bot's real token, that wrong token's signer would also validate. Mitigate by setting `BOT_TOKEN_NEW` only from the exact value BotFather gave for `@GrandMont_bot`, and by keeping the migration window short (owner's stated plan: full migration, remove the old-token fallback only once new-bot acceptance is confirmed across onboarding/DailyPlan/shifts/absence/invite flow for a real existing worker).
+- See `tests/test_bot_token_migration.py` for the regression coverage (old accepted, new accepted, third-party token still rejected, tampered signature still rejected, window-closed behavior restored).
+
 ## Authorization
 
 Two roles, `owner`/`worker`, resolved from `roles.json` by Telegram user ID through `get_current_user()`. See [ROLES_AND_PERMISSIONS.md](ROLES_AND_PERMISSIONS.md) for the endpoint-by-endpoint audit — **that document may contain flagged gaps** (endpoints that should arguably be owner-only but don't visibly check role in the code read so far). Treat any such flag there as a live finding requiring owner decision, not something to silently patch.
