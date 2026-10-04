@@ -148,3 +148,29 @@ jobs:
 
       - name: pdfkit require() smoke-check
         run: node -e "require('pdfkit'); console.log('pdfkit OK')"
+
+      - name: Notify Engineering Center on failure
+        # Reuses the SAME bot/chat as every grandmont-group-*.service on the VPS
+        # (see scripts/engineering-center.sh in engineering-os) -- GitHub Actions
+        # can't reach /etc/claude-agent.env directly, so the same two values are
+        # mirrored into this repo's Actions secrets (BOT_TOKEN_NOTIFY, CHAT_ID).
+        # Named BOT_TOKEN_NOTIFY (not BOT_TOKEN) to avoid colliding with this
+        # workflow's own existing dummy BOT_TOKEN env var above. No new bot.
+        if: failure() && github.ref == 'refs/heads/main'
+        env:
+          BOT_TOKEN_NOTIFY: ${{ secrets.BOT_TOKEN_NOTIFY }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          if [ -z "$BOT_TOKEN_NOTIFY" ]; then
+            echo "BOT_TOKEN_NOTIFY secret not set on this repo -- skipping Telegram notify (owner setup pending)."
+            exit 0
+          fi
+          TEXT="🔴 <b>P1</b> ci/workflow_failure
+          Resource: grandmont-group-miniapp (${{ github.ref_name }})
+          Env: ci
+          Run failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          Commit: ${{ github.sha }}"
+          curl -s "https://api.telegram.org/bot${BOT_TOKEN_NOTIFY}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "parse_mode=HTML" > /dev/null
