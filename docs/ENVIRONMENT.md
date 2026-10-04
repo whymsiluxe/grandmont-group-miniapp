@@ -5,6 +5,7 @@ Loaded on the VPS from `/etc/systemd/system/grandmont-miniapp.service`'s `Enviro
 | Variable | Required | Used for | Where read | Redeploy needed to change? |
 |---|---|---|---|---|
 | `BOT_TOKEN` | Yes | Telegram WebApp `initData` HMAC validation, `sendMessage`/`sendDocument` Bot API calls | `main.py` (`os.environ['BOT_TOKEN']`, line ~22 — hard fails at import if missing) | Yes, service restart |
+| `BOT_TOKEN_NEW` | No — only during the 2026-10 bot migration | Second accepted signer for inbound `initData` verification only (dual-token window, see `docs/DECISIONS.md`'s 2026-10-04 entry and `docs/SECURITY.md`). Outbound sends/session tokens stay on `BOT_TOKEN`. | `backend/core/telegram.py` (`os.environ.get('BOT_TOKEN_NEW', '')` — soft-optional, defaults to empty string, no startup failure if absent) | Yes, service restart. Unset it (not just leave blank) once migration is confirmed complete and the fallback should close. |
 | `CLAUDE_BIN` | Yes for AI chat features | Path to Claude Code CLI binary, invoked as subprocess for AI chat/task-extraction | `main.py` | Yes |
 | `GLM_KEY` | Optional | Fallback/alternative AI model (GLM) for chat features | `main.py` | Yes |
 | `ALLOWED_CHAT` | No — not referenced anywhere in `main.py` (verified via grep). Belongs to another Grandmont Group service (`bot.py`/`webhook.py`) sharing the same env file | N/A to this app | — | N/A to this app |
