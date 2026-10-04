@@ -1,5 +1,55 @@
 # Changelog
 
+## 2026-10-04 (Telegram bot FINAL CUTOVER, branch `feat/bot-token-cutover-final`)
+
+Completes the migration started below same-day: `@GrandMont_bot` is now
+primary everywhere (outbound, new session tokens, initData verification).
+`@promonta_bot` is kept ONLY as a verify-only fallback for the migration
+window (session tokens/initData created before cutover), never for signing
+anything new. See `docs/DECISIONS.md`'s final-cutover entry.
+
+### Changed
+- **Renamed** `BOT_TOKEN_NEW` → `BOT_TOKEN_OLD` (meaning flips: `BOT_TOKEN`
+  is now the new bot, `BOT_TOKEN_OLD` is the retired one). Old name would
+  have been actively misleading post-cutover ("new" token that's actually
+  the primary one, no longer "new").
+- `validate_init_data()` — primary/fallback order flipped: `BOT_TOKEN` (new)
+  checked first, `BOT_TOKEN_OLD` (retired) fallback.
+- `_session_secret()` — now takes an optional `bot_token` param (defaults to
+  new primary `BOT_TOKEN`), same backward-compatible-default pattern as
+  `_secret_key()`.
+- `verify_session_token()` — now dual-verifies: new primary secret first,
+  `BOT_TOKEN_OLD`-derived secret as fallback. This is what lets a session
+  token created BEFORE cutover keep working for the rest of its 12h TTL
+  with zero forced re-login.
+- `create_session_token()` — unchanged in behavior, but now explicitly only
+  ever signs with the new primary secret (confirmed via
+  `test_new_session_token_is_never_signed_with_old_secret`).
+- Outbound sends (`send_telegram_message`/`send_pdf_to_chat`) — no code
+  change needed; they already read `BOT_TOKEN`, which is now the new bot's
+  value server-side. Verified live before cutover: both real users (owner
+  `872079437`, worker `5298622655`) had already opened `@GrandMont_bot`
+  (confirmed via `getChat`), and a real `sendMessage` to each succeeded
+  (`ok: true`) — outbound was NOT assumed ready just because `/api/session`
+  worked.
+
+### Added
+- `tests/test_bot_token_migration.py` rewritten for the final-cutover
+  variable scheme (12 tests): new-bot initData accepted as primary, old-bot
+  initData still accepted as fallback, identity resolves identically
+  regardless of signer, third-party/tampered initData rejected, old-bot
+  initData rejected once window closes, new session token created+verified,
+  a pre-cutover (old-secret-signed) session token still verifies during the
+  window, new tokens are never signed with the old secret, third-party
+  session signature rejected, old session secret rejected once window
+  closes, outbound confirmed on new primary token.
+
+### Migration window
+Started at this deploy's timestamp — see `docs/DECISIONS.md` for the exact
+time and the 13h (12h TTL + 1h buffer) removal window. `BOT_TOKEN_OLD` and
+the fallback branches in `validate_init_data`/`verify_session_token` are to
+be removed together, not before the window closes, not left indefinitely.
+
 ## 2026-10-04 (Telegram bot token migration, branch `feat/bot-token-migration`)
 
 Owner is moving the Mini App from the old bot (`@promonta_bot`) to a new one

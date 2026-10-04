@@ -15,15 +15,20 @@ import urllib.request as _urlreq
 
 BOT_TOKEN = os.environ['BOT_TOKEN']
 
-# Bot token migration (2026-10): set once the new bot exists, used ONLY as an
-# extra accepted signer for inbound initData verification (core/permissions.py
-# validate_init_data) during cutover. Outbound sends below stay on the old
-# BOT_TOKEN until the migration is confirmed complete and this file's
-# send_telegram_message/send_pdf_to_chat callers are deliberately flipped --
-# not automatic just because this var is present. Empty string, not unset,
-# when migration isn't in progress, so permissions.py's `if BOT_TOKEN_NEW`
-# check is a plain falsy check either way.
-BOT_TOKEN_NEW = os.environ.get('BOT_TOKEN_NEW', '')
+# Bot token migration -- FINAL CUTOVER (2026-10-04): BOT_TOKEN is now the NEW
+# bot (@GrandMont_bot) -- it is primary for outbound sends below AND for
+# signing new session tokens/initData verification. BOT_TOKEN_OLD is the
+# RETIRED bot (@promonta_bot), kept ONLY as a verification fallback so
+# sessions/initData signed before cutover keep working for their remaining
+# TTL -- never used to sign anything new, never used for outbound. Empty
+# string, not unset, when no migration is in progress, so permissions.py's
+# `if BOT_TOKEN_OLD` check is a plain falsy check either way.
+#
+# Migration window: delete BOT_TOKEN_OLD (env var + this fallback code path
+# in core/permissions.py) no earlier than 13h after cutover deploy time
+# (12h session TTL + 1h clock-skew/deploy-timing buffer) -- see
+# docs/DECISIONS.md's final-cutover entry for the exact window start time.
+BOT_TOKEN_OLD = os.environ.get('BOT_TOKEN_OLD', '')
 
 
 def send_telegram_message(chat_id, text):
