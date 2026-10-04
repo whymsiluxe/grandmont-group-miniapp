@@ -1,5 +1,20 @@
 # Current State
 
+**2026-10-04 update**: Telegram bot migration deployed to production
+(`6b542a2`, PR #25, `scripts/deploy.sh` run clean). `validate_init_data()`
+now accepts initData signed by either the old bot (`@promonta_bot`,
+`BOT_TOKEN`) or the new bot (`@GrandMont_bot`, `BOT_TOKEN_NEW`) — dual-token
+migration window, see `docs/DECISIONS.md`'s 2026-10-04 entry and
+`docs/SECURITY.md`. Verified live: a request signed with the real new bot
+token resolved the real worker `telegram_user_id=5298622655` to a valid
+session (`/api/session` → 200). Outbound sends/session-signing still on the
+old token only. **Not yet done**: full onboarding/DailyPlan/shifts/absence
+walkthrough with the new bot's actual Telegram client (only the raw
+HTTP-level initData check has been verified so far, not a real phone/app
+session), CRM link update (confirmed unneeded — already bot-agnostic), old
+bot fallback removal (deliberately kept for now, 48h+ rollback window per
+owner's instruction).
+
 **Last updated**: 2026-09-22 (iPhone screenshot audit session). `fix-shift-start`
 (the section below) has since been **merged to `main` as PR #1** (`c28ff97`)
 and deployed to production. Two more merges landed after it: PR #2
