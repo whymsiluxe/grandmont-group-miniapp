@@ -7,7 +7,7 @@
 | Clients, leads, commercial workflow, documents | **CRM** | Miniapp has no opinion on this; does not store or expose it. |
 | Organizations, projects, stages | **Core** | Miniapp has no opinion on this. |
 
-Full cross-project map: `~/engineering-os/registry/capabilities.yaml`, `~/engineering-os/adr/001-core-canonical-identity.md`, `~/engineering-os/adr/002-miniapp-shift-source-of-truth.md`.
+Full cross-project map: `~/grandmont-dev-os/registry/capabilities.yaml`, `~/grandmont-dev-os/adr/001-core-canonical-identity.md`, `~/grandmont-dev-os/adr/002-miniapp-shift-source-of-truth.md`.
 
 ## Note on docs/ organization
 
