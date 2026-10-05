@@ -2,12 +2,21 @@ name: High-risk review hint
 
 # Detect-only soft signal (Grandmont Dev OS plan item 50). Does NOT run Codex,
 # does NOT block merge, is NOT a required status check, does NOT touch branch
-# protection. Self-contained -- no dependency on the private grandmont-dev-os
-# repo at runtime, so this never breaks if that repo is unavailable.
+# protection, uses no secrets beyond the default GITHUB_TOKEN. Self-contained --
+# no dependency on the private grandmont-dev-os repo at runtime.
 #
-# High-risk paths for this repo (verified against real code, not guessed):
-#   - backend/core/permissions.py (initData HMAC verification, session tokens)
-#   - backend/core/telegram.py    (bot token, outbound sends)
+# Hardening (2026-10): changed file names are untrusted input. They are read
+# NUL-delimited by Python via an argv-list subprocess and are never interpolated
+# into shell source or into a GitHub expression. Only fixed values (PR number,
+# base branch, repo) are passed, via env. Regression test:
+# grandmont-dev-os/evals/test_high_risk_hint.py
+#
+# High-risk paths for this repo (verified against real code):
+#   - backend/core/permissions.py                      (initData HMAC verification, session tokens)
+#   - backend/core/telegram.py                         (bot token, outbound sends)
+#   - backend/core/(grandmont_core_client|workforce_shadow).py (Core client and worker-identity shadow)
+#   - backend/routes/(auth|service_bridge|daily_plan|checkin).py (auth, CRM service bridge, DailyPlan and check-in routes)
+#   - backend/daily_plan_lib.py                        (DailyPlan logic)
 
 on:
   pull_request:
@@ -24,56 +33,89 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect high-risk paths
-        id: detect
-        run: |
-          git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=50 2>/dev/null || true
-          CHANGED=$(git diff --name-only "origin/${{ github.event.pull_request.base.ref }}"...HEAD || true)
-          echo "changed files:"
-          echo "$CHANGED"
-          HITS=$(echo "$CHANGED" | grep -E '^backend/core/permissions\.py$|^backend/core/telegram\.py$' || true)
-          {
-            echo "hits<<EOF"
-            echo "$HITS"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          if [ -n "$HITS" ]; then
-            echo "is_high_risk=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_high_risk=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Step summary
-        run: |
-          if [ "${{ steps.detect.outputs.is_high_risk }}" = "true" ]; then
-            echo "### ⚠️ High-risk paths changed" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            echo "${{ steps.detect.outputs.hits }}" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            echo "Codex review recommended (informational only, not blocking)." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "No high-risk paths changed." >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Comment on PR (idempotent)
-        if: always()
+      - name: Detect high-risk paths and comment (non-blocking, idempotent)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          MARKER="<!-- grandmont-dev-os:high-risk-codex-review -->"
-          PR="${{ github.event.pull_request.number }}"
-          EXISTING_ID=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" 2>/dev/null | head -1 || true)
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys
 
-          if [ "${{ steps.detect.outputs.is_high_risk }}" = "true" ]; then
-            BODY=$(printf '%s\n⚠️ **High-risk change detected — Codex review recommended**\n\nCategories: Telegram initData/session-token auth / bot token\n\nFiles:\n```\n%s\n```\n\nConsider an independent review round (`codex-debate` skill, max 1-2 rounds) before merging. This is informational only — Codex is NOT run automatically, and this check does NOT block merge.' "$MARKER" "${{ steps.detect.outputs.hits }}")
-          else
-            BODY=$(printf '%s\nℹ️ No current high-risk files detected in this PR.' "$MARKER")
-          fi
+          MARKER = "<!-- grandmont-dev-os:high-risk-codex-review -->"
+          CATEGORIES = "Telegram initData / session-token auth / bot token / service bridge / DailyPlan / check-in / Core identity"
+          PATTERNS = [
+              r"^backend/core/permissions\.py$",
+              r"^backend/core/telegram\.py$",
+              r"^backend/core/(grandmont_core_client|workforce_shadow)\.py$",
+              r"^backend/routes/(auth|service_bridge|daily_plan|checkin)\.py$",
+              r"^backend/daily_plan_lib\.py$",
+          ]
 
-          if [ -n "$EXISTING_ID" ]; then
-            gh api "repos/${{ github.repository }}/issues/comments/$EXISTING_ID" -X PATCH -f body="$BODY" 2>/dev/null || echo "Could not update existing comment (likely a fork PR with restricted token permissions) -- see step summary above instead."
-          else
-            if [ "${{ steps.detect.outputs.is_high_risk }}" = "true" ]; then
-              gh api "repos/${{ github.repository }}/issues/$PR/comments" -X POST -f body="$BODY" 2>/dev/null || echo "Could not post comment (likely a fork PR with restricted token permissions) -- see step summary above instead."
-            fi
-          fi
+          def clean(name):
+              # Printable ASCII only, no backticks: safe inside a markdown code fence.
+              return re.sub(r"[^\x20-\x7e]|`", "?", name)[:200]
+
+          def main():
+              base = os.environ["BASE_REF"]
+              pr = os.environ["PR_NUMBER"]
+              repo = os.environ["REPO"]
+              dry = os.environ.get("HRH_DRY_RUN") == "1"
+
+              raw = subprocess.run(
+                  ["git", "diff", "-z", "--name-only", "--no-renames", "origin/" + base + "...HEAD"],
+                  check=True, capture_output=True,
+              ).stdout
+              files = [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
+              hits = sorted(p for p in files if any(re.search(rx, p) for rx in PATTERNS))
+              shown = [clean(p) for p in hits[:50]]
+              if len(hits) > 50:
+                  shown.append("... and %d more" % (len(hits) - 50))
+
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if hits:
+                  text = "### High-risk paths changed\n```\n" + "\n".join(shown) + "\n```\nCodex review recommended (informational only, not blocking).\n"
+              else:
+                  text = "No high-risk paths changed.\n"
+              print(text)
+              if summary:
+                  with open(summary, "a") as fh:
+                      fh.write(text)
+
+              if hits:
+                  body = (
+                      MARKER + "\n**High-risk change detected - Codex review recommended**\n\n"
+                      "Categories: " + CATEGORIES + "\n\nFiles:\n```\n" + "\n".join(shown) + "\n```\n\n"
+                      "Consider an independent review round (`codex-debate` skill, max 1-2 rounds) before merging. "
+                      "This is informational only - Codex is NOT run automatically, and this check does NOT block merge."
+                  )
+              else:
+                  body = MARKER + "\nNo current high-risk files detected in this PR."
+
+              if dry:
+                  print(json.dumps({"hits": hits, "body": body}))
+                  return
+
+              def gh(args, data=None):
+                  return subprocess.run(["gh", "api"] + args, input=data, capture_output=True, text=True)
+
+              found = gh(["--paginate", "repos/%s/issues/%s/comments" % (repo, pr), "--jq",
+                          '.[] | select(.body | startswith("' + MARKER + '")) | .id'])
+              existing = found.stdout.split()[0] if found.returncode == 0 and found.stdout.split() else ""
+              payload = json.dumps({"body": body})
+              if existing:
+                  r = gh(["-X", "PATCH", "repos/%s/issues/comments/%s" % (repo, existing), "--input", "-"], payload)
+              elif hits:
+                  r = gh(["-X", "POST", "repos/%s/issues/%s/comments" % (repo, pr), "--input", "-"], payload)
+              else:
+                  return
+              if r.returncode != 0:
+                  print("Could not post/update comment (likely a fork PR with a read-only token) - see step summary instead.")
+
+          try:
+              main()
+          except Exception as exc:  # non-blocking by design: never fail the PR over a hint
+              print("high-risk hint skipped: %s" % type(exc).__name__)
+          sys.exit(0)
+          PY
