@@ -41,3 +41,4 @@ backend/rechnungen/
 backend/checkin_photos/
 backend/chat_attachments/
 backend/critical_alert_photos/
+.claude-session-notes.local
