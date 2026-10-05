@@ -1,0 +1,79 @@
+name: High-risk review hint
+
+# Detect-only soft signal (Grandmont Dev OS plan item 50). Does NOT run Codex,
+# does NOT block merge, is NOT a required status check, does NOT touch branch
+# protection. Self-contained -- no dependency on the private grandmont-dev-os
+# repo at runtime, so this never breaks if that repo is unavailable.
+#
+# High-risk paths for this repo (verified against real code, not guessed):
+#   - backend/core/permissions.py (initData HMAC verification, session tokens)
+#   - backend/core/telegram.py    (bot token, outbound sends)
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  high-risk-hint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect high-risk paths
+        id: detect
+        run: |
+          git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=50 2>/dev/null || true
+          CHANGED=$(git diff --name-only "origin/${{ github.event.pull_request.base.ref }}"...HEAD || true)
+          echo "changed files:"
+          echo "$CHANGED"
+          HITS=$(echo "$CHANGED" | grep -E '^backend/core/permissions\.py$|^backend/core/telegram\.py$' || true)
+          {
+            echo "hits<<EOF"
+            echo "$HITS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          if [ -n "$HITS" ]; then
+            echo "is_high_risk=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_high_risk=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Step summary
+        run: |
+          if [ "${{ steps.detect.outputs.is_high_risk }}" = "true" ]; then
+            echo "### ⚠️ High-risk paths changed" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "${{ steps.detect.outputs.hits }}" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "Codex review recommended (informational only, not blocking)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No high-risk paths changed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Comment on PR (idempotent)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MARKER="<!-- grandmont-dev-os:high-risk-codex-review -->"
+          PR="${{ github.event.pull_request.number }}"
+          EXISTING_ID=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" 2>/dev/null | head -1 || true)
+
+          if [ "${{ steps.detect.outputs.is_high_risk }}" = "true" ]; then
+            BODY=$(printf '%s\n⚠️ **High-risk change detected — Codex review recommended**\n\nCategories: Telegram initData/session-token auth / bot token\n\nFiles:\n```\n%s\n```\n\nConsider an independent review round (`codex-debate` skill, max 1-2 rounds) before merging. This is informational only — Codex is NOT run automatically, and this check does NOT block merge.' "$MARKER" "${{ steps.detect.outputs.hits }}")
+          else
+            BODY=$(printf '%s\nℹ️ No current high-risk files detected in this PR.' "$MARKER")
+          fi
+
+          if [ -n "$EXISTING_ID" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/$EXISTING_ID" -X PATCH -f body="$BODY" 2>/dev/null || echo "Could not update existing comment (likely a fork PR with restricted token permissions) -- see step summary above instead."
+          else
+            if [ "${{ steps.detect.outputs.is_high_risk }}" = "true" ]; then
+              gh api "repos/${{ github.repository }}/issues/$PR/comments" -X POST -f body="$BODY" 2>/dev/null || echo "Could not post comment (likely a fork PR with restricted token permissions) -- see step summary above instead."
+            fi
+          fi
