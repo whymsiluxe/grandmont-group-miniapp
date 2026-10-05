@@ -1,6 +1,6 @@
 # CLAUDE.md — governance for this repo
 
-This file is a mandatory operating protocol for any Claude Code session (or human developer) working in this repo, `promonta-miniapp` (GitHub repo name, not yet renamed; the product is the Grandmont Group Mini App). It exists because a prior session was lost without any of its decisions, in-progress work, or reasoning being recorded anywhere durable — the app's code had moved three weeks ahead of its own documentation, and the frontend/backend lived in different directories with no shared version control. This file's job is to make that specific failure mode impossible to repeat silently.
+This file is a mandatory operating protocol for any Claude Code session (or human developer) working in this repo, `grandmont-group-miniapp` (the Grandmont Group Mini App; GitHub repo renamed from `promonta-miniapp`). It exists because a prior session was lost without any of its decisions, in-progress work, or reasoning being recorded anywhere durable — the app's code had moved three weeks ahead of its own documentation, and the frontend/backend lived in different directories with no shared version control. This file's job is to make that specific failure mode impossible to repeat silently.
 
 ## At the start of every session
 
@@ -46,7 +46,7 @@ If a session is about to end and the docs above weren't updated for something re
 
 1. `git status`, `git diff`, review the staged diff.
 2. Grep for secrets before staging anything new: token/key/secret/password patterns. This repo has zero hardcoded secrets as of the 2026-07-23 recovery — keep it that way.
-3. There is no lint/typecheck/test suite yet (see `docs/TESTING.md`, `docs/TODO.md`). Don't claim one passed. If you add one, wire it in here and update this section.
+3. Run the relevant tests (`tests/`, pytest, fully offline; see `docs/TESTING.md`), then the full suite once at the end. Don't claim a suite passed without having run it. CI (`.github/workflows/ci.yml`) runs syntax/import/package-import checks and `cd tests && python -m pytest . -q`.
 4. Manually verify the change per the relevant checklist in `docs/TESTING.md`.
 5. Update the documentation files listed above as applicable.
 
@@ -75,12 +75,12 @@ Conventional Commits: `feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `security
 - No claiming a function "works" without having traced or tested it this session. No marking something `DONE` in `docs/TODO.md` without its acceptance criteria actually met.
 - No silent security fixes — if you find a permission gap or vulnerability, document it (`docs/SECURITY.md` / `docs/ROLES_AND_PERMISSIONS.md`) and flag it to the user before or alongside fixing it, don't just quietly patch and move on. The user needs to know what was wrong in their production app.
 - No large UI/UX redesign, framework swap, or database migration started casually — these need the same brainstorming/planning step any nontrivial change gets, and shouldn't be mixed into a recovery/documentation/bugfix commit.
-- No direct edits to `/var/www/miniapp/` or `/home/promonta/agent/miniapp/` on the VPS without also syncing the change back into this repo (`/home/promonta/agent/miniapp-repo/`) and committing it. Skipping this is exactly how the repo and reality drifted apart before.
+- No direct edits to deployed files on the VPS (systemd runs `/home/grandmont/agent/miniapp`; legacy copies exist under `/home/promonta/agent/` and `/var/www/miniapp`) without syncing the change back into this repo. Deploy only via `scripts/deploy.sh` from a clean, current `main` clone; verify the deployed SHA with the live `/api/health` `commit` field. Skipping this is exactly how the repo and reality drifted apart before.
 
 ## Known deliberate limitations of this project (not gaps to "fix" without asking)
 
 - No database, no ORM, no migrations — flat JSON files by design, adequate at current scale. See `docs/DATABASE.md` for when this should be revisited.
-- No CI/CD, no automated tests yet — real gaps, tracked in `docs/TODO.md`, not to be silently worked around by fabricating fake passing results.
+- Continuous integration exists (offline checks + the test suite) but deploy is manual (`scripts/deploy.sh`, `scripts/rollback.sh`); there is no CD. Never fabricate passing results.
 - Material/warehouse inventory and vehicle logbook (Fahrtenbuch) features are explicitly out of scope per an owner decision — don't build them without being asked again.
 
 ## Token / context discipline
@@ -109,3 +109,7 @@ Grandmont Group Mini App:
 - Do not mix Object Detail V2/UI redesign into backend reliability fixes.
 - Use `update_json_transaction()` for JSON RMW where appropriate.
 - Production deploy only with explicit owner approval.
+
+## Dev OS and high-risk files
+
+Cross-project registries, ADRs and shared skills live in `whymsiluxe/grandmont-dev-os` (local canonical path `~/grandmont-dev-os`). Use the `verify-change`, `pr-ready` and `release-smoke` skills; after a deploy the `release-smoke-checker` subagent (`.claude/agents/`) checks production. `.github/workflows/high-risk-review-hint.yml` posts a non-blocking "Codex review recommended" comment when a PR touches Telegram auth, the CRM service bridge, DailyPlan, check-in or Core-identity files; it never blocks and never runs Codex. `.claude/settings.json` registers the project-level `deploy-branch-guard` hook (blocks `deploy.sh`/`rollback.sh` from a non-main or stale branch; the hook script lives in the user's `~/.claude/hooks/`).
