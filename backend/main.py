@@ -3518,353 +3518,62 @@ reopen_chat_thread = _chat_actions_handlers.reopen_chat_thread
 get_chat_thread_status = _chat_actions_handlers.get_chat_thread_status
 
 
-# ---------- AI Chat (GLM / Sonnet / Opus, переключаемо) ----------
-# GLM — бесплатный, экономит лимиты (z.ai). Sonnet/Opus — через claude CLI по OAuth-подписке владельца.
-# Доступ только для owner, rate limit 20 запросов/час.
-# moved to core/paths.py -- AI_RATE_FILE
-# moved to core/limits.py -- AI_RATE_LIMIT
-# moved to core/limits.py -- AI_RATE_WINDOW
-
-# moved to core/paths.py -- AI_MODEL_FILE
-# moved to core/constants.py -- AI_MODELS
-# moved to core/constants.py -- AI_MODEL_DEFAULT
-CLAUDE_BIN = os.environ.get('CLAUDE_BIN', 'claude')
-
-# 03.08 (ТЗ Задача 2, safe freeze): Owner AI (sonnet/opus) запускает `claude` CLI как
-# полноценный subprocess с доступом ко всему /home/promonta/agent -- до отдельного
-# unix-юзера/read-only checkout/sandbox (следующий раунд, НЕ этот) единственный
-# безопасный default для production -- ВЫКЛЮЧЕНО. Owner может включить явно через env,
-# осознанно принимая риск, пока sandbox не готов; deploy/production config НЕ должен
-# сам проставлять true.
-OWNER_AI_ENABLED = os.environ.get('OWNER_AI_ENABLED', 'false').strip().lower() in ('1', 'true', 'yes')
-
-# 03.08: subprocess получает ТОЛЬКО эти переменные, не полный os.environ -- claude CLI
-# реально нужен PATH (найти бинарники node/git/etc), HOME (конфиг/кэш ~/.claude),
-# ANTHROPIC_API_KEY если используется вместо OAuth-подписки (если её нет в окружении --
-# claude CLI работает по уже сохранённому OAuth-токену в HOME, тоже ок). Полный
-# os.environ до этого включал BOT_TOKEN/GLM_KEY/DATA_ROOT/все остальные секреты
-# процесса -- subprocess их не использует и не должен их видеть.
-# moved to core/constants.py -- _OWNER_AI_ENV_ALLOWLIST
-
-
-def _owner_ai_subprocess_env() -> dict:
-    return {k: os.environ[k] for k in _OWNER_AI_ENV_ALLOWLIST if k in os.environ}
-
-AI_SYSTEM_PROMPT = (
-    "Ты ИИ-ассистент строительной фирмы Grandmont Group UG (haftungsbeschränkt) (Chemnitz, Sachsen, Германия). "
-    "Специализация: Trockenbau, Malerarbeiten, Spachtel Q2/Q3, Fliesen, Bodenbelag, WDVS/Fassade. "
-    "Клиенты: Bauunternehmen, Hausverwaltungen, частные. "
-    "Отвечай кратко и по делу. Внутренние ответы — на русском, тексты клиентам — на деловом немецком."
-)
-
-
-def _get_ai_model() -> str:
-    if os.path.exists(AI_MODEL_FILE):
-        with open(AI_MODEL_FILE, encoding='utf-8') as f:
-            m = json.load(f).get('model', AI_MODEL_DEFAULT)
-        if m in AI_MODELS:
-            return m
-    return AI_MODEL_DEFAULT
-
-
-def _set_ai_model(model: str):
-    if model not in AI_MODELS:
-        raise HTTPException(400, f"Неизвестная модель. Доступно: {', '.join(AI_MODELS)}")
-    with open(AI_MODEL_FILE, 'w', encoding='utf-8') as f:
-        json.dump({'model': model}, f)
-
-
-def _check_ai_rate(user_id: int, rate_file: str = None, limit: int = None):
-    rate_file = rate_file or AI_RATE_FILE
-    limit = limit if limit is not None else AI_RATE_LIMIT
-    data = {}
-    if os.path.exists(rate_file):
-        with open(rate_file, encoding='utf-8') as f:
-            data = json.load(f)
-
-    uid = str(user_id)
-    now = time.time()
-    ud = data.get(uid, {"count": 0, "window_start": now})
-
-    if now - ud["window_start"] >= AI_RATE_WINDOW:
-        ud = {"count": 0, "window_start": now}
-
-    if ud["count"] >= limit:
-        remaining = int(AI_RATE_WINDOW - (now - ud["window_start"]))
-        raise HTTPException(429, f"Лимит {limit} запросов/час исчерпан. Сброс через {remaining // 60} мин {remaining % 60} сек")
-
-    ud["count"] += 1
-    data[uid] = ud
-    with open(rate_file, 'w', encoding='utf-8') as f:
-        json.dump(data, f)
-
-
-def _call_glm(messages: list, system: str = None) -> str:
-    glm_key = os.environ.get('GLM_KEY', '')
-    if not glm_key:
-        raise HTTPException(503, "GLM API не настроен (нет GLM_KEY)")
-
-    payload = {
-        "model": "glm-4.5-flash",
-        "max_tokens": 1024,
-        "system": system if system is not None else AI_SYSTEM_PROMPT,
-        "messages": messages,
-    }
-
-    data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-    req = _urlreq.Request(
-        'https://api.z.ai/api/anthropic/v1/messages',
-        data=data,
-        method='POST',
-        headers={
-            'Content-Type': 'application/json',
-            'x-api-key': glm_key,
-            'anthropic-version': '2023-06-01',
-        }
+# ---------- AI Chat domain ----------
+if __package__:
+    from .routes import ai_chat as _ai_chat_domain
+    from .routes.ai_chat import (
+        AiChatBody, AiChatRouteDeps, AiModelBody, WorkerAiChatBody,
+        create_ai_chat_router,
     )
-    try:
-        with _urlreq.urlopen(req, timeout=45) as resp:
-            result = json.loads(resp.read().decode('utf-8'))
-        return result['content'][0]['text']
-    except _urlreq.HTTPError as e:
-        err_body = e.read().decode('utf-8')
-        raise HTTPException(502, f"GLM API ошибка: {err_body[:300]}")
-    except Exception as e:
-        raise HTTPException(502, f"GLM API недоступен: {str(e)[:200]}")
-
-
-def _call_glm_json(system: str, user_text: str) -> str:
-    glm_key = os.environ.get('GLM_KEY', '')
-    if not glm_key:
-        raise HTTPException(503, "GLM API не настроен (нет GLM_KEY)")
-    payload = {
-        "model": "glm-4.5-flash",
-        "max_tokens": 512,
-        "system": system,
-        "messages": [{"role": "user", "content": user_text}],
-    }
-    data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-    req = _urlreq.Request(
-        'https://api.z.ai/api/anthropic/v1/messages',
-        data=data,
-        method='POST',
-        headers={
-            'Content-Type': 'application/json',
-            'x-api-key': glm_key,
-            'anthropic-version': '2023-06-01',
-        }
+else:
+    import routes.ai_chat as _ai_chat_domain  # noqa: E402
+    from routes.ai_chat import (  # noqa: E402
+        AiChatBody, AiChatRouteDeps, AiModelBody, WorkerAiChatBody,
+        create_ai_chat_router,
     )
-    with _urlreq.urlopen(req, timeout=45) as resp:
-        result = json.loads(resp.read().decode('utf-8'))
-    return result['content'][0]['text']
 
-
-def _messages_to_prompt(messages: list) -> str:
-    """claude -p принимает один текстовый prompt, не chat-массив — сворачиваем историю в текст.
-    Картинки (image content-блоки) в этом режиме не поддержаны — CLI не читает base64-вложения."""
-    parts = [f"[SYSTEM]\n{AI_SYSTEM_PROMPT}"]
-    for m in messages:
-        role = m.get('role', 'user').upper()
-        content = m.get('content')
-        if isinstance(content, str):
-            text = content
-        else:
-            text = ' '.join(b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text')
-        parts.append(f"[{role}]\n{text}")
-    return '\n\n'.join(parts)
-
-
-_claude_cli_lock = __import__('threading').Lock()
-
-
-def _call_claude_cli(messages: list, model: str) -> str:
-    """owner-only agent chat -- полный контекст/permissions осознанно (владелец хочет,
-    чтобы этот ассистент видел всё, что видит Claude Code сам). Lock -- не security-
-    ограничение, а просто защита от нескольких параллельных 120-секундных subprocess
-    (rate limit 20/час уже ограничивает частоту, но не одновременность)."""
-    if not OWNER_AI_ENABLED:
-        # 03.08 (ТЗ Задача 2): safe freeze -- пока не готов sandbox (отдельный unix-юзер +
-        # read-only checkout, следующий раунд), subprocess НЕ запускается вообще.
-        raise HTTPException(503, "Owner AI (Sonnet/Opus) временно отключён в production "
-                                  "(OWNER_AI_ENABLED=false) -- доступен GLM-режим")
-    prompt = _messages_to_prompt(messages)
-    if not _claude_cli_lock.acquire(timeout=1):
-        raise HTTPException(429, "Уже выполняется другой запрос к Claude — подожди и повтори")
-    try:
-        r = subprocess.run(
-            [CLAUDE_BIN, '-p', '--model', model, prompt],
-            cwd=AGENT_ROOT, capture_output=True, stdin=subprocess.DEVNULL,
-            text=True, timeout=120, env=_owner_ai_subprocess_env(),
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(504, f"Claude ({model}) не ответил за 120 сек")
-    except Exception as e:
-        raise HTTPException(502, f"Claude CLI недоступен: {str(e)[:200]}")
-    finally:
-        _claude_cli_lock.release()
-
-    if r.returncode != 0:
-        raise HTTPException(502, f"Claude CLI ошибка: {(r.stderr or '')[:300]}")
-
-    reply = (r.stdout or '').strip()
-    if not reply:
-        raise HTTPException(502, "Claude вернул пустой ответ")
-    return reply
-
-
-def _call_ai(messages: list) -> str:
-    model = _get_ai_model()
-    if model == 'glm':
-        return _call_glm(messages)
-    return _call_claude_cli(messages, model)
-
-
-class AiChatBody(BaseModel):
-    messages: list
-
-
-class AiModelBody(BaseModel):
-    model: str
-
-
-def _is_multimodal_content(content) -> bool:
-    return isinstance(content, list)
-
-
-@app.post("/api/ai-chat")
-def ai_chat(body: AiChatBody, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    if role != 'owner':
-        raise HTTPException(403, "Только для владельца")
-    if not body.messages:
-        raise HTTPException(400, "Нет сообщений")
-
-    for msg in body.messages:
-        if not isinstance(msg, dict) or msg.get('role') not in ('user', 'assistant'):
-            raise HTTPException(400, "Неверный формат сообщений: {role, content} required")
-        content = msg.get('content')
-        if isinstance(content, str):
-            if len(content) > 8000:
-                raise HTTPException(400, "Сообщение слишком длинное")
-        elif isinstance(content, list):
-            # Мультимодальное сообщение (текст + фото) — Anthropic content-block формат.
-            for block in content:
-                if not isinstance(block, dict) or block.get('type') not in ('text', 'image'):
-                    raise HTTPException(400, "Неверный формат content-блока")
-        else:
-            raise HTTPException(400, "content должен быть строкой или списком блоков")
-
-    _check_ai_rate(user['id'])
-    reply = _call_ai(body.messages)
-    return {"reply": reply}
-
-
-# ---------- AI Chat для worker (узкий, без бизнес-контекста) ----------
-# Отдельно от owner-чата: GLM-only (не Claude CLI agent с полным доступом),
-# system prompt не содержит имя фирмы/клиентов/финансов -- только общие
-# строительные вопросы ("как штукатурить Q2", "как смешать грунтовку").
-# Owner explicit decision (2026-07-27): worker не должен видеть чувствительные
-# данные фирмы через AI, в отличие от owner-чата, который специально видит
-# весь контекст.
-# moved to core/paths.py -- WORKER_AI_RATE_FILE
-# moved to core/limits.py -- WORKER_AI_RATE_LIMIT
-
-WORKER_AI_SYSTEM_PROMPT = (
-    "Ты помощник для строителей. Отвечай только на общие вопросы о строительных "
-    "работах: технологии (Trockenbau, Malerarbeiten, Spachtel, Fliesen, Bodenbelag, "
-    "WDVS/Fassade), материалы, инструменты, безопасность труда, нормативы. "
-    "НЕ обсуждай: конкретные объекты, клиентов, бюджеты, финансы фирмы, зарплаты, "
-    "внутренние данные компании -- у тебя нет доступа к этой информации и её не "
-    "существует в этом разговоре. Если спросят про конкретный объект/клиента/деньги -- "
-    "скажи, что это нужно уточнить у владельца. Отвечай кратко и по делу, на русском."
+_ai_chat_router, _ai_chat_handlers = create_ai_chat_router(
+    AiChatRouteDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        ai_rate_file=lambda: AI_RATE_FILE,
+        worker_ai_rate_file=lambda: WORKER_AI_RATE_FILE,
+        ai_model_file=lambda: AI_MODEL_FILE,
+        ai_rate_limit=AI_RATE_LIMIT,
+        worker_ai_rate_limit=WORKER_AI_RATE_LIMIT,
+        ai_rate_window=AI_RATE_WINDOW,
+        ai_models=AI_MODELS,
+        ai_model_default=AI_MODEL_DEFAULT,
+        owner_ai_env_allowlist=_OWNER_AI_ENV_ALLOWLIST,
+        agent_root=lambda: AGENT_ROOT,
+        ai_upload_max_bytes=AI_UPLOAD_MAX_BYTES,
+        sniff_image_or_pdf=lambda raw: sniff_image_or_pdf(raw),
+        allowed_image_mime_ext=_ALLOWED_IMAGE_MIME_EXT,
+    )
 )
+app.include_router(_ai_chat_router)
 
-
-class WorkerAiChatBody(BaseModel):
-    messages: list
-
-
-@app.post("/api/ai-chat/worker")
-def worker_ai_chat(body: WorkerAiChatBody, user: dict = Depends(get_current_user)):
-    """Доступен всем authenticated (owner тоже может, но это worker-facing UI —
-    не ограничиваем по роли, просто этот endpoint сам по себе узкий и безопасный
-    для любого юзера, в отличие от /api/ai-chat который owner-only из-за
-    Claude CLI agent access."""
-    if not body.messages:
-        raise HTTPException(400, "Нет сообщений")
-
-    for msg in body.messages:
-        if not isinstance(msg, dict) or msg.get('role') not in ('user', 'assistant'):
-            raise HTTPException(400, "Неверный формат сообщений: {role, content} required")
-        content = msg.get('content')
-        if not isinstance(content, str):
-            raise HTTPException(400, "content должен быть строкой (без фото/вложений в этом чате)")
-        if len(content) > 4000:
-            raise HTTPException(400, "Сообщение слишком длинное")
-
-    _check_ai_rate(user['id'], rate_file=WORKER_AI_RATE_FILE, limit=WORKER_AI_RATE_LIMIT)
-    reply = _call_glm(body.messages, system=WORKER_AI_SYSTEM_PROMPT)
-    return {"reply": reply}
-
-
-@app.get("/api/ai-model")
-def get_ai_model(user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    if role != 'owner':
-        raise HTTPException(403, "Только для владельца")
-    return {"model": _get_ai_model(), "available": list(AI_MODELS)}
-
-
-@app.post("/api/ai-model")
-def set_ai_model(body: AiModelBody, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    if role != 'owner':
-        raise HTTPException(403, "Только для владельца")
-    _set_ai_model(body.model)
-    return {"model": body.model}
-
-
-# moved to core/limits.py -- AI_UPLOAD_MAX_BYTES
-
-
-@app.post("/api/ai-chat/upload")
-async def ai_chat_upload(file: UploadFile = File(...), user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    if role != 'owner':
-        raise HTTPException(403, "Только для владельца")
-
-    raw = await file.read()
-    if len(raw) > AI_UPLOAD_MAX_BYTES:
-        raise HTTPException(400, "Файл слишком большой (макс. 8 МБ)")
-
-    filename = file.filename or 'file'
-    detected = sniff_image_or_pdf(raw)
-
-    if detected in _ALLOWED_IMAGE_MIME_EXT:
-        b64 = base64.b64encode(raw).decode('ascii')
-        return {
-            "kind": "image",
-            "filename": filename,
-            "block": {"type": "image", "source": {"type": "base64", "media_type": detected, "data": b64}},
-        }
-
-    if detected == 'application/pdf':
-        try:
-            import pypdf
-            import io
-            reader = pypdf.PdfReader(io.BytesIO(raw))
-            text = '\n'.join(page.extract_text() or '' for page in reader.pages)
-        except Exception as e:
-            raise HTTPException(400, f"Не удалось прочитать PDF: {str(e)[:200]}")
-        text = text[:12000]
-        if not text.strip():
-            raise HTTPException(400, "PDF не содержит извлекаемого текста (возможно скан-изображение)")
-        return {"kind": "text", "filename": filename, "text": text}
-
-    # Обычный текстовый файл
-    try:
-        text = raw.decode('utf-8', errors='ignore')[:12000]
-    except Exception:
-        raise HTTPException(400, "Не удалось прочитать файл как текст")
-    if not text.strip():
-        raise HTTPException(400, "Файл пуст или в неподдерживаемом формате")
-    return {"kind": "text", "filename": filename, "text": text}
+# Compatibility names for task extraction/direct-call tests during migration.
+CLAUDE_BIN = _ai_chat_domain.CLAUDE_BIN
+OWNER_AI_ENABLED = _ai_chat_domain.OWNER_AI_ENABLED
+AI_SYSTEM_PROMPT = _ai_chat_domain.AI_SYSTEM_PROMPT
+WORKER_AI_SYSTEM_PROMPT = _ai_chat_domain.WORKER_AI_SYSTEM_PROMPT
+_claude_cli_lock = _ai_chat_domain._claude_cli_lock
+_owner_ai_subprocess_env = _ai_chat_handlers.owner_ai_subprocess_env
+_get_ai_model = _ai_chat_handlers.get_ai_model_value
+_set_ai_model = _ai_chat_handlers.set_ai_model_value
+_check_ai_rate = _ai_chat_handlers.check_ai_rate
+_call_glm = _ai_chat_handlers.call_glm
+_call_glm_json = _ai_chat_handlers.call_glm_json
+_messages_to_prompt = _ai_chat_handlers.messages_to_prompt
+_call_claude_cli = _ai_chat_handlers.call_claude_cli
+_call_ai = _ai_chat_handlers.call_ai
+_is_multimodal_content = _ai_chat_handlers.is_multimodal_content
+ai_chat = _ai_chat_handlers.ai_chat
+worker_ai_chat = _ai_chat_handlers.worker_ai_chat
+get_ai_model = _ai_chat_handlers.get_ai_model
+set_ai_model = _ai_chat_handlers.set_ai_model
+ai_chat_upload = _ai_chat_handlers.ai_chat_upload
 
 
 # ---------- Этапы объекта / План работ (Roadmap) ----------
