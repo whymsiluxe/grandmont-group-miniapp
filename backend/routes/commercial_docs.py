@@ -87,6 +87,12 @@ class CommercialDocsRouteDeps:
     rechnung_script: Callable[[], str]
     angebot_out_dir: Callable[[], str]
     rechnung_out_dir: Callable[[], str]
+    # Optional late-bound compatibility hooks. main.py supplies these as lambdas
+    # resolving its exported aliases at call time, so existing tests/operational
+    # code that monkey-patch an old helper name still affect the extracted route.
+    send_pdf: Callable[..., None] | None = None
+    generate_pdf: Callable[..., subprocess.CompletedProcess] | None = None
+    make_pdf_filename: Callable[[str, str], str] | None = None
 
 
 @dataclass(frozen=True)
@@ -139,8 +145,6 @@ def create_commercial_docs_router(
     router = APIRouter()
 
     def require_angebot_access(role: str = Depends(deps.get_role)):
-        # Keep the legacy owner-only rule. The role model currently only permits
-        # owner/worker; do not leave a latent manager escalation path here.
         if role != "owner":
             raise HTTPException(403, "только owner может создавать Angebot")
 
@@ -169,8 +173,6 @@ def create_commercial_docs_router(
         try:
             urlreq.urlopen(request, timeout=20)
         except Exception as exc:
-            # Delivery has always been best-effort; generation/download succeeds
-            # even when Telegram is temporarily unavailable.
             print(f"WARNING: sendDocument fehlgeschlagen: {exc}")
 
     @router.post("/api/angebot")
@@ -188,9 +190,11 @@ def create_commercial_docs_router(
         if config.get("signatureBase64"):
             config["signedAt"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-        run_pdf_generator(deps.angebot_script(), config)
-        filename = safe_pdf_filename("Angebot", body.kunde.name)
-        send_pdf_to_chat(user["id"], out_path, filename, f"Angebot für {body.kunde.name}")
+        (deps.generate_pdf or run_pdf_generator)(deps.angebot_script(), config)
+        filename = (deps.make_pdf_filename or safe_pdf_filename)("Angebot", body.kunde.name)
+        (deps.send_pdf or send_pdf_to_chat)(
+            user["id"], out_path, filename, f"Angebot für {body.kunde.name}"
+        )
         return FileResponse(out_path, media_type="application/pdf", filename=filename)
 
     @router.post("/api/rechnung")
@@ -210,9 +214,11 @@ def create_commercial_docs_router(
         if config.get("signatureBase64"):
             config["signedAt"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-        run_pdf_generator(deps.rechnung_script(), config)
-        filename = safe_pdf_filename("Rechnung", body.kunde.name)
-        send_pdf_to_chat(user["id"], out_path, filename, f"{body.nummer} — {body.kunde.name}")
+        (deps.generate_pdf or run_pdf_generator)(deps.rechnung_script(), config)
+        filename = (deps.make_pdf_filename or safe_pdf_filename)("Rechnung", body.kunde.name)
+        (deps.send_pdf or send_pdf_to_chat)(
+            user["id"], out_path, filename, f"{body.nummer} — {body.kunde.name}"
+        )
         return FileResponse(out_path, media_type="application/pdf", filename=filename)
 
     return router, CommercialDocsHandlers(
