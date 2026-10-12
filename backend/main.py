@@ -18,6 +18,7 @@ import tempfile
 import time
 import uuid
 from contextvars import ContextVar
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, quote
 
@@ -452,27 +453,6 @@ CONTRACTS_DRIVE_FOLDER_ID = os.environ.get('CONTRACTS_DRIVE_FOLDER_ID', '')
 # _corrupt_lock_path, _quarantine_corrupt_json
 
 
-app = FastAPI(title="Grandmont Group Mini App", docs_url=None, redoc_url=None, openapi_url=None)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://web.telegram.org"],
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["*"],
-)
-
-# First router extraction (routes/auth.py -- GET/POST/DELETE /api/roles).
-# Registered here, right after app creation, same place a router would
-# normally go -- routes/auth.py imports only from core/*, never from this
-# module, so there is no ordering constraint forcing this include_router
-# call any later in the file.
-try:
-    from .routes.auth import router as _auth_router
-except ImportError:
-    from routes.auth import router as _auth_router  # noqa: E402
-app.include_router(_auth_router)
-
-
-@app.on_event("startup")
 async def _on_startup():
     """Retry pending finish-outbox events from a previous crash, and reconcile
     any finished checkin session whose outbox event never got written at all
@@ -506,7 +486,6 @@ async def _on_startup():
     _outbox_retry_task = asyncio.create_task(_outbox_retry_sweep_loop())
 
 
-@app.on_event("shutdown")
 async def _on_shutdown():
     """Stop the periodic outbox-retry sweep cleanly -- cancel and await it so
     it doesn't log a "Task was destroyed but it is pending" warning or leak
@@ -519,6 +498,36 @@ async def _on_shutdown():
         except asyncio.CancelledError:
             pass
         _outbox_retry_task = None
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    """FastAPI lifespan wrapper preserving the legacy startup/shutdown behavior."""
+    await _on_startup()
+    try:
+        yield
+    finally:
+        await _on_shutdown()
+
+
+app = FastAPI(title="Grandmont Group Mini App", docs_url=None, redoc_url=None, openapi_url=None, lifespan=_lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://web.telegram.org"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=["*"],
+)
+
+# First router extraction (routes/auth.py -- GET/POST/DELETE /api/roles).
+# Registered here, right after app creation, same place a router would
+# normally go -- routes/auth.py imports only from core/*, never from this
+# module, so there is no ordering constraint forcing this include_router
+# call any later in the file.
+try:
+    from .routes.auth import router as _auth_router
+except ImportError:
+    from routes.auth import router as _auth_router  # noqa: E402
+app.include_router(_auth_router)
 
 
 @app.exception_handler(CorruptJsonError)
