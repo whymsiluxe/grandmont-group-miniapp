@@ -102,6 +102,14 @@ def test_route_count_invariant():
     assert len(list(iter_app_routes(backend.app))) == 193
 
 
+def test_main_monolith_stays_under_phase6_line_budget():
+    # Phase 6 crossed the explicit <=3000-line target through real extraction,
+    # not comment deletion. Prevent future features from silently growing the
+    # composition root back above that boundary.
+    main_path = Path(backend.BACKEND_DIR, 'main.py')
+    assert len(main_path.read_text(encoding='utf-8').splitlines()) <= 3000
+
+
 def test_checkin_router_has_no_main_import():
     src = Path(backend.BACKEND_DIR, 'routes', 'checkin.py').read_text()
     assert 'import main' not in src
