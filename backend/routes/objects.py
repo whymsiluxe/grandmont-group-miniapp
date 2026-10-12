@@ -7,7 +7,6 @@ router and re-exports the handlers for legacy direct-call tests.
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 import sys
 import time

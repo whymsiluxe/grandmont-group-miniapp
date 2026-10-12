@@ -17,9 +17,9 @@ import logging
 from typing import Any
 
 try:
-    from .grandmont_core_client import CoreErrorKind, CoreIntegrationError, get_core_client
+    from .grandmont_core_client import CoreIntegrationError, get_core_client
 except ImportError:
-    from grandmont_core_client import CoreErrorKind, CoreIntegrationError, get_core_client  # noqa: E402
+    from grandmont_core_client import CoreIntegrationError, get_core_client  # noqa: E402
 
 logger = logging.getLogger('grandmont_core.shadow')
 

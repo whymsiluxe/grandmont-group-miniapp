@@ -590,7 +590,6 @@ def create_daily_plan_router(deps: DailyPlanRouteDeps):
     ):
         """Лёгкая оценка рисков объекта + рекомендации по перепланированию.
         Не изменяет данные — только читает и возвращает risk-summary."""
-        today = deps.business_today_str()
         store = dpl.get_store_snapshot()
 
         plans = [p for p in store["daily_plans"].values() if p["object_id"] == object_id]
