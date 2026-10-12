@@ -2480,370 +2480,78 @@ get_mangel_comments = _mangel_handlers.get_mangel_comments
 # moved to core/limits.py -- CHECKIN_MAX_BYTES
 _checkin_lock = __import__('threading').Lock()
 
-# 10.40: idempotency-key для checkin start/finish/manual — при плохой связи на
-# объекте worker может не увидеть ответ и повторить запрос; без этого второй запрос
-# либо создаёт дубль, либо возвращает пугающую 409/400 ошибку на успешное действие.
-# 23.09: durable + scoped guard. Один raw Idempotency-Key больше не является
-# глобальным ключом на все роли/endpoints/payloads: он проверяется по actor + kind,
-# а entity/payload_hash обязаны совпасть. Store переживает restart в пределах TTL.
-_idempotency_cache = {}  # identity_hash -> entry_dict
-_idempotency_lock = __import__('threading').Lock()
-# moved to core/limits.py -- _IDEMPOTENCY_TTL
-
-
-def _idempotency_payload_hash(payload: dict | None) -> str:
-    raw = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
-
-
-def _idempotency_scope(kind: str, actor_id: str | int, entity_id: str = '', payload: dict | None = None) -> dict:
-    return {
-        "kind": str(kind),
-        "actor_id": str(actor_id),
-        "entity_id": str(entity_id or ''),
-        "payload_hash": _idempotency_payload_hash(payload),
-    }
-
-
-def _idempotency_identity(key: str, scope: dict | None = None) -> str:
-    scope = scope or {"kind": "legacy", "actor_id": "", "entity_id": "", "payload_hash": ""}
-    raw = json.dumps({
-        "key": str(key),
-        "kind": str(scope.get('kind') or ''),
-        "actor_id": str(scope.get('actor_id') or ''),
-    }, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
-
-
-def _idempotent_entity_id(key: str, scope: dict | None) -> str:
-    """F03 (owner review commit db584ac, CHANGES REQUIRED): the business entity's id used
-    to be uuid4() -- random on every attempt, including a retried one. That meant the
-    crash window (business fact written -> process dies -> _idempotency_save() never
-    runs -> durable idempotency entry stays 'pending' forever until TTL prune -> retry
-    after prune creates a SECOND business fact) had no way to self-heal: nothing tied a
-    retried attempt back to what an earlier attempt may have already written.
-
-    Deriving the id from the same (key, scope) identity used by the idempotency store
-    makes a retried attempt with the SAME Idempotency-Key + payload land on the exact
-    same entity id every time. Callers check-before-insert on this id so a
-    crash-recovered retry finds its own prior write instead of duplicating it --
-    closing the crash window without needing a real transactional store across two
-    separate JSON files."""
-    if not key:
-        return uuid.uuid4().hex
-    return _idempotency_identity(key, scope)[:32]
-
-
-def _idempotency_entry_matches(entry: dict, scope: dict | None) -> bool:
-    if scope is None:
-        return True
-    return (
-        str(entry.get('kind') or '') == str(scope.get('kind') or '')
-        and str(entry.get('actor_id') or '') == str(scope.get('actor_id') or '')
-        and str(entry.get('entity_id') or '') == str(scope.get('entity_id') or '')
-        and str(entry.get('payload_hash') or '') == str(scope.get('payload_hash') or '')
+# Check-in idempotency + finish-outbox runtime moved to core/checkin_runtime.py.
+# main.py remains the composition root and keeps compatibility aliases so existing
+# direct-call tests/operational code continue to exercise the canonical runtime.
+try:
+    from .core.checkin_runtime import (
+        FinishOutboxDeps, FinishOutboxRuntime, IdempotencyDeps, IdempotencyRuntime,
+    )
+except ImportError:
+    from core.checkin_runtime import (  # noqa: E402
+        FinishOutboxDeps, FinishOutboxRuntime, IdempotencyDeps, IdempotencyRuntime,
     )
 
-
-def _idempotency_assert_same_request(entry: dict, scope: dict | None) -> None:
-    if not _idempotency_entry_matches(entry, scope):
-        raise HTTPException(409, "Idempotency-Key уже использован для другого запроса")
-
-
-def _idempotency_prune(store: dict, now: float) -> None:
-    stale = [
-        k for k, v in store.items()
-        if now - float(v.get('updated_at') or v.get('created_at') or 0) > _IDEMPOTENCY_TTL
-    ]
-    for k in stale:
-        store.pop(k, None)
-        _idempotency_cache.pop(k, None)
-
-
-def _idempotency_get(key: str, scope: dict | None = None):
-    if not key:
-        return None
-    identity = _idempotency_identity(key, scope)
-    now = time.time()
-    cached = _idempotency_cache.get(identity)
-    if cached and now - float(cached.get('updated_at') or cached.get('created_at') or 0) <= _IDEMPOTENCY_TTL:
-        _idempotency_assert_same_request(cached, scope)
-        if cached.get('state') == 'done':
-            return copy.deepcopy(cached.get('response'))
-        raise HTTPException(409, "Запрос уже выполняется, повторите чуть позже")
-
-    result = {"found": False, "response": None, "pending": False}
-
-    def mutator(store: dict):
-        _idempotency_prune(store, now)
-        entry = store.get(identity)
-        if not entry:
-            return
-        _idempotency_assert_same_request(entry, scope)
-        _idempotency_cache[identity] = copy.deepcopy(entry)
-        result["found"] = True
-        if entry.get('state') == 'done':
-            result["response"] = copy.deepcopy(entry.get('response'))
-        else:
-            result["pending"] = True
-
-    update_json_transaction(CHECKIN_IDEMPOTENCY_FILE, {}, mutator)
-    if result["pending"]:
-        raise HTTPException(409, "Запрос уже выполняется, повторите чуть позже")
-    return result["response"] if result["found"] else None
-
-
-def _idempotency_claim(key: str, scope: dict | None = None):
-    if not key:
-        return None
-    identity = _idempotency_identity(key, scope)
-    now = time.time()
-    result = {"response": None}
-
-    def mutator(store: dict):
-        _idempotency_prune(store, now)
-        entry = store.get(identity)
-        if entry:
-            _idempotency_assert_same_request(entry, scope)
-            if entry.get('state') == 'done':
-                _idempotency_cache[identity] = copy.deepcopy(entry)
-                result["response"] = copy.deepcopy(entry.get('response'))
-                return
-            # F03 (owner review commit db584ac, CHANGES REQUIRED -- corrected,
-            # timer-based "stale pending" heuristic removed per owner instruction:
-            # crash recovery must be deterministic, not time-based): a 'pending'
-            # entry with no 'done' response is indistinguishable, from here alone,
-            # between "still genuinely running" and "crashed before
-            # _idempotency_save()". Blocking on it (409) was the old behavior and
-            # is what caused the F03 crash window: a dead claim blocked every
-            # retry until the full 10-minute TTL pruned it. Real state comes from
-            # elsewhere. Attaching entity_id to a pending claim means the caller's
-            # own storage-level id (_idempotent_entity_id) resolves this
-            # deterministically: checkin_start/checkin_manual/checkin_finish each
-            # check-before-insert by that same id under _checkin_lock, so a
-            # crashed attempt's business fact (if any) is found and replayed, and
-            # concurrent double-submission is serialized by that same lock --
-            # neither needs a 409 here to be correct. Let the caller through.
-        entry = {
-            "state": "pending",
-            "kind": str((scope or {}).get('kind') or 'legacy'),
-            "actor_id": str((scope or {}).get('actor_id') or ''),
-            "entity_id": str((scope or {}).get('entity_id') or ''),
-            "payload_hash": str((scope or {}).get('payload_hash') or ''),
-            "created_at": (entry or {}).get('created_at', now),
-            "updated_at": now,
-        }
-        store[identity] = entry
-        _idempotency_cache[identity] = copy.deepcopy(entry)
-
-    with _idempotency_lock:
-        update_json_transaction(CHECKIN_IDEMPOTENCY_FILE, {}, mutator)
-    return result["response"]
-
-
-def _idempotency_save(key: str, response: dict, scope: dict | None = None):
-    if not key:
-        return
-    identity = _idempotency_identity(key, scope)
-    now = time.time()
-    entry = {
-        "state": "done",
-        "kind": str((scope or {}).get('kind') or 'legacy'),
-        "actor_id": str((scope or {}).get('actor_id') or ''),
-        "entity_id": str((scope or {}).get('entity_id') or ''),
-        "payload_hash": str((scope or {}).get('payload_hash') or ''),
-        "response": copy.deepcopy(response),
-        "created_at": now,
-        "updated_at": now,
-    }
-
-    def mutator(store: dict):
-        _idempotency_prune(store, now)
-        existing = store.get(identity)
-        if existing:
-            _idempotency_assert_same_request(existing, scope)
-            entry["created_at"] = existing.get('created_at') or now
-        store[identity] = entry
-
-    with _idempotency_lock:
-        update_json_transaction(CHECKIN_IDEMPOTENCY_FILE, {}, mutator)
-    _idempotency_cache[identity] = copy.deepcopy(entry)
-
-
-def _idempotency_release(key: str, scope: dict | None = None) -> None:
-    if not key:
-        return
-    identity = _idempotency_identity(key, scope)
-
-    def mutator(store: dict):
-        entry = store.get(identity)
-        if entry and _idempotency_entry_matches(entry, scope) and entry.get('state') != 'done':
-            store.pop(identity, None)
-
-    with _idempotency_lock:
-        update_json_transaction(CHECKIN_IDEMPOTENCY_FILE, {}, mutator)
-    _idempotency_cache.pop(identity, None)
+_idempotency_runtime = IdempotencyRuntime(IdempotencyDeps(
+    file_path=lambda: CHECKIN_IDEMPOTENCY_FILE,
+    ttl_seconds=_IDEMPOTENCY_TTL,
+    update_json_transaction=lambda path, default, mutator: update_json_transaction(path, default, mutator),
+    now=lambda: time.time(),
+))
+_idempotency_cache = _idempotency_runtime.cache
+_idempotency_lock = _idempotency_runtime.lock
+_idempotency_payload_hash = _idempotency_runtime.payload_hash
+_idempotency_scope = _idempotency_runtime.scope
+_idempotency_identity = _idempotency_runtime.identity
+_idempotent_entity_id = _idempotency_runtime.entity_id
+_idempotency_entry_matches = _idempotency_runtime.entry_matches
+_idempotency_assert_same_request = _idempotency_runtime.assert_same_request
+_idempotency_prune = _idempotency_runtime.prune
+_idempotency_get = _idempotency_runtime.get
+_idempotency_claim = _idempotency_runtime.claim
+_idempotency_save = _idempotency_runtime.save
+_idempotency_release = _idempotency_runtime.release
 
 os.makedirs(CHECKIN_PHOTO_BASE, exist_ok=True)
 
+_finish_outbox_runtime = FinishOutboxRuntime(FinishOutboxDeps(
+    file_path=lambda: FINISH_OUTBOX_FILE,
+    safe_load_json=lambda path, default: _safe_load_json(path, default),
+    atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+    checkin_lock=_checkin_lock,
+    load_checkin_meta=lambda: _load_checkin_meta(),
+    save_checkin_meta=lambda items: _save_checkin_meta(items),
+    apply_daily_execution=lambda **kwargs: dpl.apply_daily_execution(**kwargs),
+    execution_validation_error=dpl.ExecutionValidationError,
+    now=lambda: time.time(),
+    outbox_load=lambda: _outbox_load(),
+    outbox_write_pending=lambda *args, **kwargs: _outbox_write_pending(*args, **kwargs),
+    outbox_mark_applied=lambda session_id: _outbox_mark_applied(session_id),
+    outbox_mark_failed=lambda session_id, error: _outbox_mark_failed(session_id, error),
+    outbox_mark_dead_letter=lambda session_id, error: _outbox_mark_dead_letter(session_id, error),
+    clear_pending_execution_report=lambda session_id: _clear_pending_execution_report(session_id),
+    retry_pending_events=lambda: _retry_pending_outbox_events(),
+))
+_finish_outbox_lock = _finish_outbox_runtime.lock
+OUTBOX_MAX_ATTEMPTS = _finish_outbox_runtime.MAX_ATTEMPTS
+OUTBOX_RETRY_SWEEP_INTERVAL_SECONDS = _finish_outbox_runtime.RETRY_SWEEP_INTERVAL_SECONDS
+_outbox_load = _finish_outbox_runtime.load
+_outbox_save = _finish_outbox_runtime.save
+_outbox_write_pending = _finish_outbox_runtime.write_pending
+_outbox_mark_applied = _finish_outbox_runtime.mark_applied
+_outbox_mark_failed = _finish_outbox_runtime.mark_failed
+_outbox_mark_dead_letter = _finish_outbox_runtime.mark_dead_letter
+_retry_pending_outbox_events = _finish_outbox_runtime.retry_pending
+_outbox_dead_letter_count = _finish_outbox_runtime.dead_letter_count
+_clear_pending_execution_report = _finish_outbox_runtime.clear_pending_execution_report
+_reject_pending_execution_report = _finish_outbox_runtime.reject_pending_execution_report
+_reconcile_missing_outbox_events = _finish_outbox_runtime.reconcile_missing_events
 
-# ── Finish projector outbox ──────────────────────────────────────────────────
-# Guarantees that a DailyPlan execution update is never silently lost when a crash
-# occurs between the checkin_meta write and the daily_plan_store write.
-
-def _outbox_load() -> dict:
-    return _safe_load_json(FINISH_OUTBOX_FILE, {})
-
-
-def _outbox_save(outbox: dict) -> None:
-    _atomic_write_json(FINISH_OUTBOX_FILE, outbox)
-
-
-# Round 1.2 follow-up (owner P0 finding): the original state machine was
-# pending -> applied | failed, and startup retry only ever looked at "pending"
-# -- once an event became "failed" it was permanently stuck (no automatic path
-# back to being retried). New state machine: pending -> retrying -> applied |
-# dead_letter, with attempt_count. Both "pending" and "retrying" are retried on
-# every startup; after OUTBOX_MAX_ATTEMPTS failures the event becomes
-# "dead_letter" and must surface in owner diagnostics (RED) for manual handling
-# -- never silently dropped, never silently retried forever either.
-OUTBOX_MAX_ATTEMPTS = 10
-
-# Periodic sweep interval for the liveness fix (fix/miniapp-profile-rmw-outbox-retry):
-# this is a small internal app (single-VPS, low request volume, no queue framework) --
-# a plain asyncio background task polling every 60s is more than fast enough to notice
-# a transient failure well before OUTBOX_MAX_ATTEMPTS (10 attempts) would exhaust itself,
-# without busy-looping or adding load. No existing outbox-specific interval constant to
-# match against (this is the first periodic task in the codebase); 60s sits inside the
-# 30-120s band the task called out and is symmetric with the exponential-ish but bounded
-# total budget: 10 attempts * 60s ≈ worst case a few minutes to dead_letter, not hours.
-OUTBOX_RETRY_SWEEP_INTERVAL_SECONDS = 60
-
-
-def _outbox_write_pending(session_id: str, plan_id: str, plan_version: int,
-                          worker_id: str, date_str: str, object_id: str,
-                          item_results: list, acceptance_id: str | None = None) -> None:
-    with _finish_outbox_lock:
-        outbox = _outbox_load()
-        outbox[session_id] = {
-            "state": "pending",
-            "plan_id": plan_id,
-            "plan_version": plan_version,
-            "worker_id": str(worker_id),
-            "date": date_str,
-            "object_id": object_id,
-            "item_results": item_results,
-            "acceptance_id": acceptance_id,
-            "created_at": time.time(),
-            "last_attempt_at": None,
-            "attempt_count": 0,
-            "error": None,
-        }
-        _outbox_save(outbox)
-
-
-def _outbox_mark_applied(session_id: str) -> None:
-    with _finish_outbox_lock:
-        outbox = _outbox_load()
-        if session_id in outbox:
-            outbox[session_id]["state"] = "applied"
-            outbox[session_id]["applied_at"] = time.time()
-            _outbox_save(outbox)
-
-
-def _outbox_mark_failed(session_id: str, error: str) -> None:
-    """Records a failed attempt. Stays retryable ("retrying") until
-    OUTBOX_MAX_ATTEMPTS is reached, then becomes a permanent "dead_letter" --
-    at that point only manual owner intervention (fixing the underlying data
-    issue, then a manual re-trigger) should touch it again."""
-    with _finish_outbox_lock:
-        outbox = _outbox_load()
-        if session_id in outbox:
-            evt = outbox[session_id]
-            evt["attempt_count"] = evt.get("attempt_count", 0) + 1
-            evt["error"] = error[:500]
-            evt["last_attempt_at"] = time.time()
-            if evt["attempt_count"] >= OUTBOX_MAX_ATTEMPTS:
-                evt["state"] = "dead_letter"
-            else:
-                evt["state"] = "retrying"
-            _outbox_save(outbox)
-
-
-def _outbox_mark_dead_letter(session_id: str, error: str) -> None:
-    """P0 fix: immediate permanent dead-letter for a validation rejection
-    (ExecutionValidationError) -- unlike _outbox_mark_failed's gradual
-    retry-then-dead-letter path, a rejected-as-invalid report will not become
-    valid on a 2nd/3rd/10th automatic retry, so there is no reason to consume
-    ordinary retry attempts on it. Still never silently dropped -- it stays
-    visible via the same _outbox_dead_letter_count() owner diagnostic as any
-    other dead-lettered event, tagged with the specific rejection reason."""
-    with _finish_outbox_lock:
-        outbox = _outbox_load()
-        if session_id in outbox:
-            evt = outbox[session_id]
-            evt["attempt_count"] = evt.get("attempt_count", 0) + 1
-            evt["error"] = error[:500]
-            evt["last_attempt_at"] = time.time()
-            evt["state"] = "dead_letter"
-            _outbox_save(outbox)
-
-
-def _retry_pending_outbox_events() -> int:
-    """Called at startup to apply any pending/retrying finish-projection events.
-    dead_letter events are intentionally NOT retried automatically -- they need
-    manual owner review (surfaced via diagnostics, see _outbox_dead_letter_count).
-    Returns count of successfully applied events.
-
-    P0 fix: passes acceptance_id through to apply_daily_execution so the SAME
-    validate_execution_against_acceptance() the normal Finish path uses also
-    gates this crash-recovery path -- a report that would have been rejected
-    at Finish time must not become valid merely by surviving to a restart.
-    ExecutionValidationError is NOT a transient failure (retrying will never
-    make invalid data valid) -- it goes straight to dead_letter for owner
-    review instead of consuming ordinary retry attempts, but it is still
-    surfaced via the exact same diagnostic mechanism as any other stuck event,
-    never silently dropped."""
-    with _finish_outbox_lock:
-        outbox = _outbox_load()
-    retried = 0
-    for session_id, evt in list(outbox.items()):
-        if evt.get("state") not in ("pending", "retrying"):
-            continue
-        try:
-            dpl.apply_daily_execution(
-                session_id=session_id,
-                daily_plan_id=evt["plan_id"],
-                plan_version=int(evt.get("plan_version") or 0),
-                worker_id=str(evt["worker_id"]),
-                date_str=evt["date"],
-                object_id=evt["object_id"],
-                item_results=evt.get("item_results") or [],
-                acceptance_id=evt.get("acceptance_id"),
-            )
-            _outbox_mark_applied(session_id)
-            _clear_pending_execution_report(session_id)
-            retried += 1
-        except dpl.ExecutionValidationError as ve:
-            _outbox_mark_dead_letter(session_id, f"validation rejected: {ve}")
-        except Exception as e:
-            _outbox_mark_failed(session_id, str(e))
-    return retried
-
-
-async def _run_outbox_retry_sweep_once() -> int | None:
-    """One tick of the periodic liveness fix: reuses _retry_pending_outbox_events()
-    as-is (no reimplementation of the state machine) via asyncio.to_thread so the
-    (synchronous, file-I/O-bound) sweep never blocks the event loop / normal request
-    handling. Returns None (instead of running) if a sweep is already in flight.
-
-    The check-then-set on _outbox_sweep_in_progress below has no `await` between
-    them, so no other coroutine can interleave there under asyncio's cooperative
-    scheduling -- two callers racing this function (e.g. two overlapping scheduler
-    ticks, or a test firing it twice concurrently) always have exactly one of them
-    see False and proceed, never both. The one that proceeds always resets the flag
-    in `finally`, including if _retry_pending_outbox_events() itself raises -- a
-    failed sweep must not permanently wedge every future tick into "skip"."""
+async def _run_outbox_retry_sweep_once():
+    # Compatibility guard remains visible in main while tests/operations still
+    # patch this legacy flag.  No await occurs between check and set, preserving
+    # the original cooperative-scheduling atomicity; actual retry state machine
+    # lives in FinishOutboxRuntime.
     global _outbox_sweep_in_progress
     if _outbox_sweep_in_progress:
         return None
@@ -2853,18 +2561,8 @@ async def _run_outbox_retry_sweep_once() -> int | None:
     finally:
         _outbox_sweep_in_progress = False
 
-
 async def _outbox_retry_sweep_loop():
-    """Runtime counterpart to the startup-only retry above (Issue 2 liveness fix,
-    fix/miniapp-profile-rmw-outbox-retry): without this, a transient failure after
-    startup left an event stuck in "retrying" until the next process restart, which
-    on a stable long-running service could be days. Started from _on_startup,
-    cancelled from _on_shutdown -- never left running after the app stops.
-
-    A sweep failure is logged and MUST NOT crash the app or stop future ticks --
-    the whole point of this loop is resilience against transient failures, so an
-    unexpected exception inside one tick is exactly the kind of thing it exists to
-    survive."""
+    # Keep the legacy public interval patch seam used by tests/operations.
     while True:
         try:
             await asyncio.sleep(OUTBOX_RETRY_SWEEP_INTERVAL_SECONDS)
@@ -2873,106 +2571,8 @@ async def _outbox_retry_sweep_loop():
                 print(f"[outbox-sweep] Retried {retried} pending finish-outbox event(s)")
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            print(f"[outbox-sweep] tick failed (will retry next interval): {e}")
-
-
-def _outbox_dead_letter_count() -> int:
-    """Owner diagnostics: count of finish-projection events that exhausted all
-    retry attempts and need manual review. A non-zero count means a completed
-    shift's DailyExecution was never recorded and needs a human to look."""
-    outbox = _outbox_load()
-    return sum(1 for evt in outbox.values() if evt.get("state") == "dead_letter")
-
-
-def _clear_pending_execution_report(session_id: str) -> None:
-    """Once a finish-projection event is successfully applied (either inline in
-    checkin_finish or via startup retry), clear the raw report we stashed on the
-    checkin_meta session as a crash-window safety net -- it's done its job, no
-    need to keep the raw JSON blob around forever."""
-    with _checkin_lock:
-        items = _load_checkin_meta()
-        session = next((i for i in items if i.get('id') == session_id), None)
-        if session and session.get('pending_execution_report'):
-            session['pending_execution_report'] = None
-            _save_checkin_meta(items)
-
-
-def _reject_pending_execution_report(session_id: str, reason: str) -> None:
-    """P0 fix: when checkin_finish's own pre-check (or the centralized
-    validate_execution_against_acceptance()) rejects a submitted
-    daily_plan_report, the raw report must stop being retrievable -- otherwise
-    it sits in pending_execution_report forever, and a later server restart's
-    _reconcile_missing_outbox_events() would reconstruct an outbox event from
-    it and re-attempt exactly what was just rejected. Per spec: never
-    silently apply, never silently delete -- so this records the rejection
-    reason + timestamp on the session (rejected_execution_report) instead of
-    just nulling the field blind, giving the owner something to look at, then
-    clears pending_execution_report so reconciliation has nothing left to
-    reconstruct from."""
-    with _checkin_lock:
-        items = _load_checkin_meta()
-        session = next((i for i in items if i.get('id') == session_id), None)
-        if session and session.get('pending_execution_report'):
-            session['rejected_execution_report'] = {
-                "raw": session['pending_execution_report'],
-                "reason": reason[:500],
-                "rejected_at": time.time(),
-            }
-            session['pending_execution_report'] = None
-            _save_checkin_meta(items)
-
-
-def _reconcile_missing_outbox_events() -> int:
-    """Startup reconciliation (owner P0 finding): a finished checkin session can
-    have pending_execution_report set (the crash-window fix above) but no
-    corresponding outbox event at all, if the process died between the
-    checkin_meta commit and the _outbox_write_pending call in checkin_finish.
-    Without this, such a session's DailyExecution is silently lost forever --
-    nothing would ever retry it, because _retry_pending_outbox_events only
-    looks at events that already exist in the outbox. This scans finished
-    sessions for that exact gap and reconstructs the missing outbox entry so
-    the normal pending/retrying machinery picks it up on this same startup.
-    Returns count of reconstructed events."""
-    items = _load_checkin_meta()
-    outbox = _outbox_load()
-    reconciled = 0
-    for session in items:
-        if session.get('finish_at') is None:
-            continue
-        report_raw = session.get('pending_execution_report')
-        if not report_raw:
-            continue
-        session_id = session.get('id')
-        if session_id in outbox:
-            continue  # outbox event already exists (normal path or already reconciled)
-        try:
-            rpt = json.loads(report_raw)
-        except Exception as e:
-            print(f'WARNING: reconcile — session {session_id} has unparseable pending_execution_report: {e}')
-            continue
-        plan_id = rpt.get('plan_id', '') or session.get('daily_plan_id', '')
-        plan_ver = int(rpt.get('plan_version', 0) or session.get('daily_plan_version', 0) or 0)
-        item_results = rpt.get('item_results') or []
-        if not (plan_id and isinstance(item_results, list) and item_results):
-            continue
-        # P0 fix: carry the session's own trusted daily_plan_acceptance_id
-        # (set durably at checkin_start, never derived from the untrusted raw
-        # report) into the reconstructed outbox event, so
-        # validate_execution_against_acceptance() -- run identically for this
-        # path and the normal Finish path via apply_daily_execution -- can
-        # check it against the immutable accepted_context_snapshot instead of
-        # only the live (possibly since-changed) plan.
-        _reconciled_acceptance_id = session.get('daily_plan_acceptance_id') or None
-        _outbox_write_pending(
-            session_id=session_id, plan_id=plan_id, plan_version=plan_ver,
-            worker_id=str(session['user_id']), date_str=session['date'],
-            object_id=session['object_id'], item_results=item_results,
-            acceptance_id=_reconciled_acceptance_id,
-        )
-        reconciled += 1
-        print(f'[startup] Reconciled missing outbox event for session {session_id} (crash-window recovery)')
-    return reconciled
+        except Exception as exc:
+            print(f"[outbox-sweep] tick failed (will retry next interval): {exc}")
 
 
 def _load_checkin_meta() -> list:
