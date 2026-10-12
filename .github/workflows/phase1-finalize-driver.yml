@@ -1,0 +1,44 @@
+name: Phase 1.1 finalize driver
+
+on:
+  push:
+    branches:
+      - refactor/main-monolith-phase-1
+    paths:
+      - .github/workflows/phase1-finalize-driver.yml
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/main-monolith-phase-1
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply patch
+        run: python .github/phase1_finalize.py
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+      - name: Run affected tests
+        env:
+          BOT_TOKEN: ci-dummy-token-not-a-real-secret
+          MINIAPP_DATA_ROOT: /tmp/phase1-finalize-data
+        run: pytest -q tests/test_core_workforce_shadow.py tests/test_release_audit2.py tests/test_release_audit3.py tests/test_phase1_route_contract.py
+      - name: Run full Python suite
+        env:
+          BOT_TOKEN: ci-dummy-token-not-a-real-secret
+          MINIAPP_DATA_ROOT: /tmp/phase1-finalize-full-data
+        run: PYTHONPATH=. pytest -q tests/
+      - name: Commit verified finalization
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "test: harden phase 1 extracted route contracts"
+          git push origin HEAD:refactor/main-monolith-phase-1
