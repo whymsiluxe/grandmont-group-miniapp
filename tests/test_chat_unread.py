@@ -1,119 +1,118 @@
-"""Backend tests for chat unread counters (Release-аудит Этап 5): общий nav-badge
-(GET /api/chat/unread_count) раньше вообще не учитывал thread_key-треды (obj:/
-mangel:/task:) -- фильтровал только по to_user_id, поэтому любое сообщение с
-thread_key попадало в ветку "group" и считалось непрочитанным ДЛЯ ЛЮБОГО
-пользователя, независимо от того, участник ли он этого конкретного треда.
-
-Same plain stdlib unittest approach as tests/test_chat_backend.py -- route handler
-called directly with mocked _load_chat/_load_reads/_object_chat_participants etc.,
-no real Google Sheets or filesystem access needed.
-
-Run:
-    cd miniapp-repo && python3 -m unittest tests.test_chat_unread -v
-"""
+"""Behavior tests for chat unread counters after routes/chat.py extraction."""
 import os
 import sys
+import tempfile
 import unittest
-from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 
-import main as backend  # noqa: E402
+from routes.chat import ChatRouteDeps, create_chat_router  # noqa: E402
 
 
 class UnreadCountThreadKeyTests(unittest.TestCase):
-    """Основной фикс: общий unread_count badge должен учитывать thread_key
-    (obj:/mangel:/task:) так же строго, как unread_by_thread уже делал."""
+    """Unread behavior is tested at the extracted domain boundary, not via main aliases."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.messages = []
+        self.reads = {}
+        self.meta = {}
+        self.object_participants = {'OBJ-1': {'222'}}
+        self.mangel_participants = {'T-1': {'222'}}
+
+        def safe_load(path, default):
+            if path.endswith('chat.json'):
+                return [dict(m) for m in self.messages]
+            if path.endswith('reads.json'):
+                return {k: dict(v) if isinstance(v, dict) else v for k, v in self.reads.items()}
+            if path.endswith('meta.json'):
+                return self.meta
+            if path.endswith('reactions.json'):
+                return []
+            if path.endswith('archive.json'):
+                return []
+            return default
+
+        deps = ChatRouteDeps(
+            get_current_user=lambda: {},
+            get_role=lambda: 'worker',
+            safe_load_json=safe_load,
+            atomic_write_json=lambda path, value: None,
+            chat_file=lambda: os.path.join(self.tmp.name, 'chat.json'),
+            chat_archive_file=lambda: os.path.join(self.tmp.name, 'archive.json'),
+            chat_reads_file=lambda: os.path.join(self.tmp.name, 'reads.json'),
+            chat_thread_meta_file=lambda: os.path.join(self.tmp.name, 'meta.json'),
+            chat_reactions_file=lambda: os.path.join(self.tmp.name, 'reactions.json'),
+            chat_attach_dir=lambda: self.tmp.name,
+            chat_max=200,
+            chat_retention_seconds=7 * 24 * 3600,
+            chat_reaction_options=('👍', '👀'),
+            thread_type_by_prefix={'obj:': 'OBJECT', 'mangel:': 'DEFECT', 'task:': 'TASK'},
+            default_thread_prefs={'muted': False, 'pinned': False, 'archived': False},
+            online_threshold_seconds=120,
+            load_roles=lambda: {'111': 'worker', '222': 'worker', '333': 'worker'},
+            load_assignments=lambda: {
+                oid: [{'user_id': uid, 'status': 'accepted'} for uid in users]
+                for oid, users in self.object_participants.items()
+            },
+            today_berlin_str=lambda: '2026-10-12',
+            has_active_object_access=lambda uid, oid, today: uid in self.object_participants.get(oid, set()),
+            load_mangel_lib=lambda: type('M', (), {'get_ticket': staticmethod(lambda tid: {})})(),
+            load_tasks=lambda: [],
+            cached_get_used_range=lambda tab: [],
+            load_worker_profiles=lambda: {},
+            last_seen_for=lambda uid: None,
+            sanitize_display_name=lambda raw, fallback: raw or fallback,
+            resolve_current_display_name=lambda uid, fallback: fallback or str(uid),
+            sniff_chat_attachment=lambda data: ('image/jpeg', 'jpg'),
+        )
+        _, self.handlers = create_chat_router(deps)
+
+    def tearDown(self):
+        self.tmp.cleanup()
 
     def test_own_messages_never_count_as_unread(self):
-        messages = [{'user_id': 111, 'ts': 1000, 'text': 'привет'}]
-        with patch.object(backend, '_load_chat', return_value=messages), \
-             patch.object(backend, '_load_reads', return_value={}), \
-             patch.object(backend, '_load_chat_thread_meta', return_value={}):
-            result = backend.get_unread_count(user={'id': 111}, role='worker')
-        self.assertEqual(result['unread'], 0)
+        self.messages = [{'user_id': 111, 'ts': 1000, 'text': 'привет'}]
+        self.assertEqual(self.handlers.get_unread_count(user={'id': 111}, role='worker')['unread'], 0)
 
     def test_group_message_counts_when_not_read(self):
-        messages = [{'user_id': 222, 'ts': 1000, 'text': 'всем привет'}]
-        with patch.object(backend, '_load_chat', return_value=messages), \
-             patch.object(backend, '_load_reads', return_value={}), \
-             patch.object(backend, '_load_chat_thread_meta', return_value={}):
-            result = backend.get_unread_count(user={'id': 111}, role='worker')
-        self.assertEqual(result['unread'], 1)
+        self.messages = [{'user_id': 222, 'ts': 1000, 'text': 'всем привет'}]
+        self.assertEqual(self.handlers.get_unread_count(user={'id': 111}, role='worker')['unread'], 1)
 
     def test_group_message_does_not_count_after_read(self):
-        messages = [{'user_id': 222, 'ts': 1000, 'text': 'всем привет'}]
-        reads = {'111': {'group': 2000}}  # прочитано после ts сообщения
-        with patch.object(backend, '_load_chat', return_value=messages), \
-             patch.object(backend, '_load_reads', return_value=reads), \
-             patch.object(backend, '_load_chat_thread_meta', return_value={}):
-            result = backend.get_unread_count(user={'id': 111}, role='worker')
-        self.assertEqual(result['unread'], 0)
+        self.messages = [{'user_id': 222, 'ts': 1000, 'text': 'всем привет'}]
+        self.reads = {'111': {'group': 2000}}
+        self.assertEqual(self.handlers.get_unread_count(user={'id': 111}, role='worker')['unread'], 0)
 
     def test_object_thread_message_counts_only_for_participant(self):
-        # Сообщение в obj:OBJ-1 треде -- участник (222) должен видеть unread,
-        # посторонний (333) -- нет (403 от _check_thread_access -- continue).
-        messages = [{'user_id': 111, 'ts': 1000, 'thread_key': 'obj:OBJ-1', 'text': 'нужен материал'}]
-        with patch.object(backend, '_load_chat', return_value=messages), \
-             patch.object(backend, '_load_reads', return_value={}), \
-             patch.object(backend, '_load_chat_thread_meta', return_value={}), \
-             patch.object(backend, '_object_chat_participants', return_value=['222']):
-            result_participant = backend.get_unread_count(user={'id': 222}, role='worker')
-            result_stranger = backend.get_unread_count(user={'id': 333}, role='worker')
-        self.assertEqual(result_participant['unread'], 1)
-        self.assertEqual(result_stranger['unread'], 0)
+        self.messages = [{'user_id': 111, 'ts': 1000, 'thread_key': 'obj:OBJ-1', 'text': 'нужен материал'}]
+        self.assertEqual(self.handlers.get_unread_count(user={'id': 222}, role='worker')['unread'], 1)
+        self.assertEqual(self.handlers.get_unread_count(user={'id': 333}, role='worker')['unread'], 0)
 
     def test_object_thread_does_not_leak_into_group_count(self):
-        # Регрессия основного бага: сообщение с thread_key раньше считалось как
-        # "group" для ЛЮБОГО юзера. Теперь оно должно учитываться ТОЛЬКО против
-        # last-read именно этого thread_key, не смешиваясь с group-веткой.
-        messages = [{'user_id': 111, 'ts': 1000, 'thread_key': 'obj:OBJ-1', 'text': 'X'}]
-        # Юзер прочитал GROUP полностью (large timestamp), но НЕ читал obj:OBJ-1.
-        reads = {'222': {'group': 999999}}
-        with patch.object(backend, '_load_chat', return_value=messages), \
-             patch.object(backend, '_load_reads', return_value=reads), \
-             patch.object(backend, '_load_chat_thread_meta', return_value={}), \
-             patch.object(backend, '_object_chat_participants', return_value=['222']):
-            result = backend.get_unread_count(user={'id': 222}, role='worker')
-        # Правильное поведение: всё ещё unread, т.к. group-last-read не покрывает
-        # obj:OBJ-1-тред -- это отдельный ключ в _thread_last_read.
-        self.assertEqual(result['unread'], 1)
+        self.messages = [{'user_id': 111, 'ts': 1000, 'thread_key': 'obj:OBJ-1', 'text': 'X'}]
+        self.reads = {'222': {'group': 999999}}
+        self.assertEqual(self.handlers.get_unread_count(user={'id': 222}, role='worker')['unread'], 1)
 
     def test_muted_thread_excluded_from_count(self):
-        messages = [{'user_id': 111, 'ts': 1000, 'thread_key': 'mangel:T-1', 'text': 'статус изменён'}]
-        meta = {'mangel:T-1': {'user_prefs': {'222': {'muted': True}}}}
-        with patch.object(backend, '_load_chat', return_value=messages), \
-             patch.object(backend, '_load_reads', return_value={}), \
-             patch.object(backend, '_load_chat_thread_meta', return_value=meta), \
-             patch.object(backend, '_mangel_chat_participants', return_value=['222']):
-            result = backend.get_unread_count(user={'id': 222}, role='worker')
-        self.assertEqual(result['unread'], 0)
+        self.messages = [{'user_id': 111, 'ts': 1000, 'thread_key': 'mangel:T-1', 'text': 'статус изменён'}]
+        self.meta = {'mangel:T-1': {'user_prefs': {'222': {'muted': True}}}}
+        # The product rule grants active workers access to defect chat.
+        self.assertEqual(self.handlers.get_unread_count(user={'id': 222}, role='worker')['unread'], 0)
 
     def test_dm_message_only_counts_for_recipient(self):
-        messages = [{'user_id': 111, 'to_user_id': '222', 'ts': 1000, 'text': 'личное'}]
-        with patch.object(backend, '_load_chat', return_value=messages), \
-             patch.object(backend, '_load_reads', return_value={}), \
-             patch.object(backend, '_load_chat_thread_meta', return_value={}):
-            result_recipient = backend.get_unread_count(user={'id': 222}, role='worker')
-            result_other = backend.get_unread_count(user={'id': 333}, role='worker')
-        self.assertEqual(result_recipient['unread'], 1)
-        self.assertEqual(result_other['unread'], 0)
+        self.messages = [{'user_id': 111, 'to_user_id': '222', 'ts': 1000, 'text': 'личное'}]
+        self.assertEqual(self.handlers.get_unread_count(user={'id': 222}, role='worker')['unread'], 1)
+        self.assertEqual(self.handlers.get_unread_count(user={'id': 333}, role='worker')['unread'], 0)
 
     def test_matches_unread_by_thread_counts_for_same_data(self):
-        # Согласованность: unread_count (сумма) должен совпадать с суммой
-        # unread_by_thread для одного и того же набора данных -- иначе badge на
-        # общей навигации разойдётся с суммой badge'ей по вкладкам.
-        messages = [
+        self.messages = [
             {'user_id': 111, 'ts': 1000, 'text': 'group msg'},
             {'user_id': 111, 'ts': 1001, 'thread_key': 'obj:OBJ-1', 'text': 'obj msg'},
             {'user_id': 111, 'to_user_id': '222', 'ts': 1002, 'text': 'dm msg'},
         ]
-        with patch.object(backend, '_load_chat', return_value=messages), \
-             patch.object(backend, '_load_reads', return_value={}), \
-             patch.object(backend, '_load_chat_thread_meta', return_value={}), \
-             patch.object(backend, '_object_chat_participants', return_value=['222']):
-            total = backend.get_unread_count(user={'id': 222}, role='worker')
-            by_thread = backend.get_unread_by_thread(user={'id': 222}, role='worker')
+        total = self.handlers.get_unread_count(user={'id': 222}, role='worker')
+        by_thread = self.handlers.get_unread_by_thread(user={'id': 222}, role='worker')
         self.assertEqual(total['unread'], sum(by_thread['unread_by_thread'].values()))
 
 

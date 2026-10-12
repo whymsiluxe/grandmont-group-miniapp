@@ -2,9 +2,8 @@
 "Выполненные"), а не удаляется. Архив в Sheets — только при первом закрытии.
 Переоткрытие снимает closed_at.
 
-Run:
-    BOT_TOKEN='ci-dummy-token-not-a-real-secret' MINIAPP_DATA_ROOT=$(mktemp -d) \
-      /home/promonta/agent/miniapp/.venv/bin/python3 -m pytest tests/test_needs_workflow.py -v
+All Needs persistence assertions use a real temporary TASKS_FILE so route/module
+extraction cannot be hidden by monkey-patching the old main._load_tasks location.
 """
 import os
 import sys
@@ -22,18 +21,14 @@ OWNER = {'id': 1, 'first_name': 'Boss'}
 
 
 class NeedsWorkflowTests(unittest.TestCase):
-    # 23.09 (owner P0 fix): update_task_status() now goes through
-    # update_json_transaction(TASKS_FILE, ...), which does its own real file
-    # I/O -- patching _load_tasks/_save_tasks no longer intercepts anything
-    # this endpoint actually reads/writes. Seed a real temp store instead,
-    # same pattern used for critical_alerts.json elsewhere this session.
     def setUp(self):
-        self._tmp = tempfile.mkdtemp(prefix='tasks-needs-workflow-')
+        self._tmp = tempfile.TemporaryDirectory(prefix='tasks-needs-workflow-')
         self._orig_tasks_file = backend.TASKS_FILE
-        backend.TASKS_FILE = os.path.join(self._tmp, 'tasks.json')
+        backend.TASKS_FILE = os.path.join(self._tmp.name, 'tasks.json')
 
     def tearDown(self):
         backend.TASKS_FILE = self._orig_tasks_file
+        self._tmp.cleanup()
 
     def _run(self, tasks, task_id, status):
         backend._save_tasks(tasks)
@@ -51,14 +46,14 @@ class NeedsWorkflowTests(unittest.TestCase):
         result, saved = self._run(tasks, 'T1', 'закрыто')
         self.assertEqual(result['status'], 'закрыто')
         self.assertIsNotNone(result.get('closed_at'))
-        # задача осталась в сохранённом списке (не удалена)
-        self.assertEqual([t['id'] for t in saved], ['T1'])
+        self.assertEqual([task['id'] for task in saved], ['T1'])
 
     def test_reopen_clears_closed_at(self):
         tasks = [{'id': 'T1', 'status': 'закрыто', 'created_at': 1, 'closed_at': 999}]
         result, saved = self._run(tasks, 'T1', 'открыто')
         self.assertEqual(result['status'], 'открыто')
         self.assertIsNone(result['closed_at'])
+        self.assertIsNone(saved[0]['closed_at'])
 
     def test_accept_transition(self):
         tasks = [{'id': 'T1', 'status': 'открыто', 'created_at': 1}]
@@ -66,7 +61,6 @@ class NeedsWorkflowTests(unittest.TestCase):
         self.assertEqual(result['status'], 'в работе')
 
     def test_archive_only_on_first_close(self):
-        # уже закрытая → повторный PATCH 'закрыто' не должен снова архивировать (Sheets не трогается)
         tasks = [{'id': 'T1', 'status': 'закрыто', 'created_at': 1, 'closed_at': 5}]
         backend._save_tasks(tasks)
         called = {'n': 0}
@@ -74,6 +68,7 @@ class NeedsWorkflowTests(unittest.TestCase):
         def _sheets():
             called['n'] += 1
             raise RuntimeError('boom')
+
         with patch.object(backend, '_load_repo_objekte_lib', side_effect=_sheets):
             backend.update_task_status('T1', backend.TaskStatusBody(status='закрыто'), user=OWNER, _=None)
         self.assertEqual(called['n'], 0)
@@ -86,13 +81,12 @@ class NeedsWorkflowTests(unittest.TestCase):
 
     def test_overdue_open_task_is_owner_alert(self):
         now = int(time.time())
-        tasks = [{
+        backend._save_tasks([{
             'id': 'T1', 'status': 'открыто', 'title': 'Нужен цемент',
             'object_id': 'OBJ-1', 'from_name': 'Ivan', 'due_at': now - 10,
             'priority': 'срочно', 'created_at': now - 3600,
-        }]
-        with patch.object(backend, '_load_tasks', return_value=tasks), \
-             patch.object(backend, '_cached_get_used_range', return_value=None), \
+        }])
+        with patch.object(backend, '_cached_get_used_range', return_value=None), \
              patch.object(backend, '_load_repo_tools_lib', side_effect=RuntimeError('no tools')), \
              patch.object(backend, '_load_abwesenheit', return_value=[]), \
              patch.object(backend, '_load_critical_alerts', return_value=[]), \
@@ -100,19 +94,18 @@ class NeedsWorkflowTests(unittest.TestCase):
              patch.object(backend, '_load_alert_dismissals', return_value={}):
             alerts = backend.get_alerts(user=OWNER, role='owner')['alerts']
 
-        overdue = [a for a in alerts if a.get('task_overdue')]
+        overdue = [alert for alert in alerts if alert.get('task_overdue')]
         self.assertEqual(len(overdue), 1)
         self.assertEqual(overdue[0]['id'], 'task-overdue-T1')
         self.assertEqual(overdue[0]['type'], 'red')
 
     def test_future_or_closed_task_is_not_overdue_alert(self):
         now = int(time.time())
-        tasks = [
+        backend._save_tasks([
             {'id': 'future', 'status': 'открыто', 'title': 'Позже', 'due_at': now + 3600},
             {'id': 'closed', 'status': 'закрыто', 'title': 'Готово', 'due_at': now - 10},
-        ]
-        with patch.object(backend, '_load_tasks', return_value=tasks):
-            alerts = backend._overdue_task_alerts(now=now)
+        ])
+        alerts = backend._overdue_task_alerts(now=now)
         self.assertEqual(alerts, [])
 
 

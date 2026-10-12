@@ -3,10 +3,8 @@
 потребность НА КОНКРЕТНОМ объекте. Owner -- доступ всегда. Запрос list_tasks() без
 object_id (глобальный экран "мои потребности") НЕ трогается этой задачей.
 
-Тот же стиль, что tests/test_object_access_and_checkin_photos.py.
-
-Run:
-    /home/promonta/agent/miniapp/.venv/bin/python3 -m pytest tests/test_needs_access_control.py -v
+Tests use a real temporary TASKS_FILE so they validate public storage behavior
+rather than the historical implementation location of ``main._load_tasks``.
 """
 import os
 import sys
@@ -19,14 +17,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 
 from fastapi import HTTPException  # noqa: E402
 import main as backend  # noqa: E402
-import core.permissions as permissions  # noqa: E402
 
 OWNER = {'id': 1, 'first_name': 'Boss'}
 WORKER_A = {'id': 10, 'first_name': 'Ivan'}
 
 
 def _assignment(uid, status='accepted', date_from=None, date_to=None):
-    # Use relative dates so the "active" assignment is never stale regardless of run date.
     if date_from is None:
         date_from = (date.today() - timedelta(days=5)).isoformat()
     if date_to is None:
@@ -34,11 +30,22 @@ def _assignment(uid, status='accepted', date_from=None, date_to=None):
     return {'user_id': str(uid), 'status': status, 'date_from': date_from, 'date_to': date_to}
 
 
-class ListTasksAccessTests(unittest.TestCase):
+class _TempTasksStoreMixin:
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix='tasks-access-control-')
+        self._orig_tasks_file = backend.TASKS_FILE
+        backend.TASKS_FILE = os.path.join(self._tmp.name, 'tasks.json')
+
+    def tearDown(self):
+        backend.TASKS_FILE = self._orig_tasks_file
+        self._tmp.cleanup()
+
+
+class ListTasksAccessTests(_TempTasksStoreMixin, unittest.TestCase):
     def test_active_worker_reads_object_tasks(self):
         assignments = {'OBJ-1': [_assignment(10)]}
-        with patch.object(backend, '_load_assignments', return_value=assignments), \
-             patch.object(backend, '_load_tasks', return_value=[]):
+        backend._save_tasks([])
+        with patch.object(backend, '_load_assignments', return_value=assignments):
             result = backend.list_tasks(object_id='OBJ-1', user=WORKER_A, role='worker')
         self.assertEqual(result['tasks'], [])
 
@@ -77,33 +84,24 @@ class ListTasksAccessTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 403)
 
     def test_owner_always_has_read_access(self):
-        with patch.object(backend, '_load_assignments', return_value={}), \
-             patch.object(backend, '_load_tasks', return_value=[]):
+        backend._save_tasks([])
+        with patch.object(backend, '_load_assignments', return_value={}):
             result = backend.list_tasks(object_id='OBJ-1', user=OWNER, role='owner')
         self.assertEqual(result['tasks'], [])
 
     def test_no_object_id_worker_sees_only_own_unaffected(self):
-        # object_id не передан -- эта ветка НЕ трогается задачей 4, доступ не должен
-        # требовать has_active_object_access вообще (глобальный "мои потребности").
-        tasks = [{'from_user_id': '10', 'priority': 'обычная', 'created_at': 1}]
-        with patch.object(backend, '_load_tasks', return_value=tasks):
+        # object_id не передан -- доступ к объекту не должен проверяться; worker
+        # по-прежнему видит только собственные записи глобального экрана.
+        backend._save_tasks([
+            {'id': 'mine', 'from_user_id': '10', 'priority': 'обычная', 'created_at': 2},
+            {'id': 'other', 'from_user_id': '11', 'priority': 'срочно', 'created_at': 3},
+        ])
+        with patch.object(backend, '_load_assignments', side_effect=AssertionError('must not read assignments')):
             result = backend.list_tasks(object_id='', user=WORKER_A, role='worker')
-        self.assertEqual(len(result['tasks']), 1)
+        self.assertEqual([task['id'] for task in result['tasks']], ['mine'])
 
 
-class CreateTaskAccessTests(unittest.TestCase):
-    def setUp(self):
-        # 23.09 (owner P0 fix): create_task() now goes through
-        # update_json_transaction(TASKS_FILE, ...), which does its own real
-        # file I/O -- patching _load_tasks/_save_tasks no longer intercepts
-        # anything this endpoint actually reads/writes.
-        self._tmp = tempfile.mkdtemp(prefix='tasks-access-control-')
-        self._orig_tasks_file = backend.TASKS_FILE
-        backend.TASKS_FILE = os.path.join(self._tmp, 'tasks.json')
-
-    def tearDown(self):
-        backend.TASKS_FILE = self._orig_tasks_file
-
+class CreateTaskAccessTests(_TempTasksStoreMixin, unittest.TestCase):
     def test_active_worker_creates_task(self):
         assignments = {'OBJ-1': [_assignment(10)]}
         body = backend.TaskCreateBody(title='Нужен цемент', object_id='OBJ-1')
@@ -113,6 +111,7 @@ class CreateTaskAccessTests(unittest.TestCase):
              patch.object(backend, 'send_telegram_message'):
             task = backend.create_task(body, user=WORKER_A, role='worker')
         self.assertEqual(task['object_id'], 'OBJ-1')
+        self.assertEqual([item['id'] for item in backend._load_tasks()], [task['id']])
 
     def test_worker_without_object_access_cannot_create(self):
         body = backend.TaskCreateBody(title='Нужен цемент', object_id='OBJ-1')
@@ -130,8 +129,6 @@ class CreateTaskAccessTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 403)
 
     def test_owner_cannot_create_task_regardless_of_access(self):
-        # Существующее поведение (не менять по спеке п.4) -- owner вообще не создаёт
-        # Потребности, роль-проверка идёт РАНЬШЕ access-проверки.
         body = backend.TaskCreateBody(title='Нужен цемент', object_id='OBJ-1')
         with self.assertRaises(HTTPException) as ctx:
             backend.create_task(body, user=OWNER, role='owner')

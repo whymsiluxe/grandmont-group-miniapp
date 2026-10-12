@@ -14,7 +14,7 @@ QA_JS = ROOT / "frontend" / "js" / "worker-quick-actions.js"
 FEED_JS = ROOT / "frontend" / "js" / "feed.js"
 HOME_JS = ROOT / "frontend" / "js" / "home.js"
 APP_HTML = ROOT / "frontend" / "app.html"
-MAIN_PY = ROOT / "backend" / "main.py"
+PHOTO_FEED_PY = ROOT / "backend" / "routes" / "photo_feed.py"
 
 
 def _source(path: Path) -> str:
@@ -103,12 +103,12 @@ def test_photo_action_reuses_existing_feed_upload_endpoint():
     assert "async function _uploadFeedPhoto(files, objectId)" in feed_src
     assert "formData.append('object_id', objectId)" in feed_src
 
-    # Backend already accepted object_id before this change -- confirms no
-    # new endpoint was required, only wiring the existing field from the client.
-    main_src = _source(MAIN_PY)
-    start = main_src.index("async def upload_feed_photo(")
-    end = main_src.index("\n\n\n", start)
-    assert "object_id: str = Form('')" in main_src[start:end]
+    # Canonical backend endpoint now lives in the extracted photo-feed domain.
+    photo_src = _source(PHOTO_FEED_PY)
+    start = photo_src.index("async def upload_feed_photo(")
+    end = photo_src.index("\n\n", start)
+    assert "object_id: str = Form('')" in photo_src[start:end]
+    assert "@router.post('/api/feed/photos')" in photo_src
 
 
 def test_need_action_reuses_existing_tasks_form_no_duplicate_validation():

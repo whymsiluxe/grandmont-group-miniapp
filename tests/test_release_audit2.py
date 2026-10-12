@@ -17,9 +17,11 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
+sys.path.insert(0, os.path.dirname(__file__))
 
 from fastapi import HTTPException  # noqa: E402
 import main as backend  # noqa: E402
+from chat_domain_testkit import ChatDomainHarness  # noqa: E402
 
 OWNER = {'id': 1, 'first_name': 'Boss'}
 WORKER_A = {'id': 10, 'first_name': 'Ivan'}
@@ -161,32 +163,32 @@ class CorruptJsonExceptionHandlerTests(unittest.IsolatedAsyncioTestCase):
 
 class AbwesenheitRedactionTests(unittest.TestCase):
     FULL_ENTRY = {
-        'id': 'a1', 'user_id': '10', 'name': 'Ivan', 'date_from': '2026-08-01',
-        'date_to': '2026-08-05', 'open_ended': False, 'reason': 'krankheit',
+        'id': 'a1', 'user_id': '10', 'name': 'Ivan', 'date_from': '2099-08-01',
+        'date_to': '2099-08-05', 'open_ended': False, 'reason': 'krankheit',
         'note': 'Приватная мед. деталь про операцию', 'start_time': '', 'end_time': '',
         'status': 'approved',
     }
 
+    def _list_from_real_temp_store(self, user, role):
+        with tempfile.TemporaryDirectory() as td, \
+             patch.object(backend, 'ABWESENHEIT_FILE', os.path.join(td, 'abwesenheit.json')):
+            backend._save_abwesenheit([dict(self.FULL_ENTRY)])
+            return backend.list_all_abwesenheit(user=user, role=role)
+
     def test_worker_sees_redacted_fields_for_others(self):
-        with patch.object(backend, '_load_abwesenheit', return_value=[dict(self.FULL_ENTRY)]), \
-             patch.object(backend, '_auto_close_expired_open_ended_abwesenheit'):
-            result = backend.list_all_abwesenheit(user=WORKER_B, role='worker')
+        result = self._list_from_real_temp_store(user=WORKER_B, role='worker')
         entry = result['entries'][0]
         self.assertNotIn('note', entry)
         self.assertEqual(entry['name'], 'Ivan')
         self.assertEqual(entry['status'], 'approved')
 
     def test_worker_sees_own_full_entry(self):
-        with patch.object(backend, '_load_abwesenheit', return_value=[dict(self.FULL_ENTRY)]), \
-             patch.object(backend, '_auto_close_expired_open_ended_abwesenheit'):
-            result = backend.list_all_abwesenheit(user=WORKER_A, role='worker')
+        result = self._list_from_real_temp_store(user=WORKER_A, role='worker')
         entry = result['entries'][0]
         self.assertEqual(entry['note'], self.FULL_ENTRY['note'])
 
     def test_owner_sees_full_entry(self):
-        with patch.object(backend, '_load_abwesenheit', return_value=[dict(self.FULL_ENTRY)]), \
-             patch.object(backend, '_auto_close_expired_open_ended_abwesenheit'):
-            result = backend.list_all_abwesenheit(user=OWNER, role='owner')
+        result = self._list_from_real_temp_store(user=OWNER, role='owner')
         entry = result['entries'][0]
         self.assertEqual(entry['note'], self.FULL_ENTRY['note'])
 
@@ -227,33 +229,35 @@ class ToolCheckoutRaceTests(unittest.TestCase):
 
 class ArchivedAttachmentAccessTests(unittest.TestCase):
     def test_participant_opens_attachment_from_archived_message(self):
-        att = {'file': 'archived1.jpg', 'name': 'photo.jpg', 'content_type': 'image/jpeg'}
-        archived_msg = {
-            'id': 'old1', 'ts': 1000, 'user_id': 10, 'name': 'Ivan', 'text': '',
-            'to_user_id': None, 'thread_key': 'obj:OBJ-1', 'attachment': att,
-        }
-        with patch.object(backend, '_load_chat', return_value=[]), \
-             patch.object(backend, '_safe_load_json', return_value=[archived_msg]), \
-             patch.object(backend.os.path, 'exists', return_value=True), \
-             patch.object(backend, '_check_thread_access'), \
-             patch.object(backend, 'FileResponse', return_value='OK') as mock_fr:
-            result = backend.get_chat_attachment('archived1.jpg', user=WORKER_A, role='worker')
-        self.assertEqual(result, 'OK')
-        mock_fr.assert_called_once()
+        h = ChatDomainHarness()
+        try:
+            h.grant_object('OBJ-1', '10')
+            h.create_attachment('archived1.jpg')
+            h.archive = [{
+                'id': 'old1', 'ts': 1000, 'user_id': 10, 'name': 'Ivan', 'text': '',
+                'to_user_id': None, 'thread_key': 'obj:OBJ-1',
+                'attachment': {'file': 'archived1.jpg', 'name': 'photo.jpg', 'content_type': 'image/jpeg'},
+            }]
+            response = h.actions.get_chat_attachment('archived1.jpg', user=WORKER_A, role='worker')
+            self.assertTrue(response.path.endswith('archived1.jpg'))
+        finally:
+            h.close()
 
     def test_outsider_denied_for_archived_attachment(self):
-        att = {'file': 'archived2.jpg', 'name': 'photo.jpg', 'content_type': 'image/jpeg'}
-        archived_msg = {
-            'id': 'old2', 'ts': 1000, 'user_id': 10, 'name': 'Ivan', 'text': '',
-            'to_user_id': None, 'thread_key': 'obj:OBJ-1', 'attachment': att,
-        }
-        with patch.object(backend, '_load_chat', return_value=[]), \
-             patch.object(backend, '_safe_load_json', return_value=[archived_msg]), \
-             patch.object(backend.os.path, 'exists', return_value=True), \
-             patch.object(backend, '_check_thread_access', side_effect=HTTPException(403, 'no access')):
+        h = ChatDomainHarness()
+        try:
+            h.grant_object('OBJ-1', '10')
+            h.create_attachment('archived2.jpg')
+            h.archive = [{
+                'id': 'old2', 'ts': 1000, 'user_id': 10, 'name': 'Ivan', 'text': '',
+                'to_user_id': None, 'thread_key': 'obj:OBJ-1',
+                'attachment': {'file': 'archived2.jpg', 'name': 'photo.jpg', 'content_type': 'image/jpeg'},
+            }]
             with self.assertRaises(HTTPException) as ctx:
-                backend.get_chat_attachment('archived2.jpg', user=WORKER_B, role='worker')
-        self.assertEqual(ctx.exception.status_code, 403)
+                h.actions.get_chat_attachment('archived2.jpg', user=WORKER_B, role='worker')
+            self.assertEqual(ctx.exception.status_code, 403)
+        finally:
+            h.close()
 
 
 if __name__ == '__main__':

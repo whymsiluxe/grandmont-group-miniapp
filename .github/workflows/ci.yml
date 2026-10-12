@@ -28,9 +28,9 @@ jobs:
       - name: Install test dependencies
         run: pip install -r requirements-test.txt
 
-      - name: Python syntax check (backend/*.py, backend/core/*.py, tests/*.py)
+      - name: Python syntax check (backend/*.py, backend/core/*.py, backend/routes/*.py, tests/*.py)
         run: |
-          python -m py_compile backend/*.py backend/core/*.py tests/*.py
+          python -m py_compile backend/*.py backend/core/*.py backend/routes/*.py tests/*.py
 
       - name: Verify backend/main.py importable in test environment
         run: |
@@ -134,7 +134,7 @@ jobs:
 
       - name: Run full test suite
         run: |
-          cd tests && python -m pytest . -q
+          cd tests && python -m pytest . -q -rs
 
       - name: JS syntax check (frontend/js/**/*.js + backend PDF scripts)
         run: |

@@ -8,26 +8,23 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 
 import main as backend  # noqa: E402
+from photo_feed_testkit import PhotoFeedHarness  # noqa: E402
+from routes.photo_feed import PhotoReactionBody  # noqa: E402
 
 
 class FeedPhotoIntegrityTests(unittest.TestCase):
     def test_list_feed_photos_hides_posts_without_existing_files(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            keep = os.path.join(tmp, 'keep.jpg')
-            with open(keep, 'wb') as f:
-                f.write(b'jpg')
-
-            items = [
+        harness = PhotoFeedHarness()
+        try:
+            harness.create_photo_file('keep.jpg')
+            harness.metadata = [
                 {'id': 'missing', 'files': ['missing.jpg'], 'comments': [{'id': 'c1'}]},
                 {'id': 'partial', 'files': ['keep.jpg', 'gone.jpg'], 'comments': []},
             ]
-            with (
-                patch.object(backend, 'PHOTO_DIR', tmp),
-                patch.object(backend, '_load_photo_meta', return_value=items),
-                patch.object(backend, '_load_photo_reactions', return_value={'partial': {'1': True, '2': True}}),
-                patch.object(backend, '_load_feed_saved', return_value={'1': {'photo': {'partial': 123}}}),
-            ):
-                result = backend.list_feed_photos(user={'id': 1})
+            harness._write_json(harness.reactions_path, {'partial': {'1': True, '2': True}})
+            harness.saved = {'1': {'photo': {'partial': 123}}}
+
+            result = harness.handlers.list_feed_photos(user={'id': 1})
 
             self.assertEqual([p['id'] for p in result['photos']], ['partial'])
             self.assertEqual(result['photos'][0]['files'], ['keep.jpg'])
@@ -35,40 +32,38 @@ class FeedPhotoIntegrityTests(unittest.TestCase):
             self.assertEqual(result['photos'][0]['likes'], 2)
             self.assertTrue(result['photos'][0]['liked_by_me'])
             self.assertTrue(result['photos'][0]['saved_by_me'])
+        finally:
+            harness.close()
 
     def test_react_feed_photo_persists_like_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            reactions_path = os.path.join(tmp, 'feed_photo_reactions.json')
-            meta = [{'id': 'PH1', 'files': ['keep.jpg']}]
-
-            with (
-                patch.object(backend, 'PHOTO_REACTIONS_FILE', reactions_path),
-                patch.object(backend, '_load_photo_meta', return_value=meta),
-            ):
-                liked = backend.react_feed_photo(
-                    'PH1',
-                    backend.PhotoReactionBody(liked=True),
-                    user={'id': 7},
-                )
-                unliked = backend.react_feed_photo(
-                    'PH1',
-                    backend.PhotoReactionBody(liked=False),
-                    user={'id': 7},
-                )
+        harness = PhotoFeedHarness()
+        try:
+            harness.metadata = [{'id': 'PH1', 'files': ['keep.jpg']}]
+            liked = harness.handlers.react_feed_photo(
+                'PH1', PhotoReactionBody(liked=True), user={'id': 7},
+            )
+            self.assertEqual(harness.reactions, {'PH1': {'7': True}})
+            unliked = harness.handlers.react_feed_photo(
+                'PH1', PhotoReactionBody(liked=False), user={'id': 7},
+            )
 
             self.assertEqual(liked, {'likes': 1, 'liked_by_me': True})
             self.assertEqual(unliked, {'likes': 0, 'liked_by_me': False})
+            self.assertEqual(harness.reactions, {'PH1': {}})
+        finally:
+            harness.close()
 
     def test_react_feed_photo_404_for_missing_post(self):
-        with self.assertRaises(backend.HTTPException) as ctx:
-            with patch.object(backend, '_load_photo_meta', return_value=[]):
-                backend.react_feed_photo(
-                    'missing',
-                    backend.PhotoReactionBody(liked=True),
-                    user={'id': 7},
+        harness = PhotoFeedHarness()
+        try:
+            harness.metadata = []
+            with self.assertRaises(backend.HTTPException) as ctx:
+                harness.handlers.react_feed_photo(
+                    'missing', PhotoReactionBody(liked=True), user={'id': 7},
                 )
-
-        self.assertEqual(ctx.exception.status_code, 404)
+            self.assertEqual(ctx.exception.status_code, 404)
+        finally:
+            harness.close()
 
     def test_save_feed_photo_persists_state(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -73,13 +73,15 @@ class CriticalAlertAckRaceTests(unittest.TestCase):
         # comment referencing the old pattern by name).
         import inspect
         src = inspect.getsource(backend.ack_critical_alert)
-        assert 'update_json_transaction(CRITICAL_ALERTS_FILE' in src
+        assert 'deps.update_json_transaction(' in src
+        assert 'deps.critical_alerts_file()' in src
         assert '_save_critical_alerts(items)' not in src
 
     def test_resolve_uses_update_json_transaction_not_a_bare_load_then_save(self):
         import inspect
         src = inspect.getsource(backend.resolve_critical_alert)
-        assert 'update_json_transaction(CRITICAL_ALERTS_FILE' in src
+        assert 'deps.update_json_transaction(' in src
+        assert 'deps.critical_alerts_file()' in src
         assert '_save_critical_alerts(items)' not in src
 
     def test_ack_survives_a_concurrent_create_without_losing_either_write(self):

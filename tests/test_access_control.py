@@ -23,9 +23,11 @@ import unittest
 from urllib.parse import quote
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
+sys.path.insert(0, os.path.dirname(__file__))
 
 from fastapi import HTTPException  # noqa: E402
 import main as backend  # noqa: E402
+from chat_domain_testkit import ChatDomainHarness  # noqa: E402
 
 
 def _build_init_data(user_id=111, first_name='Test', auth_date=None, tamper=False, bad_hash=False, missing_hash=False):
@@ -176,12 +178,14 @@ class CrossWorkerAuthorizationTests(unittest.TestCase):
             self.assertEqual(len(json.load(f)), 1)
 
     def test_worker_cannot_delete_another_workers_chat_message(self):
-        from unittest.mock import patch
-        messages = [{'id': 'm1', 'user_id': 222, 'text': 'hi', 'to_user_id': None}]
-        with patch.object(backend, '_load_chat', return_value=messages):
+        h = ChatDomainHarness(roles={'111': 'worker', '222': 'worker'})
+        try:
+            h.messages = [{'id': 'm1', 'user_id': 222, 'text': 'hi', 'to_user_id': None}]
             with self.assertRaises(HTTPException) as ctx:
-                backend.delete_chat_message(msg_id='m1', user={'id': 111}, role='worker')
+                h.actions.delete_chat_message(msg_id='m1', user={'id': 111}, role='worker')
             self.assertEqual(ctx.exception.status_code, 403)
+        finally:
+            h.close()
 
     def test_worker_cannot_ack_another_workers_critical_alert(self):
         import tempfile
@@ -237,26 +241,18 @@ class DirectFileAccessTests(unittest.TestCase):
     правильной авторизации, даже зная точное имя файла (IDOR)."""
 
     def test_worker_cannot_fetch_other_threads_chat_attachment(self):
-        from unittest.mock import patch
-        import tempfile
-        # Файл должен реально существовать -- get_chat_attachment сначала проверяет
-        # os.path.exists() и 404-ит раньше authorization-логики, иначе тест проверял
-        # бы "файла нет", а не саму IDOR-защиту.
-        original_dir = backend.CHAT_ATTACH_DIR
-        with tempfile.TemporaryDirectory() as tmp:
-            backend.CHAT_ATTACH_DIR = tmp
-            try:
-                with open(os.path.join(tmp, 'secret.jpg'), 'wb') as f:
-                    f.write(b'fake image bytes')
-                # Вложение принадлежит DM-треду между 222 и 333 -- 111 не участник.
-                messages = [{'id': 'm1', 'user_id': 222, 'to_user_id': '333',
-                             'attachment': {'file': 'secret.jpg'}}]
-                with patch.object(backend, '_load_chat', return_value=messages):
-                    with self.assertRaises(HTTPException) as ctx:
-                        backend.get_chat_attachment(fname='secret.jpg', user={'id': 111}, role='worker')
-                    self.assertEqual(ctx.exception.status_code, 403)
-            finally:
-                backend.CHAT_ATTACH_DIR = original_dir
+        h = ChatDomainHarness(roles={'111': 'worker', '222': 'worker', '333': 'worker'})
+        try:
+            h.create_attachment('secret.jpg')
+            h.messages = [{
+                'id': 'm1', 'user_id': 222, 'to_user_id': '333',
+                'attachment': {'file': 'secret.jpg'},
+            }]
+            with self.assertRaises(HTTPException) as ctx:
+                h.actions.get_chat_attachment(fname='secret.jpg', user={'id': 111}, role='worker')
+            self.assertEqual(ctx.exception.status_code, 403)
+        finally:
+            h.close()
 
     def test_worker_cannot_fetch_another_users_transcribe_audio_by_guessing_id(self):
         # file_id существует только в подпапке user 222 -- 111 (non-owner) ищет
