@@ -1,0 +1,37 @@
+name: Storage utcnow cleanup
+
+on:
+  push:
+    branches:
+      - cleanup/storage-utcnow
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    env:
+      BOT_TOKEN: ci-dummy-token-not-a-real-secret
+      MINIAPP_DATA_ROOT: /tmp/ci-miniapp-data
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y libmagic1
+      - run: pip install -r requirements-test.txt
+      - run: python tools/storage_utcnow_cleanup.py
+      - run: python -m py_compile backend/*.py backend/core/*.py backend/routes/*.py tests/*.py
+      - run: cd tests && python -m pytest . -q -rs
+      - name: Commit clean result
+        run: |
+          rm tools/storage_utcnow_cleanup.py .github/workflows/storage-utcnow-cleanup.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "cleanup: remove storage utcnow deprecation"
+          git push origin HEAD:cleanup/storage-utcnow
