@@ -51,20 +51,22 @@ AUTH_HEADERS = [
 ]
 
 # method, path, handler, operationId, exact top-level deps, local OpenAPI params,
-# JSON body component (if applicable), request content type (if applicable).
+# body component, request content type, request-body requiredness.
 ROUTES = [
-    ("GET", "/api/mangel", "get_mangel_list", "get_mangel_list_api_mangel_get", [("user","user"),("role","role")], [("object_id","query",False,"string","")], None, None),
-    ("GET", "/api/mangel/counts", "get_mangel_counts", "get_mangel_counts_api_mangel_counts_get", [("user","user")], [], None, None),
-    ("GET", "/api/mangel/{ticket_id}", "get_mangel_ticket", "get_mangel_ticket_api_mangel__ticket_id__get", [("user","user"),("_","mangel_access")], [("ticket_id","path",True,"string","<required>")], None, None),
-    ("POST", "/api/mangel", "create_mangel_ticket", "create_mangel_ticket_api_mangel_post", [("user","user"),("role","role")], [], "Body_create_mangel_ticket_api_mangel_post", "multipart/form-data"),
-    ("GET", "/api/mangel/photos/{fname}/file", "get_mangel_photo_file", "get_mangel_photo_file_api_mangel_photos__fname__file_get", [("user","user"),("role","role")], [("fname","path",True,"string","<required>")], None, None),
-    ("PATCH", "/api/mangel/{ticket_id}/status", "update_mangel_status", "update_mangel_status_api_mangel__ticket_id__status_patch", [("user","user"),("_","owner")], [("ticket_id","path",True,"string","<required>")], "MangelStatusBody", "application/json"),
-    ("POST", "/api/mangel/{ticket_id}/comments", "add_mangel_comment", "add_mangel_comment_api_mangel__ticket_id__comments_post", [("user","user"),("_","mangel_access")], [("ticket_id","path",True,"string","<required>")], "MangelCommentBody", "application/json"),
-    ("DELETE", "/api/mangel/{ticket_id}", "delete_mangel_ticket", "delete_mangel_ticket_api_mangel__ticket_id__delete", [("user","user"),("_","owner")], [("ticket_id","path",True,"string","<required>")], None, None),
-    ("GET", "/api/mangel/{ticket_id}/comments", "get_mangel_comments", "get_mangel_comments_api_mangel__ticket_id__comments_get", [("user","user"),("_","mangel_access")], [("ticket_id","path",True,"string","<required>")], None, None),
+    ("GET", "/api/mangel", "get_mangel_list", "get_mangel_list_api_mangel_get", [("user","user"),("role","role")], [("object_id","query",False,"string","")], None, None, None),
+    ("GET", "/api/mangel/counts", "get_mangel_counts", "get_mangel_counts_api_mangel_counts_get", [("user","user")], [], None, None, None),
+    ("GET", "/api/mangel/{ticket_id}", "get_mangel_ticket", "get_mangel_ticket_api_mangel__ticket_id__get", [("user","user"),("_","mangel_access")], [("ticket_id","path",True,"string","<required>")], None, None, None),
+    # All multipart fields have defaults in the legacy endpoint, so the whole
+    # requestBody is optional. This is intentionally pinned as part of the API.
+    ("POST", "/api/mangel", "create_mangel_ticket", "create_mangel_ticket_api_mangel_post", [("user","user"),("role","role")], [], "Body_create_mangel_ticket_api_mangel_post", "multipart/form-data", False),
+    ("GET", "/api/mangel/photos/{fname}/file", "get_mangel_photo_file", "get_mangel_photo_file_api_mangel_photos__fname__file_get", [("user","user"),("role","role")], [("fname","path",True,"string","<required>")], None, None, None),
+    ("PATCH", "/api/mangel/{ticket_id}/status", "update_mangel_status", "update_mangel_status_api_mangel__ticket_id__status_patch", [("user","user"),("_","owner")], [("ticket_id","path",True,"string","<required>")], "MangelStatusBody", "application/json", True),
+    ("POST", "/api/mangel/{ticket_id}/comments", "add_mangel_comment", "add_mangel_comment_api_mangel__ticket_id__comments_post", [("user","user"),("_","mangel_access")], [("ticket_id","path",True,"string","<required>")], "MangelCommentBody", "application/json", True),
+    ("DELETE", "/api/mangel/{ticket_id}", "delete_mangel_ticket", "delete_mangel_ticket_api_mangel__ticket_id__delete", [("user","user"),("_","owner")], [("ticket_id","path",True,"string","<required>")], None, None, None),
+    ("GET", "/api/mangel/{ticket_id}/comments", "get_mangel_comments", "get_mangel_comments_api_mangel__ticket_id__comments_get", [("user","user"),("_","mangel_access")], [("ticket_id","path",True,"string","<required>")], None, None, None),
 ]
 
-for method, path, handler_name, operation_id, deps, local_params, body_component, content_type in ROUTES:
+for method, path, handler_name, operation_id, deps, local_params, body_component, content_type, body_required in ROUTES:
     matches = [r for r in routes if getattr(r, "path", None) == path and method in getattr(r, "methods", set())]
     assert len(matches) == 1, (method, path, len(matches))
     route = matches[0]
@@ -89,7 +91,8 @@ for method, path, handler_name, operation_id, deps, local_params, body_component
 
     request_body = operation.get("requestBody")
     if body_component:
-        assert request_body is not None and request_body.get("required") is True, (method, path, request_body)
+        assert request_body is not None, (method, path, request_body)
+        assert bool(request_body.get("required", False)) is body_required, (method, path, request_body)
         schema = request_body["content"][content_type]["schema"]
         assert schema == {"$ref": f"#/components/schemas/{body_component}"}, (method, path, schema)
     else:
@@ -154,7 +157,10 @@ for node in ast.walk(main_tree):
 
 # Compatibility is alias-only and retains the canonical repo-backed module object.
 assert backend.ml is backend._load_repo_mangel_lib()
-assert backend.delete_mangel_ticket is next(r.endpoint for r in routes if getattr(r,"path",None)=="/api/mangel/{ticket_id}" and "DELETE" in getattr(r,"methods",set()))
+assert backend.delete_mangel_ticket is next(
+    r.endpoint for r in routes
+    if getattr(r, "path", None) == "/api/mangel/{ticket_id}" and "DELETE" in getattr(r, "methods", set())
+)
 
 print("phase2-mangel-contract-ok", len(ROUTES))
 '''
