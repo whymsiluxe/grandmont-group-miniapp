@@ -2654,6 +2654,11 @@ _commercial_docs_router, _commercial_docs_handlers = create_commercial_docs_rout
         rechnung_script=lambda: RECHNUNG_SCRIPT,
         angebot_out_dir=lambda: ANGEBOT_OUT_DIR,
         rechnung_out_dir=lambda: RECHNUNG_OUT_DIR,
+        # Late-bound compatibility: callers/tests that temporarily replace the
+        # legacy main.py helper names still affect the extracted endpoints.
+        send_pdf=lambda *args, **kwargs: send_pdf_to_chat(*args, **kwargs),
+        generate_pdf=lambda *args, **kwargs: _run_pdf_generator(*args, **kwargs),
+        make_pdf_filename=lambda prefix, customer: _safe_pdf_filename(prefix, customer),
     )
 )
 app.include_router(_commercial_docs_router)
