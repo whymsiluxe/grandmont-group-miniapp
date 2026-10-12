@@ -50,6 +50,7 @@ class WorkforceProfilesDeps:
     load_worker_profiles: Callable[[], dict]
     sanitize_display_name: Callable[[Any, str], str]
     update_json_transaction: Callable[[str, Any, Callable[[Any], Any]], Any]
+    atomic_write_json: Callable[[str, Any], None]
     worker_profiles_file: Callable[[], str]
     work_types_catalog: Callable[[], Any]
     skill_options: Collection[str]
@@ -98,16 +99,7 @@ def create_workforce_profiles_router(
     os.makedirs(deps.avatar_dir(), exist_ok=True)
 
     def save_worker_profiles(profiles: dict):
-        # Keep the old helper semantics for direct compatibility callers; all RMW
-        # endpoint paths below continue to use update_json_transaction.
-        from pathlib import Path
-        import json
-        path = deps.worker_profiles_file()
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        tmp = f'{path}.tmp-{os.getpid()}'
-        with open(tmp, 'w', encoding='utf-8') as handle:
-            json.dump(profiles, handle, ensure_ascii=False)
-        os.replace(tmp, path)
+        deps.atomic_write_json(deps.worker_profiles_file(), profiles)
 
     def get_worker_profile(user_id) -> dict:
         profiles = deps.load_worker_profiles()
@@ -208,15 +200,12 @@ def create_workforce_profiles_router(
         if not healed_name and user.get('first_name'):
             candidate = deps.sanitize_display_name(user.get('first_name'), '')
             if candidate:
+                profiles = deps.load_worker_profiles()
                 key = str(user['id'])
-
-                def _heal(profiles):
-                    current = profiles.get(key, {"skills": [], "quiz_completed": False})
-                    current['name'] = candidate
-                    profiles[key] = current
-                    return current
-
-                profile = deps.update_json_transaction(deps.worker_profiles_file(), {}, _heal)
+                profile = profiles.get(key, {"skills": [], "quiz_completed": False})
+                profile['name'] = candidate
+                profiles[key] = profile
+                save_worker_profiles(profiles)
                 healed_name = candidate
         if healed_name:
             profile = {**profile, 'name': healed_name}

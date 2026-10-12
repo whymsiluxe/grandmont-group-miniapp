@@ -864,490 +864,87 @@ def create_session(x_telegram_init_data: str = Header(...)) -> dict:
     }
 
 
-# ---------- Workers list (для bubble-assign, Фаза 2 → доделано в Фазе 3) ----------
-@app.get("/api/workers")
-def list_workers(user: dict = Depends(get_current_user)):
-    roles = _load_roles()
-    profiles = _load_worker_profiles()
-    # 09.09: roster/access invariant fix (owner report -- worker "Иван" appeared in
-    # team/dashboard, had no avatar, Worker Card 404'd, and was missing from the
-    # Доступ tab). Root cause: this endpoint unioned roles.json + worker_profiles.json
-    # keys, then did `roles.get(uid, 'worker')` -- a DEFAULT of 'worker' for ANY uid
-    # not in roles.json at all, not just those explicitly granted that role. The same
-    # exact bug was already found and fixed in get_assignment_candidates() (01.08,
-    # comment above worker_ids there) but never applied here -- this endpoint kept
-    # presenting profile-only users (filled onboarding, never granted or since revoked
-    # access) as if they were active workers with real access. Every one of this
-    # endpoint's 6 frontend consumers already filters on `w.role === 'worker'`
-    # (mangel.js, tools.js, home.js, abwesenheit.js, today-plan.js) -- fixing the
-    # default here makes those filters correct automatically, no frontend change
-    # needed for the worker-picker call sites. `access_granted` is new, additive --
-    # existing consumers reading only `role`/`name` are unaffected.
-    all_ids = set(roles.keys() if isinstance(roles, dict) else []) | set(profiles.keys() if isinstance(profiles, dict) else [])
-    workers = []
-    for uid in all_ids:
-        try:
-            p = profiles.get(uid) if isinstance(profiles, dict) else None
-            if not isinstance(p, dict):
-                p = {}
-            last_seen = _last_seen.get(uid)
-            role = roles.get(uid) if isinstance(roles, dict) else None  # None if not in roles.json -- no more silent 'worker' default
-            skills = p.get('skills', [])
-            workers.append({
-                'user_id': uid,
-                'role': role,
-                'access_granted': role is not None,
-                'name': _sanitize_display_name(p.get('name'), uid),
-                'skills': skills if isinstance(skills, list) else [],
-                'has_avatar': bool(p.get('avatar')),
-                'quiz_completed': bool(p.get('quiz_completed', False)),
-                'online': bool(last_seen and (time.time() - last_seen) < ONLINE_THRESHOLD_SECONDS),
-            })
-        except Exception:
-            # 27.09 (owner report: Workers screen not loading): one malformed
-            # roles/worker_profiles entry must not take down the whole roster --
-            # skip just that uid, never the profile content (could carry PII).
-            logging.getLogger('grandmont.workers').warning("workers: skipping malformed entry for uid=%s", uid)
-            continue
-    return {'workers': workers}
-
-
-# ---------- Профиль работника: навыки + онбординг-квиз (Фаза 2/8) ----------
-# moved to core/paths.py -- WORKER_PROFILES_FILE
-# 01.08 (единый каталог видов работ): SKILL_OPTIONS был вручную продублированным
-# списком из 19 строк, отдельно от frontend ONBOARDING_GROUPS/BUBBLE_STAGE_OPTIONS --
-# новый навык мог появиться в одном месте и отсутствовать в другом (реальный
-# найденный дрифт: SKILL_STAGE_MAP покрывал только 8 из 19). Источник истины теперь
-# один -- work_types.py, SKILL_OPTIONS оставлен как производный список ИМЁН active
-# work types (тот же порядок что в каталоге) только для legacy-полей API-ответов
-# (skill_options в /api/profile/me), которые старый frontend-код ещё может читать.
-SKILL_OPTIONS = [w['name'] for w in wt.WORK_TYPES if w['active']]
-
-
-# _load_worker_profiles moved to core/profiles.py (minimal dependency closure
-# for routes/auth.py) -- imported back below, main.py's copy is a re-export,
-# not a second implementation. Patched by name in 12 test files targeting
-# functions that stay in main.py, so the name must keep resolving here too.
+# ---------- Workforce profiles domain ----------
+# Roster, profile/onboarding, skills verification and avatar HTTP flow live in
+# routes/workforce_profiles.py. Cross-domain check-in/Sheets state is injected.
 try:
     from .core.profiles import _load_worker_profiles, _sanitize_display_name
+    from .routes.workforce_profiles import (
+        ProfileUpdateBody,
+        SkillV2Body,
+        SkillVerificationBody,
+        WorkforceProfilesDeps,
+        create_workforce_profiles_router,
+    )
 except ImportError:
     from core.profiles import _load_worker_profiles, _sanitize_display_name  # noqa: E402
+    from routes.workforce_profiles import (  # noqa: E402
+        ProfileUpdateBody,
+        SkillV2Body,
+        SkillVerificationBody,
+        WorkforceProfilesDeps,
+        create_workforce_profiles_router,
+    )
 
+_workforce_profiles_router, _workforce_profiles_handlers = create_workforce_profiles_router(
+    WorkforceProfilesDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        require_owner=require_owner,
+        load_roles=lambda: _load_roles(),
+        load_worker_profiles=lambda: _load_worker_profiles(),
+        sanitize_display_name=lambda raw, fallback: _sanitize_display_name(raw, fallback),
+        update_json_transaction=update_json_transaction,
+        atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+        worker_profiles_file=lambda: WORKER_PROFILES_FILE,
+        work_types_catalog=wt.work_types_catalog,
+        skill_options=[w['name'] for w in wt.WORK_TYPES if w['active']],
+        normalize_profile_skills=pskills.normalize_profile_skills,
+        legacy_skill_names_from_v2=pskills.legacy_skill_names_from_v2,
+        set_skill_verification=pskills.set_skill_verification,
+        skill_levels=pskills.SKILL_LEVELS,
+        business_today=lambda: business_today(),
+        business_today_str=lambda: business_today_str(),
+        last_seen_for=lambda uid: _last_seen.get(str(uid)),
+        online_threshold_seconds=ONLINE_THRESHOLD_SECONDS,
+        load_checkin_meta=lambda: _load_checkin_meta(),
+        is_active_photo_checkin_session=lambda session: _is_active_photo_checkin_session(session),
+        cached_get_used_range=lambda tab: _cached_get_used_range(tab),
+        avatar_dir=lambda: AVATAR_DIR,
+        avatar_max_bytes=AVATAR_MAX_BYTES,
+        sniff_image=sniff_image,
+        allowed_image_mime_ext=_ALLOWED_IMAGE_MIME_EXT,
+    )
+)
+app.include_router(_workforce_profiles_router)
 
-def _save_worker_profiles(profiles: dict):
-    _atomic_write_json(WORKER_PROFILES_FILE, profiles)
+SKILL_OPTIONS = _workforce_profiles_handlers.skill_options
+_save_worker_profiles = _workforce_profiles_handlers.save_worker_profiles
+_get_worker_profile = _workforce_profiles_handlers.get_worker_profile
+_get_worker_skills_v2 = _workforce_profiles_handlers.get_worker_skills_v2
+_is_meaningful_name = _workforce_profiles_handlers.is_meaningful_name
+_resolve_current_display_name = _workforce_profiles_handlers.resolve_current_display_name
+_validate_birthday = _workforce_profiles_handlers.validate_birthday
+_profile_completion_status = _workforce_profiles_handlers.profile_completion_status
+list_workers = _workforce_profiles_handlers.list_workers
+get_work_types = _workforce_profiles_handlers.get_work_types
+get_my_profile = _workforce_profiles_handlers.get_my_profile
+get_user_card = _workforce_profiles_handlers.get_user_card
+update_my_profile = _workforce_profiles_handlers.update_my_profile
+verify_worker_skill = _workforce_profiles_handlers.verify_worker_skill
+upload_my_avatar = _workforce_profiles_handlers.upload_my_avatar
+get_avatar = _workforce_profiles_handlers.get_avatar
 
-
-def _get_worker_profile(user_id) -> dict:
-    profiles = _load_worker_profiles()
-    return profiles.get(str(user_id), {"skills": [], "quiz_completed": False})
-
-
-@app.get("/api/work-types")
-def get_work_types(user: dict = Depends(get_current_user)):
-    """01.08: единый каталог видов работ -- доступен любому авторизованному
-    пользователю (не owner-only), т.к. Worker выбирает навыки в onboarding/профиле,
-    не только Owner в Assignment Sheet."""
-    return wt.work_types_catalog()
-
-
-def _get_worker_skills_v2(user_id) -> list:
-    """Профиль работника -> нормализованный skills_v2, с idempotent миграцией
-    legacy 'skills' (список названий) при первом обращении -- ТОЛЬКО если реально
-    нужна миграция (skills_v2 отсутствует), файл не переписывается на каждый read.
-
-    RMW под update_json_transaction (не load->mutate->save по отдельности) --
-    иначе конкурентный update_my_profile/verify_worker_skill на том же профиле
-    мог тихо затереться этой миграцией или наоборот (см. storage.py docstring)."""
-    key = str(user_id)
-
-    def _mutator(profiles):
-        profile = profiles.get(key, {"skills": [], "quiz_completed": False})
-        skills_v2, changed = pskills.normalize_profile_skills(profile)
-        if changed:
-            profile['skills_v2'] = skills_v2
-            profiles[key] = profile
-        return skills_v2
-
-    return update_json_transaction(WORKER_PROFILES_FILE, {}, _mutator)
-
-
-# moved to core/constants.py -- _INVISIBLE_FILLER_CHARS
-
-
+# Check-in-specific GPS heuristic stays in the composition module until the
+# remaining check-in support helpers are consolidated separately.
 def _gps_suspect(lat: str, lon: str) -> bool:
-    """Грубая эвристика, не блокирует check-in (GPS на стройке часто глючит --
-    подвалы, между зданиями), только помечает координаты как подозрительные для owner:
-    (0,0) -- Null Island, классический fallback GPS-модуля при полном отсутствии сигнала;
-    либо явно вне разумного диапазона Германии (широта ~47-55, долгота ~5-16)."""
     try:
         f_lat, f_lon = float(lat), float(lon)
     except (ValueError, TypeError):
         return True
     if f_lat == 0 and f_lon == 0:
         return True
-    if not (47 <= f_lat <= 55.5 and 5 <= f_lon <= 16):
-        return True
-    return False
-
-
-def _is_meaningful_name(raw: str | None, user_id: str) -> bool:
-    """Раунд 6 §4.1: строка — настоящее отображаемое имя, а не заглушка/ID.
-    Строже, чем _sanitize_display_name (тот пропускает цифры и сам user_id как
-    'валидные' \\w-строки): используется для one-time completion-gate существующих
-    пользователей без имени. Пусто/пробелы/невидимое/==user_id/только цифры/<2/>100 -> False."""
-    cleaned = _sanitize_display_name(raw, '')
-    if not cleaned:
-        return False
-    s = cleaned.strip()
-    if len(s) < 2 or len(s) > 100:
-        return False
-    if s.isdigit():
-        return False
-    if s == str(user_id):
-        return False
-    return True
-
-
-def _resolve_current_display_name(user_id, stored_name: str | None = None) -> str:
-    """22.09 (iPhone screenshot audit, P0/P1): canonical READ-SIDE display-name
-    resolver -- always returns the CURRENT profile name for user_id, never a
-    name frozen at write time.
-
-    Real bug this closes: chat messages (post_chat_message) and other records
-    stamp `name` at CREATE time from `user.get('first_name', str(user['id']))`
-    -- if Telegram's first_name was empty/missing at that moment, the record
-    permanently stores the raw numeric user_id as its "name" field. Every
-    later read of that record (Chat history, Feed author, Calendar/Abwesenheit
-    entries) then displayed the raw ID forever, even after the user's profile
-    later got a real name -- confirmed live on a real device across Chat,
-    Feed, and Calendar. A frontend-only mask (e.g. hiding numeric-looking
-    names) would still show nothing meaningful and wouldn't fix legacy
-    records with name==user_id stored server-side.
-
-    Always looks up the CURRENT worker_profiles entry for user_id and uses it
-    when meaningful (_is_meaningful_name, same bar the onboarding gate uses)
-    -- ignores `stored_name` entirely when the profile has a real name,
-    because a since-set real name must win over whatever was frozen at
-    write time. `stored_name` is only a last-resort fallback (kept for the
-    rare legitimate case of an ex-user with no profile record at all)."""
-    uid_str = str(user_id)
-    profile_name = _load_worker_profiles().get(uid_str, {}).get('name')
-    if _is_meaningful_name(profile_name, uid_str):
-        return _sanitize_display_name(profile_name, uid_str)
-    return _sanitize_display_name(stored_name, uid_str)
-
-
-def _validate_birthday(raw: str) -> str:
-    """Раунд 6 §3.1: валидирует дату рождения. Формат YYYY-MM-DD, реальная дата,
-    не в будущем (Europe/Berlin). Возвращает нормализованную ISO-строку либо HTTP 400."""
-    if raw is None or not str(raw).strip():
-        raise HTTPException(400, "Укажите дату рождения")
-    s = str(raw).strip()
-    try:
-        d = datetime.strptime(s, '%Y-%m-%d').date()
-    except ValueError:
-        raise HTTPException(400, "Некорректная дата рождения (формат ГГГГ-ММ-ДД)")
-    if d > business_today():
-        raise HTTPException(400, "Дата рождения не может быть в будущем")
-    return d.isoformat()
-
-
-def _profile_completion_status(user: dict, profile: dict, role: str) -> dict:
-    """Раунд 6 §3.2/§4: какие обязательные поля профиля не заполнены.
-    name — для всех; birthday — только для Worker (Owner не обязан заполнять)."""
-    uid = str(user['id'])
-    name_ok = _is_meaningful_name(profile.get('name') or user.get('first_name'), uid)
-    birthday_ok = bool(profile.get('birthday'))
-    return {
-        'name_required': not name_ok,
-        'birthday_required': (role == 'worker') and not birthday_ok,
-    }
-
-
-@app.get("/api/profile/me")
-def get_my_profile(user: dict = Depends(get_current_user)):
-    profile = _get_worker_profile(user['id'])
-    healed_name = _sanitize_display_name(profile.get('name'), '') or None
-    if not healed_name and user.get('first_name'):
-        # Раньше имя сохранялось только при загрузке аватара — работник без аватара
-        # отображался у всех числовым Telegram ID (в чате, people-dots, Abwesenheit).
-        # 23.07: то же самое — если сохранённое имя оказалось "битым" (невидимые
-        # символы/бессмысленный набор из Telegram first_name), перезаписываем его
-        # текущим Telegram first_name (обычно тем же значением — тогда ничего не
-        # меняется — но если юзер уже поправил имя в Telegram, подхватываем новое).
-        candidate = _sanitize_display_name(user.get('first_name'), '')
-        if candidate:
-            profiles = _load_worker_profiles()
-            key = str(user['id'])
-            profile = profiles.get(key, {"skills": [], "quiz_completed": False})
-            profile['name'] = candidate
-            profiles[key] = profile
-            _save_worker_profiles(profiles)
-            healed_name = candidate
-    if healed_name:
-        profile = {**profile, 'name': healed_name}
-    else:
-        # Item 5 fix (owner report: square/garbled glyphs in profile name):
-        # the healing above only overwrites profile['name'] when a usable
-        # replacement (Telegram first_name) exists. If BOTH the stored name
-        # AND the current first_name fail sanitization (real case: Telegram
-        # first_name genuinely contains only Hangul filler characters, not a
-        # rendering/font bug -- confirmed by reading the raw string, not
-        # guessed), the original unsanitized value was passed straight
-        # through to the client. Never silently strip a legitimate Cyrillic
-        # name (sanitize_display_name already handles that correctly) --
-        # only replace when sanitization proves there is truly nothing
-        # displayable left, falling back to the Telegram user_id like the
-        # rest of the app already does when no name is available at all.
-        existing_sanitized = _sanitize_display_name(profile.get('name'), '')
-        if not existing_sanitized:
-            profile = {**profile, 'name': str(user['id'])}
-    skills_v2 = _get_worker_skills_v2(user['id'])
-    role = _load_roles().get(str(user['id']), 'worker')
-    return {
-        "user_id": user['id'],
-        "skill_options": SKILL_OPTIONS,  # legacy -- старый frontend-код может ещё это читать
-        **profile,
-        "role": role,
-        "skills": pskills.legacy_skill_names_from_v2(skills_v2),  # legacy-совместимый список строк
-        "skills_v2": skills_v2,  # новый источник истины
-        "onboarding_completed": bool(profile.get('onboarding_completed') or profile.get('quiz_completed')),
-        "onboarding_version": profile.get('onboarding_version', 1),
-        # Раунд 6 §3.2/§4/§6: bootstrap показывает completion-экран если что-то обязательное пусто
-        "needs_completion": _profile_completion_status(user, profile, role),
-    }
-
-
-@app.get("/api/users/{target_id}/card")
-def get_user_card(target_id: str, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """Публичная карточка (10.10) — доступна любому авторизованному пользователю,
-    в отличие от /api/profile/stats (там чужой профиль видит только owner).
-    Только неконфиденциальные поля: имя, роль, навыки. Без часов/истории объектов/бюджета.
-
-    30.07 (спек: expanded user-card): текущий объект/статус смены -- это МЕСТОПОЛОЖЕНИЕ
-    работника, та же чувствительность что у /api/dashboard/shifts-today (уже owner-only).
-    Не добавляем эти поля для worker-to-worker просмотра (нарушило бы существующий явный
-    privacy-дизайн этого endpoint'а) -- только когда card смотрит owner."""
-    roles = _load_roles()
-    if target_id not in roles:
-        raise HTTPException(404, "Пользователь не найден")
-    profile = _get_worker_profile(target_id)
-    has_avatar = bool(profile.get('avatar'))
-    skills_v2 = _get_worker_skills_v2(target_id)
-    card = {
-        "user_id": target_id,
-        "name": _sanitize_display_name(profile.get('name'), target_id),
-        "role": roles[target_id],
-        "skills": pskills.legacy_skill_names_from_v2(skills_v2),
-        "skills_v2": skills_v2,
-        "has_avatar": has_avatar,
-    }
-    if role == 'owner' and roles[target_id] != 'owner':
-        # 20.09 (merged from upstream c23894d): здесь оставался datetime.now() =
-        # UTC сервера, хотя s['date'] пишется checkin_start'ом как business_today_str()
-        # (Europe/Berlin). Вечером после 00:00 CEST (23:00 UTC) сравнение шло со
-        # ВЧЕРАШНЕЙ датой, и владелец видел "смена не идёт" у работника на живой
-        # ночной смене. Остальные call-sites перевели на business_today_str() ещё
-        # 03.08, этот пропустили.
-        today = business_today_str()
-        sessions = [s for s in _load_checkin_meta() if str(s.get('user_id')) == target_id and s.get('date') == today]
-        open_session = next((s for s in sessions if _is_active_photo_checkin_session(s)), None)
-        rows = _cached_get_used_range('Объекты')
-        object_names = {}
-        if rows:
-            header, data = rows[0], rows[1:]
-            for r in data:
-                obj = dict(zip(header, r))
-                object_names[str(obj.get('ID объекта', ''))] = obj.get('Объект', '')
-        if open_session:
-            card["shift_status"] = "working"
-            card["object_name"] = object_names.get(open_session['object_id'], open_session['object_id'])
-            card["stage_name"] = open_session.get('stage_name') or ''
-            card["start_at"] = open_session.get('start_at')
-        else:
-            card["shift_status"] = "idle"
-    return card
-
-
-class SkillV2Body(BaseModel):
-    skill_id: str
-    level: str
-    verified: bool = False
-
-
-class ProfileUpdateBody(BaseModel):
-    name: str | None = None  # 24.07: ручное имя — нужно, когда Telegram first_name
-    # пуст/скрыт/состоит из невидимых символов (self-heal в get_my_profile не может
-    # исцелиться нечем в этом случае).
-    skills: list[str] | None = None  # legacy -- принимается для обратной совместимости
-    skills_v2: list[SkillV2Body] | None = None  # 01.08: новый источник истины
-    quiz_completed: bool | None = None
-    onboarding_completed: bool | None = None
-    onboarding_version: int | None = None
-    pants_size: str | None = None
-    shirt_size: str | None = None
-    shoe_size: str | None = None
-    birthday: str | None = None  # YYYY-MM-DD
-    # Раунд 6 §3: владелец ОТМЕНИЛ прежнее решение (01.08), запрещавшее дату рождения в
-    # onboarding и профиле. Поле снова обязательно для Worker в onboarding и completion-
-    # экране, редактируется в профиле, используется для календаря и birthday-алертов.
-    # Валидация — _validate_birthday() ниже (формат + не в будущем, Europe/Berlin).
-
-
-@app.patch("/api/profile/me")
-def update_my_profile(body: ProfileUpdateBody, user: dict = Depends(get_current_user)):
-    """RMW под update_json_transaction -- profile-зависимая часть (existing_by_id
-    для skills_v2 verified-preservation, onboarding merge-check против сохранённых
-    полей, финальный update+save) выполняется ВНУТРИ мутатора на одном захвате
-    лока, иначе конкурентный verify_worker_skill/avatar-upload/skills_v2-миграция
-    на том же профиле мог тихо затереться этим PATCH или наоборот (storage.py)."""
-    key = str(user['id'])
-    role = _load_roles().get(key, 'worker')
-    updates = body.dict(exclude_unset=True)
-    if 'name' in updates:
-        cleaned = _sanitize_display_name(updates['name'], '')
-        if not cleaned:
-            raise HTTPException(400, "Имя не должно быть пустым")
-        updates['name'] = cleaned[:100]
-    # Раунд 6 §3.1: дата рождения — валидируем формат/не-в-будущем при любом сохранении.
-    if 'birthday' in updates and updates['birthday'] is not None:
-        updates['birthday'] = _validate_birthday(updates['birthday'])
-    if 'skills_v2' in updates:
-        for s in updates['skills_v2']:
-            if s.get('level') not in pskills.SKILL_LEVELS:
-                raise HTTPException(400, f"Недопустимый уровень навыка: {s.get('level')!r}")
-
-    def _mutator(profiles):
-        profile = profiles.get(key, {"skills": [], "quiz_completed": False})
-        if 'skills_v2' in updates:
-            # 01.08 (доп.раунд П3): было -- ЛЮБОЙ PATCH skills_v2 сбрасывал verified=False
-            # для ВСЕГО списка, включая навыки, которые вообще не менялись (реальный баг:
-            # owner подтверждает 3 навыка, worker меняет уровень 4-го -- все 3 подтверждения
-            # молча слетали). Теперь: verified сохраняется, если И skill_id, И level
-            # совпадают с тем, что уже было в сохранённом профиле; новый/изменённый навык
-            # получает verified=False (worker всё ещё не может сам его подтвердить -- см.
-            # verify_worker_skill ниже, единственный способ поставить True).
-            existing_by_id = {s['skill_id']: s for s in (profile.get('skills_v2') or []) if 'skill_id' in s}
-            normalized = []
-            for s in updates['skills_v2']:
-                prior = existing_by_id.get(s.get('skill_id'))
-                unchanged = prior is not None and prior.get('level') == s.get('level')
-                normalized.append({
-                    "skill_id": s.get('skill_id'),
-                    "level": s.get('level'),
-                    "verified": bool(prior.get('verified')) if unchanged else False,
-                })
-            updates['skills_v2'] = normalized
-        # 01.08 (спека п.3): onboarding_completed нельзя установить, пока обязательные
-        # условия не выполнены -- проверяем на РЕЗУЛЬТИРУЮЩЕМ профиле (после merge с
-        # уже сохранёнными полями), не только на этом одном PATCH-запросе, т.к. frontend
-        # сохраняет профиль по шагам (спека: "Сначала сохранить профиль, затем
-        # установить onboarding_completed: true").
-        if updates.get('onboarding_completed'):
-            merged_name = updates.get('name', profile.get('name'))
-            merged_skills = updates.get('skills_v2', profile.get('skills_v2', []))
-            merged_birthday = updates.get('birthday', profile.get('birthday'))
-            if not _sanitize_display_name(merged_name, ''):
-                raise HTTPException(400, "Укажите имя, чтобы завершить регистрацию")
-            # Раунд 6 §3.1: дата рождения обязательна для Worker (Owner — нет).
-            if role == 'worker' and not merged_birthday:
-                raise HTTPException(400, "Укажите дату рождения, чтобы завершить регистрацию")
-            if not merged_skills:
-                raise HTTPException(400, "Выберите хотя бы один навык")
-            for s in merged_skills:
-                level = s.get('level') if isinstance(s, dict) else None
-                if level not in pskills.SKILL_LEVELS:
-                    raise HTTPException(400, "Укажите уровень для каждого выбранного навыка")
-            updates['onboarding_completed_at'] = datetime.utcnow().isoformat() + 'Z'
-            updates['onboarding_version'] = 2
-            updates['quiz_completed'] = True  # legacy-совместимость (спека п.3)
-        profile.update(updates)
-        profiles[key] = profile
-        return profile
-
-    return update_json_transaction(WORKER_PROFILES_FILE, {}, _mutator)
-
-
-class SkillVerificationBody(BaseModel):
-    verified: bool
-
-
-@app.patch("/api/workers/{user_id}/skills/{skill_id}/verification")
-def verify_worker_skill(user_id: str, skill_id: str, body: SkillVerificationBody,
-                         user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    """01.08 (спека п.4): только Owner подтверждает навык работника. Worker не может
-    сам выставить verified: true -- см. update_my_profile выше, self-service PATCH
-    всегда сбрасывает verified в False.
-
-    RMW под update_json_transaction -- read+normalize+set_verification+save на
-    одном захвате лока, иначе конкурентный update_my_profile/avatar-upload на том
-    же профиле мог тихо затереться этим подтверждением или наоборот (storage.py)."""
-    key = str(user_id)
-
-    def _mutator(profiles):
-        profile = profiles.get(key)
-        if not profile:
-            raise HTTPException(404, "Профиль не найден")
-        skills_v2, _changed = pskills.normalize_profile_skills(profile)
-        skills_v2, found = pskills.set_skill_verification(skills_v2, skill_id, body.verified)
-        if not found:
-            raise HTTPException(404, "У работника нет такого навыка")
-        profile['skills_v2'] = skills_v2
-        profiles[key] = profile
-
-    update_json_transaction(WORKER_PROFILES_FILE, {}, _mutator)
-    return {"skill_id": skill_id, "verified": body.verified}
-
-
-# ---------- Фаза 8: аватар + агрегированная статистика профиля ----------
-# moved to core/paths.py -- AVATAR_DIR
-# moved to core/limits.py -- AVATAR_MAX_BYTES
-os.makedirs(AVATAR_DIR, exist_ok=True)
-
-
-@app.post("/api/profile/me/avatar")
-async def upload_my_avatar(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    raw = await file.read()
-    if len(raw) > AVATAR_MAX_BYTES:
-        raise HTTPException(400, "Аватар слишком большой (макс. 4 МБ)")
-    detected = sniff_image(raw)
-    if not detected:
-        raise HTTPException(400, "Файл должен быть изображением")
-    ext = _ALLOWED_IMAGE_MIME_EXT[detected]
-    uid = str(user['id'])
-    # держим ровно один файл на юзера — старое расширение убираем
-    for fname in os.listdir(AVATAR_DIR):
-        if fname.startswith(uid + '.'):
-            os.remove(os.path.join(AVATAR_DIR, fname))
-    with open(os.path.join(AVATAR_DIR, f"{uid}.{ext}"), 'wb') as f:
-        f.write(raw)
-
-    # RMW под update_json_transaction -- иначе конкурентный update_my_profile/
-    # verify_worker_skill на том же профиле мог тихо затереться этим avatar-флагом
-    # или наоборот (storage.py). Файл на диске (сам аватар) пишется вне лока
-    # профилей -- отдельный ресурс, гонка с ним тут не в скоупе этого фикса.
-    def _mutator(profiles):
-        profile = profiles.get(uid, {"skills": [], "quiz_completed": False})
-        profile['avatar'] = True
-        if not profile.get('name'):
-            profile['name'] = user.get('first_name', uid)
-        profiles[uid] = profile
-
-    update_json_transaction(WORKER_PROFILES_FILE, {}, _mutator)
-    return {"status": "ok"}
-
-
-@app.get("/api/profile/{user_id}/avatar")
-def get_avatar(user_id: str, user: dict = Depends(get_current_user)):
-    if not user_id.isdigit():
-        raise HTTPException(400, "user_id должен быть числовым Telegram ID")
-    for ext in ('jpg', 'png', 'webp'):
-        path = os.path.join(AVATAR_DIR, f"{user_id}.{ext}")
-        if os.path.exists(path):
-            return FileResponse(path)
-    raise HTTPException(404, "Аватар не найден")
-
+    return not (47 <= f_lat <= 55.5 and 5 <= f_lon <= 16)
 
 def _photo_pause_seconds(s: dict) -> int:
     if s.get('pause_accumulated_seconds') is not None:
