@@ -1,0 +1,22 @@
+name: Ruff correctness baseline
+
+on:
+  push:
+    branches:
+      - cleanup/ruff-guard
+
+permissions:
+  contents: read
+
+jobs:
+  ruff-baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install Ruff
+        run: pip install ruff==0.17.0
+      - name: Check extracted backend modules for Python correctness
+        run: ruff check backend/core backend/routes --select F --output-format concise
