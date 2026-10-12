@@ -2937,283 +2937,56 @@ set_feed_saved = _feed_news_handlers.set_feed_saved
 get_feed_unread = _feed_news_handlers.get_feed_unread
 
 
-# ---------- Photo feed ----------
-# Хранение: файлы на диске + метадата в JSON. Любой сотрудник грузит фото с объекта,
-# все видят общей лентой (без ролевых ограничений — как командный чат).
-# moved to core/paths.py -- PHOTO_DIR
-# moved to core/paths.py -- PHOTO_META_FILE
-# moved to core/limits.py -- PHOTO_MAX_BYTES
-# moved to core/limits.py -- PHOTO_MAX_COUNT
-_photo_lock = __import__('threading').Lock()
+# ---------- Photo feed domain ----------
+if __package__:
+    from .routes.photo_feed import (
+        PhotoCommentBody, PhotoFeedRouteDeps, PhotoReactionBody, create_photo_feed_router,
+    )
+else:
+    from routes.photo_feed import (  # noqa: E402
+        PhotoCommentBody, PhotoFeedRouteDeps, PhotoReactionBody, create_photo_feed_router,
+    )
 
-os.makedirs(PHOTO_DIR, exist_ok=True)
+_photo_feed_router, _photo_feed_handlers = create_photo_feed_router(
+    PhotoFeedRouteDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        safe_load_json=lambda path, default: _safe_load_json(path, default),
+        atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+        photo_dir=lambda: PHOTO_DIR,
+        photo_meta_file=lambda: PHOTO_META_FILE,
+        photo_reactions_file=lambda: PHOTO_REACTIONS_FILE,
+        checkin_photo_base=lambda: CHECKIN_PHOTO_BASE,
+        photo_max_bytes=PHOTO_MAX_BYTES,
+        photo_max_count=PHOTO_MAX_COUNT,
+        photo_max_files=PHOTO_MAX_FILES,
+        sniff_image=lambda raw: sniff_image(raw),
+        allowed_image_mime_ext=_ALLOWED_IMAGE_MIME_EXT,
+        load_feed_saved=lambda: _load_feed_saved(),
+        is_feed_saved=lambda saved, uid, item_type, item_id: _is_feed_saved(saved, uid, item_type, item_id),
+        sanitize_display_name=lambda raw, fallback: _sanitize_display_name(raw, fallback),
+        resolve_current_display_name=lambda uid, fallback: _resolve_current_display_name(uid, fallback),
+        resolve_object_name=lambda object_id: _resolve_object_name(object_id),
+        emit_comment_activity_alerts=lambda *args, **kwargs: _emit_comment_activity_alerts(*args, **kwargs),
+        comment_alert_recipients=lambda *args, **kwargs: _comment_alert_recipients(*args, **kwargs),
+    )
+)
+app.include_router(_photo_feed_router)
 
-
-def _load_photo_meta() -> list:
-    return _safe_load_json(PHOTO_META_FILE, [])
-
-
-def _save_photo_meta(items: list):
-    with open(PHOTO_META_FILE, 'w', encoding='utf-8') as f:
-        json.dump(items, f, ensure_ascii=False)
-
-
-def _load_photo_reactions() -> dict:
-    return _safe_load_json(PHOTO_REACTIONS_FILE, {})
-
-
-def _save_photo_reactions(data: dict):
-    _atomic_write_json(PHOTO_REACTIONS_FILE, data)
-
-
-def _copy_checkin_photos_to_feed(rel_paths: list, prefix: str) -> list:
-    """Копирует check-in фото (уже сохранены под CHECKIN_PHOTO_BASE) в PHOTO_DIR под
-    новыми именами, возвращает список имён файлов для feed_photos.json. 24.07: фото
-    старта/финиша смены теперь дублируются в общую фото-ленту — юзер явно попросил
-    "чтоб фото начала и конца работ летели в ленту с фото"."""
-    saved = []
-    for i, rel in enumerate(rel_paths):
-        src_path = os.path.join(CHECKIN_PHOTO_BASE, rel)
-        if not os.path.exists(src_path):
-            continue
-        ext = os.path.splitext(rel)[1] or '.jpg'
-        fname = f"{prefix}_{i}{ext}"
-        with open(src_path, 'rb') as fsrc, open(os.path.join(PHOTO_DIR, fname), 'wb') as fdst:
-            fdst.write(fsrc.read())
-        saved.append(fname)
-    return saved
-
-
-def _upsert_checkin_feed_post(session: dict, kind: str, object_name: str, user_id, user_name: str):
-    """kind: 'start' | 'finish'. Один пост на смену (session['id']) в фото-ленте — старт
-    создаёт пост, финиш дописывает свои фото в тот же пост (не два отдельных поста).
-    Каждое фото подписывается через _photo_captions (index -> подпись), отдельно от
-    общей caption поста."""
-    rel_paths = session.get('start_photos' if kind == 'start' else 'finish_photos') or []
-    if not rel_paths:
-        return
-    prefix = f"checkin_{session['id']}_{kind}"
-    new_files = _copy_checkin_photos_to_feed(rel_paths, prefix)
-    if not new_files:
-        return
-
-    time_str = datetime.fromtimestamp(
-        session['start_at'] if kind == 'start' else session['finish_at']
-    ).strftime('%H:%M')
-    label = ('Начало смены' if kind == 'start' else 'Конец смены') + f' · {time_str}'
-
-    with _photo_lock:
-        items = _load_photo_meta()
-        post = next((p for p in items if p.get('checkin_session_id') == session['id']), None)
-        if post:
-            start_idx = len(post['files'])
-            post['files'].extend(new_files)
-            post.setdefault('photo_labels', {})
-            for i, _f in enumerate(new_files):
-                post['photo_labels'][str(start_idx + i)] = label
-        else:
-            post = {
-                "id": uuid.uuid4().hex,
-                "files": new_files,
-                "ts": int(time.time()),
-                "user_id": user_id,
-                "name": user_name,
-                "object_id": object_name,
-                "caption": "",
-                "checkin_session_id": session['id'],
-                "photo_labels": {str(i): label for i in range(len(new_files))},
-            }
-            items.append(post)
-        _save_photo_meta(items)
-
-
-@app.get("/api/feed/photos")
-def list_feed_photos(user: dict = Depends(get_current_user)):
-    with _photo_lock:
-        items = _load_photo_meta()
-    reactions = _load_photo_reactions()
-    saved = _load_feed_saved()
-    uid = str(user['id'])
-    photos = []
-    for p in reversed(items):
-        p = dict(p)
-        photo_reactions = reactions.get(p.get('id'), {})
-        p['likes'] = len(photo_reactions)
-        p['liked_by_me'] = uid in photo_reactions
-        p['saved_by_me'] = _is_feed_saved(saved, uid, 'photo', p.get('id'))
-        p['comment_count'] = len(p.pop('comments', []))
-        # 22.09 (iPhone screenshot audit): read-side resolve, see
-        # _resolve_current_display_name()'s docstring -- posts stamp `name`
-        # at write time (checkin start/finish, upload) and can freeze a raw
-        # user_id into it if the profile had no real name yet at that moment.
-        if p.get('user_id'):
-            p['name'] = _resolve_current_display_name(p['user_id'], p.get('name'))
-        # 24.07: мультифото — старые записи (до этой правки) хранили один 'file',
-        # новые хранят 'files' (список). Нормализуем на чтение, не трогаем сами
-        # старые JSON-записи на диске (не нужно, чтение уже покрывает оба случая).
-        if 'files' not in p:
-            p['files'] = [p['file']] if p.get('file') else []
-        # 12.09: старые/stale записи могли ссылаться на уже отсутствующие файлы
-        # (например после ручной чистки storage). Не показываем пользователю битой
-        # карточки и не провоцируем каскад 404 /api/feed/photos/{id}/file.
-        p['files'] = [fname for fname in p.get('files', []) if os.path.exists(os.path.join(PHOTO_DIR, fname))]
-        if not p['files']:
-            continue
-        photos.append(p)
-    return {"photos": photos}
-
-
-# moved to core/limits.py -- PHOTO_MAX_FILES
-
-
-@app.post("/api/feed/photos")
-async def upload_feed_photo(
-    files: list[UploadFile] = File(...),
-    object_id: str = Form(''),
-    caption: str = Form(''),
-    user: dict = Depends(get_current_user),
-):
-    if not files:
-        raise HTTPException(400, "Нужно хотя бы одно фото")
-    if len(files) > PHOTO_MAX_FILES:
-        raise HTTPException(400, f"Максимум {PHOTO_MAX_FILES} фото за раз")
-
-    photo_id = uuid.uuid4().hex
-    saved_files = []
-    for f in files:
-        raw = await f.read()
-        if len(raw) > PHOTO_MAX_BYTES:
-            raise HTTPException(400, "Фото слишком большое (макс. 8 МБ на файл)")
-        detected = sniff_image(raw)
-        if not detected:
-            raise HTTPException(400, "Все файлы должны быть изображениями")
-        ext = _ALLOWED_IMAGE_MIME_EXT[detected]
-        fname = f"{photo_id}_{len(saved_files)}.{ext}"
-        with open(os.path.join(PHOTO_DIR, fname), 'wb') as out:
-            out.write(raw)
-        saved_files.append(fname)
-
-    entry = {
-        "id": photo_id,
-        "files": saved_files,
-        "ts": int(time.time()),
-        "user_id": user['id'],
-        "name": _sanitize_display_name(user.get('first_name'), str(user['id'])),
-        "object_id": object_id.strip()[:100],
-        "caption": caption.strip()[:300],
-    }
-
-    with _photo_lock:
-        items = _load_photo_meta()
-        items.append(entry)
-        if len(items) > PHOTO_MAX_COUNT:
-            for old in items[:-PHOTO_MAX_COUNT]:
-                for old_fname in (old.get('files') or ([old['file']] if old.get('file') else [])):
-                    old_path = os.path.join(PHOTO_DIR, old_fname)
-                    if os.path.exists(old_path):
-                        os.remove(old_path)
-            items = items[-PHOTO_MAX_COUNT:]
-        _save_photo_meta(items)
-
-    return {"photo": entry}
-
-
-class PhotoCommentBody(BaseModel):
-    text: str
-    reply_to: str = None
-
-
-@app.post("/api/feed/photos/{photo_id}/comments")
-def add_feed_photo_comment(photo_id: str, body: PhotoCommentBody, user: dict = Depends(get_current_user)):
-    text = (body.text or '').strip()[:500]
-    if not text:
-        raise HTTPException(400, "Комментарий не может быть пустым")
-    with _photo_lock:
-        items = _load_photo_meta()
-        entry = next((p for p in items if p['id'] == photo_id), None)
-        if not entry:
-            raise HTTPException(404, "Фото не найдено")
-        comments = entry.setdefault('comments', [])
-        prior_ids = {c.get('user_id') for c in comments}
-        photo_author = entry.get('user_id')
-        photo_object_id = entry.get('object_id', '')
-        actor_name = _sanitize_display_name(user.get('first_name'), str(user['id']))
-        new_id = uuid.uuid4().hex
-        comments.append({
-            'id': new_id,
-            'user_id': str(user['id']),
-            'name': actor_name,
-            'text': text,
-            'reply_to': (body.reply_to or None),
-            'at': datetime.utcnow().isoformat(),
-        })
-        _save_photo_meta(items)
-    # Раунд 6 §5.2: activity alerts (owner + прежние комментаторы + автор фото).
-    try:
-        obj_name = _resolve_object_name(photo_object_id)
-        subtitle = f"Объект: {obj_name}" if obj_name else ''
-        _emit_comment_activity_alerts(
-            'photo_comment', photo_id, new_id, str(user['id']), actor_name,
-            f"{actor_name} прокомментировал фото", subtitle,
-            _comment_alert_recipients(user['id'], prior_ids, author_id=photo_author))
-    except Exception:
-        pass
-    return {"comments": entry['comments']}
-
-
-class PhotoReactionBody(BaseModel):
-    liked: bool
-
-
-@app.post("/api/feed/photos/{photo_id}/react")
-def react_feed_photo(photo_id: str, body: PhotoReactionBody, user: dict = Depends(get_current_user)):
-    with _photo_lock:
-        items = _load_photo_meta()
-        if not any(p.get('id') == photo_id for p in items):
-            raise HTTPException(404, "Фото не найдено")
-        reactions = _load_photo_reactions()
-        photo_reactions = reactions.setdefault(photo_id, {})
-        uid = str(user['id'])
-        if body.liked:
-            photo_reactions[uid] = True
-        else:
-            photo_reactions.pop(uid, None)
-        _save_photo_reactions(reactions)
-    return {"likes": len(photo_reactions), "liked_by_me": bool(body.liked)}
-
-
-@app.get("/api/feed/photos/{photo_id}/comments")
-def get_feed_photo_comments(photo_id: str, user: dict = Depends(get_current_user)):
-    with _photo_lock:
-        items = _load_photo_meta()
-    entry = next((p for p in items if p['id'] == photo_id), None)
-    if not entry:
-        raise HTTPException(404, "Фото не найдено")
-    # 22.09 (iPhone screenshot audit, Item I): same read-side resolve as
-    # get_news_comments -- stored `name` at write time must not outlive a
-    # later profile-name correction.
-    comments = entry.get('comments', [])
-    for c in comments:
-        c['name'] = _resolve_current_display_name(c.get('user_id'), c.get('name'))
-    return {"comments": comments}
-
-
-@app.delete("/api/feed/photos/{photo_id}/comments/{comment_id}")
-def delete_feed_photo_comment(photo_id: str, comment_id: str, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    with _photo_lock:
-        items = _load_photo_meta()
-        entry = next((p for p in items if p['id'] == photo_id), None)
-        if not entry:
-            raise HTTPException(404, "Фото не найдено")
-        comments = entry.get('comments', [])
-        comment = next((c for c in comments if c.get('id') == comment_id), None)
-        if not comment:
-            raise HTTPException(404, "Комментарий не найден")
-        if str(comment.get('user_id')) != str(user['id']) and role != 'owner':
-            raise HTTPException(403, "Можно удалить только свой комментарий")
-        entry['comments'] = [c for c in comments if c.get('id') != comment_id]
-        _save_photo_meta(items)
-    return {"comments": entry['comments']}
+# Compatibility aliases for remaining bridges/check-in callers during migration.
+_photo_lock = _photo_feed_handlers.photo_lock
+_load_photo_meta = _photo_feed_handlers.load_photo_meta
+_save_photo_meta = _photo_feed_handlers.save_photo_meta
+_load_photo_reactions = _photo_feed_handlers.load_photo_reactions
+_save_photo_reactions = _photo_feed_handlers.save_photo_reactions
+_copy_checkin_photos_to_feed = _photo_feed_handlers.copy_checkin_photos_to_feed
+_upsert_checkin_feed_post = _photo_feed_handlers.upsert_checkin_feed_post
+list_feed_photos = _photo_feed_handlers.list_feed_photos
+upload_feed_photo = _photo_feed_handlers.upload_feed_photo
+add_feed_photo_comment = _photo_feed_handlers.add_feed_photo_comment
+react_feed_photo = _photo_feed_handlers.react_feed_photo
+get_feed_photo_comments = _photo_feed_handlers.get_feed_photo_comments
+delete_feed_photo_comment = _photo_feed_handlers.delete_feed_photo_comment
 
 
 # ---------- Раунд 6 §5: пересылка комментариев + in-app activity alerts ----------
