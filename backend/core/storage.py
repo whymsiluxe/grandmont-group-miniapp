@@ -18,7 +18,7 @@ import json
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 CRITICAL_JSON_PATHS: set = set()
@@ -59,7 +59,7 @@ def _quarantine_corrupt_json(path: str) -> None:
         "original_path": path,
         "quarantine_path": quarantine_path,
         "detected_at": int(time.time()),
-        "detected_at_iso": datetime.utcnow().isoformat() + 'Z',
+        "detected_at_iso": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + 'Z',
     }
     try:
         with open(lock_path, 'w', encoding='utf-8') as f:
