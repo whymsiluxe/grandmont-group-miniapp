@@ -114,16 +114,20 @@ class PersistentCorruptLockTests(unittest.TestCase):
 
 class AbwesenheitReasonRedactionTests(unittest.TestCase):
     FULL_ENTRY = {
-        'id': 'a1', 'user_id': '10', 'name': 'Ivan', 'date_from': '2026-08-01',
-        'date_to': '2026-08-05', 'open_ended': False, 'reason': 'krankheit',
+        'id': 'a1', 'user_id': '10', 'name': 'Ivan', 'date_from': '2099-08-01',
+        'date_to': '2099-08-05', 'open_ended': False, 'reason': 'krankheit',
         'note': 'приватная деталь', 'start_time': '', 'end_time': '', 'status': 'approved',
     }
     EXPECTED_PUBLIC = {'id', 'user_id', 'name', 'date_from', 'date_to', 'open_ended', 'status'}
 
+    def _list_from_real_temp_store(self, user, role):
+        with tempfile.TemporaryDirectory() as td, \
+             patch.object(backend, 'ABWESENHEIT_FILE', os.path.join(td, 'abwesenheit.json')):
+            backend._save_abwesenheit([dict(self.FULL_ENTRY)])
+            return backend.list_all_abwesenheit(user=user, role=role)
+
     def test_worker_sees_exact_public_field_set_for_others(self):
-        with patch.object(backend, '_load_abwesenheit', return_value=[dict(self.FULL_ENTRY)]), \
-             patch.object(backend, '_auto_close_expired_open_ended_abwesenheit'):
-            result = backend.list_all_abwesenheit(user=WORKER_B, role='worker')
+        result = self._list_from_real_temp_store(user=WORKER_B, role='worker')
         entry = result['entries'][0]
         self.assertEqual(set(entry.keys()), self.EXPECTED_PUBLIC)
         self.assertNotIn('reason', entry)
@@ -132,17 +136,13 @@ class AbwesenheitReasonRedactionTests(unittest.TestCase):
         self.assertNotIn('end_time', entry)
 
     def test_worker_sees_own_reason_and_note(self):
-        with patch.object(backend, '_load_abwesenheit', return_value=[dict(self.FULL_ENTRY)]), \
-             patch.object(backend, '_auto_close_expired_open_ended_abwesenheit'):
-            result = backend.list_all_abwesenheit(user=WORKER_A, role='worker')
+        result = self._list_from_real_temp_store(user=WORKER_A, role='worker')
         entry = result['entries'][0]
         self.assertEqual(entry['reason'], 'krankheit')
         self.assertEqual(entry['note'], 'приватная деталь')
 
     def test_owner_sees_reason_and_note(self):
-        with patch.object(backend, '_load_abwesenheit', return_value=[dict(self.FULL_ENTRY)]), \
-             patch.object(backend, '_auto_close_expired_open_ended_abwesenheit'):
-            result = backend.list_all_abwesenheit(user=OWNER, role='owner')
+        result = self._list_from_real_temp_store(user=OWNER, role='owner')
         entry = result['entries'][0]
         self.assertEqual(entry['reason'], 'krankheit')
         self.assertEqual(entry['note'], 'приватная деталь')
