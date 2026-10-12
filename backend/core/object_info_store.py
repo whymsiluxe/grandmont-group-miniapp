@@ -1,7 +1,7 @@
 """Shared persistence helpers for the per-object info JSON document.
 
 Documents and the Objects domain both own fields inside the same historical
-OBJECT_INFO_FILE record.  This store centralises that shared shape without making
+OBJECT_INFO_FILE record. This store centralises that shared shape without making
 either HTTP router depend on the other or on ``backend.main``.
 """
 from __future__ import annotations
@@ -22,23 +22,20 @@ class ObjectInfoStore:
 
     @classmethod
     def ensure_entry(cls, data: dict, object_id: str) -> dict:
+        # Preserve the legacy helper exactly: malformed existing non-dict entries
+        # are not silently repaired by this refactor.
         entry = data.setdefault(object_id, cls.new_entry())
-        if not isinstance(entry, dict):
-            entry = cls.new_entry()
-            data[object_id] = entry
         entry.setdefault("items", [])
         entry.setdefault("documents", [])
         entry.setdefault("description", "")
         return entry
 
     def load(self) -> dict:
-        data = self.safe_load_json(self.file_path(), {})
-        return data if isinstance(data, dict) else {}
+        return self.safe_load_json(self.file_path(), {})
 
     def save(self, data: dict) -> None:
         self.atomic_write_json(self.file_path(), data)
 
-    def entry(self, object_id: str) -> dict:
+    def entry(self, object_id: str):
         data = self.load()
-        entry = data.get(object_id)
-        return entry if isinstance(entry, dict) else self.new_entry()
+        return data.get(object_id, self.new_entry())
