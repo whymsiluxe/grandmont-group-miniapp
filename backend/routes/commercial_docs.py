@@ -87,9 +87,10 @@ class CommercialDocsRouteDeps:
     rechnung_script: Callable[[], str]
     angebot_out_dir: Callable[[], str]
     rechnung_out_dir: Callable[[], str]
-    # Optional late-bound compatibility hooks. main.py supplies these as lambdas
-    # resolving its exported aliases at call time, so existing tests/operational
-    # code that monkey-patch an old helper name still affect the extracted route.
+    # Deprecated migration-only fields. They are intentionally NOT consulted by
+    # endpoint execution anymore. main.py still passes them temporarily so this
+    # cleanup can land without editing the monolith again, but production flow is
+    # now fully owned by this module and no longer reaches back through main aliases.
     send_pdf: Callable[..., None] | None = None
     generate_pdf: Callable[..., subprocess.CompletedProcess] | None = None
     make_pdf_filename: Callable[[str, str], str] | None = None
@@ -190,9 +191,12 @@ def create_commercial_docs_router(
         if config.get("signatureBase64"):
             config["signedAt"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-        (deps.generate_pdf or run_pdf_generator)(deps.angebot_script(), config)
-        filename = (deps.make_pdf_filename or safe_pdf_filename)("Angebot", body.kunde.name)
-        (deps.send_pdf or send_pdf_to_chat)(
+        # Production execution deliberately resolves helpers in THIS module.
+        # Deprecated deps.* compatibility callbacks are ignored so the route can
+        # no longer call back through aliases in backend.main.
+        run_pdf_generator(deps.angebot_script(), config)
+        filename = safe_pdf_filename("Angebot", body.kunde.name)
+        send_pdf_to_chat(
             user["id"], out_path, filename, f"Angebot für {body.kunde.name}"
         )
         return FileResponse(out_path, media_type="application/pdf", filename=filename)
@@ -214,9 +218,9 @@ def create_commercial_docs_router(
         if config.get("signatureBase64"):
             config["signedAt"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-        (deps.generate_pdf or run_pdf_generator)(deps.rechnung_script(), config)
-        filename = (deps.make_pdf_filename or safe_pdf_filename)("Rechnung", body.kunde.name)
-        (deps.send_pdf or send_pdf_to_chat)(
+        run_pdf_generator(deps.rechnung_script(), config)
+        filename = safe_pdf_filename("Rechnung", body.kunde.name)
+        send_pdf_to_chat(
             user["id"], out_path, filename, f"{body.nummer} — {body.kunde.name}"
         )
         return FileResponse(out_path, media_type="application/pdf", filename=filename)
