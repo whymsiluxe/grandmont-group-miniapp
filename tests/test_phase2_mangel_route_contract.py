@@ -36,7 +36,6 @@ def parameter_contract(operation):
         ))
     return result
 
-
 routes = list(iter_routes(backend.app))
 openapi = backend.app.openapi()
 dependency_map = {
@@ -50,8 +49,6 @@ AUTH_HEADERS = [
     ("x-telegram-init-data", "header", False, None, None),
 ]
 
-# method, path, handler, operationId, exact top-level deps, local OpenAPI params,
-# body component, request content type, request-body requiredness.
 ROUTES = [
     ("GET", "/api/mangel", "get_mangel_list", "get_mangel_list_api_mangel_get", [("user","user"),("role","role")], [("object_id","query",False,"string","")], None, None, None),
     ("GET", "/api/mangel/counts", "get_mangel_counts", "get_mangel_counts_api_mangel_counts_get", [("user","user")], [], None, None, None),
@@ -105,16 +102,15 @@ assert {
     for name, field in backend.MangelCommentBody.model_fields.items()
 } == {"text": ("<class 'str'>", True, "<required>")}, "MangelCommentBody contract changed"
 
-# Pin the complete generated multipart component rather than relying on a series
-# of silent partial assertions. If FastAPI emits something different, CI prints
-# the complete actual schema for review.
+# Pin the generated multipart component exactly as emitted by the repository's
+# pinned FastAPI/Pydantic stack in CI (Pydantic 2.13 uses contentMediaType here).
 multipart_schema = openapi["components"]["schemas"]["Body_create_mangel_ticket_api_mangel_post"]
 expected_multipart_schema = {
     "properties": {
         "object_id": {"type": "string", "title": "Object Id", "default": ""},
         "description": {"type": "string", "title": "Description", "default": ""},
         "assigned_worker_id": {"type": "string", "title": "Assigned Worker Id", "default": ""},
-        "file": {"type": "string", "format": "binary", "title": "File"},
+        "file": {"type": "string", "contentMediaType": "application/octet-stream", "title": "File"},
     },
     "type": "object",
     "title": "Body_create_mangel_ticket_api_mangel_post",
