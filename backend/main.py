@@ -946,37 +946,6 @@ def _gps_suspect(lat: str, lon: str) -> bool:
         return True
     return not (47 <= f_lat <= 55.5 and 5 <= f_lon <= 16)
 
-def _photo_pause_seconds(s: dict) -> int:
-    if s.get('pause_accumulated_seconds') is not None:
-        return max(0, int(s.get('pause_accumulated_seconds') or 0))
-    return max(0, int(s.get('pause_minutes') or 0)) * 60
-
-
-def _photo_pause_minutes(s: dict) -> int:
-    return round(_photo_pause_seconds(s) / 60)
-
-
-def _is_active_photo_checkin_session(s: dict) -> bool:
-    return bool(s) and not s.get('manual_entry') and s.get('finish_at') is None
-
-
-def _hours_from_session(s: dict) -> float:
-    """Часы из check-in сессии: фото-сессия = finish-start-пауза, ручная = end-start-пауза.
-    10.32: раньше фото-checkin паузу не вычитал вообще (только manual_entry) — юзер
-    теперь явно спрашивает pause_minutes в finish-опроснике для обоих типов сессий."""
-    if s.get('manual_entry'):
-        try:
-            h1, m1 = map(int, s['start_time'].split(':'))
-            h2, m2 = map(int, s['end_time'].split(':'))
-            mins = (h2 * 60 + m2) - (h1 * 60 + m1) - int(s.get('pause_minutes') or 0)
-            return max(0, mins) / 60.0
-        except Exception:
-            return 0.0
-    if s.get('start_at') and s.get('finish_at'):
-        pause_seconds = _photo_pause_seconds(s)
-        return max(0, (s['finish_at'] - s['start_at']) - pause_seconds) / 3600.0
-    return 0.0
-
 
 def _session_hours_live(s: dict) -> float:
     """Как _hours_from_session, но НЕзавершённую фото-смену (finish_at is None)
@@ -2575,214 +2544,56 @@ async def _outbox_retry_sweep_loop():
             print(f"[outbox-sweep] tick failed (will retry next interval): {exc}")
 
 
-def _load_checkin_meta() -> list:
-    return _safe_load_json(CHECKIN_META_FILE, [])
+# Check-in store/photo/access/timing support moved to core/checkin_support.py.
+try:
+    from .core.checkin_support import CheckinSupportDeps, CheckinSupportRuntime
+except ImportError:
+    from core.checkin_support import CheckinSupportDeps, CheckinSupportRuntime  # noqa: E402
 
+_checkin_support = CheckinSupportRuntime(CheckinSupportDeps(
+    meta_file=lambda: CHECKIN_META_FILE,
+    photo_base=lambda: CHECKIN_PHOTO_BASE,
+    max_bytes=CHECKIN_MAX_BYTES,
+    safe_load_json=lambda path, default: _safe_load_json(path, default),
+    atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+    sniff_image=lambda raw: sniff_image(raw),
+    allowed_image_mime_ext=_ALLOWED_IMAGE_MIME_EXT,
+    load_assignments=lambda: _load_assignments(),
+    assignment_status=lambda assignment: _assignment_status(assignment),
+))
+_load_checkin_meta = _checkin_support.load_meta
+_save_checkin_meta = _checkin_support.save_meta
+_save_checkin_photos = _checkin_support.save_photos
+_checkin_file_count = _checkin_support.file_count
+_cleanup_checkin_photo_files = _checkin_support.cleanup_photo_files
+_get_active_assignment_for_checkin = _checkin_support.get_active_assignment
+_photo_pause_seconds = _checkin_support.photo_pause_seconds
+_photo_pause_minutes = _checkin_support.photo_pause_minutes
+_is_active_photo_checkin_session = _checkin_support.is_active_photo_checkin_session
+_hours_from_session = _checkin_support.hours_from_session
 
-def _save_checkin_meta(items: list):
-    # 30.07 (Release-аудит P1): было plain open(w)+json.dump -- crash посреди записи
-    # (systemctl restart, OOM-kill) обрезал бы главный стор смен/GPS/фото. RMW-race
-    # уже закрыт _checkin_lock на всех call sites, здесь только crash-safety записи.
-    _atomic_write_json(CHECKIN_META_FILE, items)
+# ---------- Worker calendar domain ----------
+try:
+    from .routes.worker_calendar import WorkerCalendarDeps, create_worker_calendar_router
+except ImportError:
+    from routes.worker_calendar import WorkerCalendarDeps, create_worker_calendar_router  # noqa: E402
 
-
-async def _save_checkin_photos(files: list, object_id: str, date_str: str) -> list:
-    # 30.07 (Release-аудит P0): object_id на /api/checkin/start приходит от клиента
-    # (Form-параметр), раньше обрезался только по длине (.strip()[:100]), без защиты
-    # от '../' -- потенциальный path traversal при записи фото. os.path.basename
-    # схлопывает любые сегменты пути в один компонент (тот же приём, что уже
-    # используется для fname/file_id в других upload/serving endpoints).
-    object_id = os.path.basename(object_id) or 'unknown'
-    day_dir = os.path.join(CHECKIN_PHOTO_BASE, object_id, date_str)
-    os.makedirs(day_dir, exist_ok=True)
-    saved = []
-    for file in files:
-        raw = await file.read()
-        if len(raw) > CHECKIN_MAX_BYTES:
-            continue
-        detected = sniff_image(raw)
-        if not detected:
-            continue
-        ext = _ALLOWED_IMAGE_MIME_EXT[detected]
-        fname = f"{uuid.uuid4().hex}.{ext}"
-        with open(os.path.join(day_dir, fname), 'wb') as f:
-            f.write(raw)
-        saved.append(os.path.join(object_id, date_str, fname))
-    return saved
-
-
-def _checkin_file_count(files) -> int:
-    try:
-        return len(files or [])
-    except TypeError:
-        return 0
-
-
-def _cleanup_checkin_photo_files(relative_paths: list) -> None:
-    """03.08: удаляет файлы, сохранённые _save_checkin_photos() ТЕКУЩЕГО неуспешного
-    запроса (когда итоговое количество валидных фото < 2) -- не оставляет orphan-файлы
-    на диске без ссылки в metadata. Не трогает фото прошлых успешных запросов -- те
-    приходят отдельным списком путей, никогда не пересекаются с этим вызовом."""
-    for rel_path in relative_paths:
-        # os.path.basename на каждом сегменте -- та же defense-in-depth привычка,
-        # что и при сохранении (rel_path здесь свой же вывод _save_checkin_photos,
-        # но не доверяем этому неявно на случай будущих изменений вызывающего кода).
-        abs_path = os.path.join(CHECKIN_PHOTO_BASE, rel_path)
-        try:
-            os.remove(abs_path)
-        except OSError:
-            pass
-
-
-def _get_active_assignment_for_checkin(user_id: str, object_id: str, today: str) -> str:
-    """Единая проверка для /api/checkin/start (30.07, аудит п.5) -- owner вызывающий
-    код не проверяет вообще (owner проходит can_access_object безусловно), эта функция
-    только для worker-пути. Возвращает assignment_id при успехе, иначе бросает 403
-    с конкретным сообщением (pending/declined/вне периода/нет назначения -- разные
-    тексты, не один общий "нет доступа"). Backward compat: назначение без 'status'
-    трактуется как accepted (_assignment_status), без date_from/date_to -- не блокируется.
-
-    03.08: критерий "успех" здесь ТОТ ЖЕ, что has_active_object_access() (accepted +
-    сегодня внутри [date_from, date_to] либо период не задан) -- не дублирующая
-    независимая проверка дат, просто эта функция дополнительно резолвит конкретный
-    assignment_id и даёт разные сообщения об ошибке (pending/declined/вне периода),
-    чего bool-helper намеренно не делает."""
-    candidates = [a for a in _load_assignments().get(object_id, []) if str(a.get('user_id')) == str(user_id)]
-    if not candidates:
-        raise HTTPException(403, "У вас нет принятого назначения на этот объект")
-
-    # Если есть хоть одно accepted в периоде -- оно и есть искомое (наиболее частый путь).
-    accepted = [a for a in candidates if _assignment_status(a) == 'accepted']
-    for a in accepted:
-        d_from, d_to = a.get('date_from', ''), a.get('date_to', '')
-        if not (d_from and d_to):
-            return a.get('id', '')
-        if d_from <= today <= d_to:
-            return a.get('id', '')
-    if accepted:
-        # Есть accepted, но ни один не покрывает today датами -- сообщаем по ближайшему.
-        a = accepted[0]
-        d_from, d_to = a.get('date_from', ''), a.get('date_to', '')
-        if today < d_from:
-            raise HTTPException(403, f"Смена доступна с {d_from}")
-        raise HTTPException(403, f"Период назначения завершён {d_to}")
-
-    if any(_assignment_status(a) == 'pending' for a in candidates):
-        raise HTTPException(403, "Сначала подтвердите назначение")
-    if any(_assignment_status(a) == 'declined' for a in candidates):
-        raise HTTPException(403, "Назначение отклонено")
-    raise HTTPException(403, "У вас нет принятого назначения на этот объект")
-
-
-@app.get("/api/workers/{target_user_id}/calendar")
-def get_worker_calendar(target_user_id: str, year: int, month: int,
-                         user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """10.30 + 21.07: owner выбирает профиль worker'а и видит availability (доступные/недоступные/
-    отработанные дни). Worker может смотреть ТОЛЬКО свой собственный календарь тем же способом —
-    permission проверяется здесь на backend (не только скрытием кнопки в UI, см. ChatGPT-аудит 21.07),
-    не декоратором require_owner, т.к. worker имеет легитимный доступ к своим же данным."""
-    if role != 'owner' and str(user['id']) != str(target_user_id):
-        raise HTTPException(403, "Можно смотреть только свой календарь")
-    month_prefix = f'{year:04d}-{month:02d}'
-
-    abwesenheit = [e for e in _load_abwesenheit() if str(e['user_id']) == target_user_id]
-    unavailable_dates = set()
-    for e in abwesenheit:
-        if e.get('status') == 'rejected':
-            continue  # отклонённая заявка не блокирует день
-        d = datetime.strptime(e['date_from'], '%Y-%m-%d')
-        end = datetime.strptime(e['date_to'], '%Y-%m-%d')
-        while d <= end:
-            ds = d.strftime('%Y-%m-%d')
-            if ds.startswith(month_prefix):
-                unavailable_dates.add(ds)
-            d += timedelta(days=1)
-
-    checkins = [c for c in _load_checkin_meta()
-                if str(c.get('user_id')) == target_user_id and c.get('date', '').startswith(month_prefix)]
-    worked_dates = sorted(set(c['date'] for c in checkins))
-
-    # 22.07: 4-е состояние — назначен на объект в эти даты (bubble-assign date_from/date_to).
-    # Одобренный отпуск теперь физически блокирует новое назначение (см. assign_user), но старые
-    # назначения (созданные до этого фикса) могут пересекаться — недоступен побеждает по приоритету.
-    assigned_dates = set()
-    for oid, lst in _load_assignments().items():
-        for a in lst:
-            if a.get('user_id') != target_user_id or not a.get('date_from') or not a.get('date_to'):
-                continue
-            d = datetime.strptime(a['date_from'], '%Y-%m-%d')
-            end = datetime.strptime(a['date_to'], '%Y-%m-%d')
-            while d <= end:
-                ds = d.strftime('%Y-%m-%d')
-                if ds.startswith(month_prefix):
-                    assigned_dates.add(ds)
-                d += timedelta(days=1)
-    assigned_dates -= unavailable_dates  # приоритет: недоступен важнее назначения
-
-    return {
-        "unavailable_dates": sorted(unavailable_dates),
-        "worked_dates": worked_dates,
-        "assigned_dates": sorted(assigned_dates),
-    }
-
-
-def _worker_period_stats(target_id: str, date_from: str, date_to: str) -> dict:
-    """Раунд 5 §13: агрегаты по периоду [date_from, date_to] включительно (Europe/Berlin,
-    строковые ISO-даты сравниваются лексикографически). days_worked = уникальные дни со
-    сменами (активная смена считается один раз, не дублируется), total_hours учитывает
-    паузы через _hours_from_session, sick/vacation — одобренные отсутствия, пересекающие
-    период. Средн. за день = total_hours / days_worked."""
-    sessions = [s for s in _load_checkin_meta()
-                if str(s.get('user_id')) == str(target_id)
-                and date_from <= s.get('date', '') <= date_to]
-    worked_dates = sorted(set(s['date'] for s in sessions if s.get('date')))
-    total_hours = round(sum(_hours_from_session(s) for s in sessions), 2)
-    days_worked = len(worked_dates)
-    avg = round(total_hours / days_worked, 2) if days_worked else 0.0
-
-    d_from = datetime.strptime(date_from, '%Y-%m-%d').date()
-    d_to = datetime.strptime(date_to, '%Y-%m-%d').date()
-    sick_days = vacation_days = 0
-    for e in _load_abwesenheit():
-        if str(e.get('user_id')) != str(target_id) or e.get('status') != 'approved':
-            continue
-        e1 = datetime.strptime(e['date_from'], '%Y-%m-%d').date()
-        e2 = datetime.strptime(e.get('date_to') or e['date_from'], '%Y-%m-%d').date()
-        lo, hi = max(e1, d_from), min(e2, d_to)
-        if lo > hi:
-            continue
-        days = (hi - lo).days + 1
-        if e.get('reason') == 'Krankheit':
-            sick_days += days
-        elif e.get('reason') == 'Urlaub':
-            vacation_days += days
-
-    return {
-        'date_from': date_from, 'date_to': date_to,
-        'days_worked': days_worked, 'total_hours': total_hours,
-        'avg_per_day': avg, 'sick_days': sick_days, 'vacation_days': vacation_days,
-        'worked_dates': worked_dates,
-    }
-
-
-@app.get("/api/workers/{target_user_id}/calendar-stats")
-def get_worker_calendar_stats(target_user_id: str, date_from: str, date_to: str,
-                              user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """Раунд 5 §13: статистика работника за произвольный период (Неделя/Месяц/3 месяца/
-    свой период). Owner видит любого, Worker — только себя (проверка на backend)."""
-    if role != 'owner' and str(user['id']) != str(target_user_id):
-        raise HTTPException(403, "Можно смотреть только свою статистику")
-    for d in (date_from, date_to):
-        try:
-            datetime.strptime(d, '%Y-%m-%d')
-        except (ValueError, TypeError):
-            raise HTTPException(400, "date_from/date_to должны быть YYYY-MM-DD")
-    if date_from > date_to:
-        raise HTTPException(400, "date_from не может быть позже date_to")
-    stats = _worker_period_stats(target_user_id, date_from, date_to)
-    profile = _get_worker_profile(target_user_id)
-    stats['name'] = _sanitize_display_name(profile.get('name'), str(target_user_id))
-    return stats
+_worker_calendar_router, _worker_calendar_handlers = create_worker_calendar_router(
+    WorkerCalendarDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        load_absence=lambda: _load_abwesenheit(),
+        load_checkin_meta=lambda: _load_checkin_meta(),
+        load_assignments=lambda: _load_assignments(),
+        hours_from_session=lambda session: _hours_from_session(session),
+        get_worker_profile=lambda uid: _get_worker_profile(uid),
+        sanitize_display_name=lambda raw, fallback: _sanitize_display_name(raw, fallback),
+    )
+)
+app.include_router(_worker_calendar_router)
+get_worker_calendar = _worker_calendar_handlers.get_worker_calendar
+_worker_period_stats = _worker_calendar_handlers.worker_period_stats
+get_worker_calendar_stats = _worker_calendar_handlers.get_worker_calendar_stats
 
 
 try:
@@ -3121,131 +2932,30 @@ _service_bridge_router, _service_bridge_handlers = create_service_bridge_router(
 app.include_router(_service_bridge_router)
 
 
-# ── Contract ingestion routes (Round 5 — Drive scope gated) ─────────────────
+# ---------- Contract ingestion domain ----------
+try:
+    from .routes.contracts import ContractReviewBody, ContractsDeps, create_contracts_router
+except ImportError:
+    from routes.contracts import ContractReviewBody, ContractsDeps, create_contracts_router  # noqa: E402
 
-# moved to core/constants.py -- _EMPTY_CONTRACT_STORE
-
-
-def _load_contract_store() -> dict:
-    """Item 14: routed through the existing safe-store mechanism (CRITICAL_JSON_PATHS
-    already includes CONTRACT_INGEST_STATE_FILE) instead of a raw json.load() that
-    silently wiped the contract list on any corruption."""
-    return _safe_load_json(CONTRACT_INGEST_STATE_FILE, {"contracts": {}})
-
-
-def _save_contract_store(data: dict) -> None:
-    tmp = CONTRACT_INGEST_STATE_FILE + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, CONTRACT_INGEST_STATE_FILE)
-
-
-@app.get("/api/contracts")
-def list_contracts(_: None = Depends(require_owner)):
-    """Список договоров и их статус обработки.
-    DRIVE_SCOPE_REQUIRED: без CONTRACTS_DRIVE_FOLDER_ID ingestion не запускается."""
-    store = _load_contract_store()
-    contracts = list(store["contracts"].values())
-    contracts.sort(key=lambda c: c.get("ingested_at", 0), reverse=True)
-    return {
-        "drive_configured": bool(CONTRACTS_DRIVE_FOLDER_ID),
-        "drive_scope_status": "DRIVE_SCOPE_REQUIRED" if not CONTRACTS_DRIVE_FOLDER_ID else "configured",
-        "total": len(contracts),
-        "contracts": [
-            {
-                "id": c["id"],
-                "file_name": c.get("file_name", ""),
-                "status": c.get("status", "unknown"),
-                "ingested_at": c.get("ingested_at"),
-                "approved_at": c.get("approved_at"),
-                "rejected_at": c.get("rejected_at"),
-                "error": c.get("error"),
-                "has_draft_plan": bool(c.get("project_plan_draft")),
-            }
-            for c in contracts
-        ],
-    }
-
-
-@app.get("/api/contracts/{contract_id}")
-def get_contract(
-    contract_id: str,
-    _: None = Depends(require_owner),
-):
-    """Полный договор с извлечёнными фактами и черновиком плана."""
-    store = _load_contract_store()
-    contract = store["contracts"].get(contract_id)
-    if not contract:
-        raise HTTPException(404, "Договор не найден")
-    return contract
-
-
-class ContractReviewBody(BaseModel):
-    notes: str = ''
-
-
-@app.post("/api/contracts/{contract_id}/approve")
-def approve_contract(
-    contract_id: str,
-    body: ContractReviewBody = ContractReviewBody(),
-    user: dict = Depends(get_current_user),
-    _: None = Depends(require_owner),
-):
-    """Owner утверждает черновик плана из договора (УТВЕРДИТЬ).
-    После утверждения project_plan_draft становится publishable для работников."""
-    with _CONTRACT_INGEST_LOCK:
-        store = _load_contract_store()
-        contract = store["contracts"].get(contract_id)
-        if not contract:
-            raise HTTPException(404, "Договор не найден")
-        if contract.get("status") not in ("ingested", "needs_manual_review"):
-            raise HTTPException(400, f"Договор в статусе '{contract['status']}' не может быть утверждён")
-        if not contract.get("project_plan_draft"):
-            raise HTTPException(400, "Нет черновика плана для утверждения")
-        contract["status"] = "approved"
-        contract["approved_at"] = time.time()
-        contract["approved_by"] = str(user['id'])
-        contract["review_notes"] = body.notes.strip()[:1000]
-        _save_contract_store(store)
-    return {"status": "approved", "contract_id": contract_id}
-
-
-@app.post("/api/contracts/{contract_id}/reject")
-def reject_contract(
-    contract_id: str,
-    body: ContractReviewBody = ContractReviewBody(),
-    user: dict = Depends(get_current_user),
-    _: None = Depends(require_owner),
-):
-    """Owner отклоняет черновик плана (ОТКЛОНИТЬ)."""
-    with _CONTRACT_INGEST_LOCK:
-        store = _load_contract_store()
-        contract = store["contracts"].get(contract_id)
-        if not contract:
-            raise HTTPException(404, "Договор не найден")
-        if contract.get("status") == "approved":
-            raise HTTPException(400, "Утверждённый договор нельзя отклонить без отмены")
-        contract["status"] = "rejected"
-        contract["rejected_at"] = time.time()
-        contract["rejected_by"] = str(user['id'])
-        contract["review_notes"] = body.notes.strip()[:1000]
-        _save_contract_store(store)
-    return {"status": "rejected", "contract_id": contract_id}
-
-
-@app.post("/api/contracts/ingest")
-def trigger_contract_ingest(
-    _: None = Depends(require_owner),
-):
-    """Ручной триггер перепроверки Drive-папки.
-    DRIVE_SCOPE_REQUIRED: если CONTRACTS_DRIVE_FOLDER_ID не задан — 503."""
-    if not CONTRACTS_DRIVE_FOLDER_ID:
-        raise HTTPException(503, "DRIVE_SCOPE_REQUIRED: задайте CONTRACTS_DRIVE_FOLDER_ID в env")
-    return {
-        "status": "trigger_sent",
-        "message": "Синхронизация с Drive будет выполнена при следующем запуске plan_sync / contract_ingest.py",
-        "folder_id": CONTRACTS_DRIVE_FOLDER_ID,
-    }
+_contracts_router, _contracts_handlers = create_contracts_router(ContractsDeps(
+    get_current_user=get_current_user,
+    require_owner=require_owner,
+    safe_load_json=lambda path, default: _safe_load_json(path, default),
+    atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+    state_file=lambda: CONTRACT_INGEST_STATE_FILE,
+    drive_folder_id=lambda: CONTRACTS_DRIVE_FOLDER_ID,
+    now=lambda: time.time(),
+))
+app.include_router(_contracts_router)
+_CONTRACT_INGEST_LOCK = _contracts_handlers.lock
+_load_contract_store = _contracts_handlers.load_contract_store
+_save_contract_store = _contracts_handlers.save_contract_store
+list_contracts = _contracts_handlers.list_contracts
+get_contract = _contracts_handlers.get_contract
+approve_contract = _contracts_handlers.approve_contract
+reject_contract = _contracts_handlers.reject_contract
+trigger_contract_ingest = _contracts_handlers.trigger_contract_ingest
 
 
 # 31.07 (Release-аудит П4): регистрация критичных сторов -- в самом конце модуля,
