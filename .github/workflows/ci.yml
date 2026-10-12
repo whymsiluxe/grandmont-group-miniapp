@@ -101,6 +101,13 @@ jobs:
 
       - name: Guard against work-type catalog duplication (01.08)
         run: |
+          # 01.08 (единый каталог видов работ): backend/work_types.py -- ЕДИНСТВЕННЫЙ
+          # источник истины. Раньше один и тот же список навыков был вручную продублирован
+          # в main.py + 2 frontend-файлах, что дало реальный дрифт (SKILL_STAGE_MAP
+          # покрывал только 8 из 19 навыков). Эта проверка ловит повторное появление
+          # статичного списка ВНЕ work_types.py -- любой JS-файл с массивом из 15+
+          # захардкоженных строк-навыков (тот же класс паттерна, что были ONBOARDING_GROUPS/
+          # BUBBLE_STAGE_OPTIONS/SKILL_STAGE_MAP) считается регрессией.
           FOUND=0
           for f in frontend/js/*.js; do
             if grep -qE '(SKILL_OPTIONS|ONBOARDING_GROUPS|BUBBLE_STAGE_OPTIONS|SKILL_STAGE_MAP)\s*=' "$f"; then
@@ -113,6 +120,8 @@ jobs:
 
       - name: Check for obvious committed secrets
         run: |
+          # Ищем реальные значения секретов, не сами имена переменных (BOT_TOKEN=
+          # os.environ[...] -- нормальный код, BOT_TOKEN=123456:ABC-DEF... -- утечка).
           FOUND=0
           if grep -rEn 'BOT_TOKEN\s*=\s*["\x27][0-9]+:[A-Za-z0-9_-]{30,}' backend/ frontend/ 2>/dev/null; then FOUND=1; fi
           if grep -rEn '\-\-\-\-\-BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY\-\-\-\-\-' . --exclude-dir=.git 2>/dev/null; then FOUND=1; fi
@@ -141,6 +150,12 @@ jobs:
         run: node -e "require('pdfkit'); console.log('pdfkit OK')"
 
       - name: Notify Engineering Center on failure
+        # Reuses the SAME bot/chat as every grandmont-group-*.service on the VPS
+        # (see scripts/engineering-center.sh in engineering-os) -- GitHub Actions
+        # can't reach /etc/claude-agent.env directly, so the same two values are
+        # mirrored into this repo's Actions secrets (BOT_TOKEN_NOTIFY, CHAT_ID).
+        # Named BOT_TOKEN_NOTIFY (not BOT_TOKEN) to avoid colliding with this
+        # workflow's own existing dummy BOT_TOKEN env var above. No new bot.
         if: failure() && github.ref == 'refs/heads/main'
         env:
           BOT_TOKEN_NOTIFY: ${{ secrets.BOT_TOKEN_NOTIFY }}
@@ -159,45 +174,3 @@ jobs:
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${TEXT}" \
             --data-urlencode "parse_mode=HTML" > /dev/null
-
-  phase6_transform:
-    if: ${{ github.event_name == 'pull_request' && github.head_ref == 'refactor/main-monolith-phase-6' }}
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    env:
-      BOT_TOKEN: ci-dummy-token-not-a-real-secret
-      MINIAPP_DATA_ROOT: /tmp/phase6-miniapp-data
-      GRANDMONT_GROUP_ENV: test
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: refactor/main-monolith-phase-6
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install test dependencies
-        run: pip install -r requirements-test.txt
-      - name: Apply extraction
-        run: python tools/phase6_transform.py
-      - name: Verify focused tests
-        run: |
-          python -m py_compile backend/main.py backend/routes/needs.py tests/test_phase6_needs_contract.py
-          cd tests
-          python -m pytest -q \
-            test_phase6_needs_contract.py \
-            test_needs_access_control.py \
-            test_needs_workflow.py \
-            test_tasks_deadlock_fix.py \
-            test_my_tasks_frontend_contract.py \
-            test_needs_ios_frontend_contract.py
-      - name: Commit clean transformed tree
-        run: |
-          git show bf3a461eebe9a62be2b200724acd36618743f1f5:.github/workflows/ci.yml > .github/workflows/ci.yml
-          rm -f tools/phase6_transform.py .github/workflows/phase6-transform.yml
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          git commit -m 'refactor: wire needs domain extraction'
-          git push origin HEAD:refactor/main-monolith-phase-6

@@ -5670,237 +5670,61 @@ def get_blocker_photo(object_id: str, fname: str, user: dict = Depends(get_curre
     return FileResponse(path)
 
 
-# ---------- Потребности (10.33) — worker → owner запросы (инструмент/материалы/защита) ----------
-# moved to core/paths.py -- TASKS_FILE
-def _load_tasks() -> list:
-    return _safe_load_json(TASKS_FILE, [])
+# ---------- Потребности / Needs domain ----------
+# Worker -> owner material/tool/PPE/access requests now live in routes/needs.py.
+# main.py remains the composition root and keeps only migration aliases.
+if __package__:
+    from .routes.needs import (
+        NeedsRouteDeps,
+        TaskCreateBody,
+        TaskStatusBody,
+        create_needs_router,
+    )
+else:
+    from routes.needs import (  # noqa: E402
+        NeedsRouteDeps,
+        TaskCreateBody,
+        TaskStatusBody,
+        create_needs_router,
+    )
 
+_needs_router, _needs_handlers = create_needs_router(
+    NeedsRouteDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        require_owner=require_owner,
+        tasks_file=lambda: TASKS_FILE,
+        safe_load_json=lambda path, default: _safe_load_json(path, default),
+        atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+        update_json_transaction=lambda path, default, mutator: update_json_transaction(path, default, mutator),
+        task_priorities=TASK_PRIORITIES,
+        task_categories=TASK_CATEGORIES,
+        task_statuses=TASK_STATUSES,
+        has_active_object_access=lambda user_id, object_id: has_active_object_access(user_id, object_id),
+        load_roles=lambda: _load_roles(),
+        get_worker_profile=lambda user_id: _get_worker_profile(user_id),
+        sanitize_display_name=lambda raw, fallback: _sanitize_display_name(raw, fallback),
+        send_telegram_message=lambda *args, **kwargs: send_telegram_message(*args, **kwargs),
+        business_now=lambda: business_now(),
+        load_repo_objekte_lib=lambda: _load_repo_objekte_lib(),
+    )
+)
+app.include_router(_needs_router)
 
-def _save_tasks(items: list):
-    _atomic_write_json(TASKS_FILE, items)
-
-
-# moved to core/constants.py -- TASK_PRIORITIES
-
-# 27.07 (B7): категория запроса -- material/tool/ppe/access/other, отдельно от
-# priority. Ключи латиницей (стабильный API contract), label для UI -- по месту рендера.
-# moved to core/constants.py -- TASK_CATEGORIES
-
-
-class TaskCreateBody(BaseModel):
-    title: str
-    description: str = ''
-    object_id: str = ''
-    priority: str = 'обычная'
-    category: str = 'other'
-    due_at: int | None = None
-
-
-class TaskStatusBody(BaseModel):
-    status: str
-
-
-# 27.07 (B7): расширено с 3 до полного набора из плана (NEW/ACKNOWLEDGED/IN_PROGRESS/
-# ORDERED/DELIVERED/DECLINED/CANCELLED) -- старые значения ('открыто','в работе','закрыто')
-# сохранены как есть для обратной совместимости с уже существующими записями в tasks.json,
-# новые статусы добавлены поверх, не переименовывая старые.
-# moved to core/constants.py -- TASK_STATUSES
-
-
-def _task_is_open(task: dict) -> bool:
-    return task.get('status') not in ('закрыто', 'выдано', 'отклонено', 'cancelled')
-
-
-def _normalize_task_due_at(raw_due_at) -> int | None:
-    if raw_due_at in (None, ''):
-        return None
-    try:
-        due_at = int(raw_due_at)
-    except (TypeError, ValueError):
-        raise HTTPException(400, "Некорректный срок задачи")
-    if due_at <= 0:
-        raise HTTPException(400, "Некорректный срок задачи")
-    if due_at < int(time.time()) - 60:
-        raise HTTPException(400, "Срок задачи не может быть в прошлом")
-    return due_at
-
-
-def _format_due_at(due_at: int) -> str:
-    try:
-        return datetime.fromtimestamp(int(due_at), business_now().tzinfo).strftime('%d.%m %H:%M')
-    except Exception:
-        return ''
-
-
-def _overdue_task_alerts(now: int | None = None) -> list:
-    now = int(time.time()) if now is None else int(now)
-    result = []
-    for task in _load_tasks():
-        if not _task_is_open(task):
-            continue
-        try:
-            due_at = int(task.get('due_at') or 0)
-        except (TypeError, ValueError):
-            continue
-        if due_at <= 0 or due_at > now:
-            continue
-        title = (task.get('title') or 'Потребность')[:80]
-        parts = []
-        if task.get('object_id'):
-            parts.append(str(task.get('object_id')))
-        due_label = _format_due_at(due_at)
-        if due_label:
-            parts.append(f'срок {due_label}')
-        if task.get('from_name') or task.get('from_user_id'):
-            parts.append(f"запросил {task.get('from_name') or task.get('from_user_id')}")
-        result.append({
-            'id': f'task-overdue-{task.get("id", "")}',
-            'type': 'red',
-            'role_filter': 'owner',
-            'title': f'Просрочена потребность: {title}',
-            'subtitle': ' · '.join(parts),
-            'at': due_at,
-            'task_id': task.get('id', ''),
-            'task_overdue': True,
-        })
-    return result
-
-
-@app.get("/api/tasks")
-def list_tasks(object_id: str = '', user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    # 03.08 (ТЗ Задача 4): worker с object_id должен иметь активный доступ к этому
-    # конкретному объекту -- раньше ЛЮБОЙ whitelisted worker мог передать чужой
-    # object_id и увидеть командную видимость Потребностей объекта, на который его
-    # никогда не назначали (get_current_user проверяет только whitelist, не привязку
-    # к объекту). Запрос БЕЗ object_id не трогаем -- он и так уже сужен до "только
-    # свои" двумя строками ниже, никакой object-level дыры там нет.
-    if object_id and role != 'owner' and not has_active_object_access(str(user['id']), object_id):
-        raise HTTPException(403, "Нет доступа к этому объекту")
-
-    items = _load_tasks()
-    # 25.07: object_id передан -- worker смотрит вкладку Потребности ВНУТРИ конкретного
-    # объекта, там нужна командная видимость (как в чате объекта), не только свои заявки.
-    # Без object_id -- это глобальный экран Потребности, там worker видит только свои
-    # (иначе он видит чужие материальные запросы по всем объектам сразу, что не нужно).
-    if role != 'owner' and not object_id:
-        items = [t for t in items if str(t.get('from_user_id')) == str(user['id'])]
-    if object_id:
-        items = [t for t in items if t.get('object_id') == object_id]
-    return {"tasks": sorted(items, key=lambda t: (t.get('priority') != 'срочно', -t.get('created_at', 0)))}
-
-
-@app.post("/api/tasks")
-def create_task(body: TaskCreateBody, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    if role == 'owner':
-        raise HTTPException(403, "Потребности создают работники")
-    if not body.title.strip():
-        raise HTTPException(400, "Название обязательно")
-    if not body.object_id.strip():
-        raise HTTPException(400, "Объект обязателен")
-    # 03.08 (ТЗ Задача 4): worker может создать потребность только на объекте, к
-    # которому у него активный доступ -- раньше object_id принимался как есть без
-    # проверки, worker мог создать заявку (видимую всей команде объекта) на объект,
-    # к которому вообще не назначен.
-    if not has_active_object_access(str(user['id']), body.object_id.strip()):
-        raise HTTPException(403, "Нет доступа к этому объекту")
-    priority = body.priority.strip() or 'обычная'
-    if priority not in TASK_PRIORITIES:
-        raise HTTPException(400, "Недопустимый приоритет")
-    category = body.category.strip() or 'other'
-    if category not in TASK_CATEGORIES:
-        raise HTTPException(400, "Недопустимая категория")
-    due_at = _normalize_task_due_at(body.due_at)
-    roles = _load_roles()
-    owner_id = next((uid for uid, r in roles.items() if r == 'owner'), None)
-    profile = _get_worker_profile(user['id'])
-    task = {
-        'id': uuid.uuid4().hex,
-        'type': 'request',
-        'from_user_id': str(user['id']),
-        'from_name': _sanitize_display_name(profile.get('name'), str(user['id'])),
-        'to_user_id': owner_id,
-        'object_id': body.object_id.strip(),
-        'title': body.title.strip()[:200],
-        'description': body.description.strip()[:1000],
-        'priority': priority,
-        'category': category,
-        'status': 'открыто',
-        'created_at': int(time.time()),
-        'due_at': due_at,
-        'closed_at': None,
-    }
-    # 23.09 (owner P0, confirmed live on production): was
-    # `with _lock_for(TASKS_FILE): ... _save_tasks(items)` -- _save_tasks()
-    # calls _atomic_write_json(), which itself does
-    # `with _lock_for(TASKS_FILE):` on the SAME path. _lock_for() caches one
-    # plain threading.Lock per path (non-reentrant) -- the second acquire
-    # attempt, from the same thread, inside the first `with` block, hangs
-    # forever. Proven with a real subprocess call (no mocks): the very FIRST
-    # call to this endpoint deadlocks, unconditionally, no concurrency
-    # required. update_json_transaction() does the read+mutate+write under
-    # ONE lock acquisition -- the correct fix, same pattern already used for
-    # critical_alerts.json/roles.json/birthday_alerts.json this session.
-    def _mutate(items):
-        items.append(task)
-        return task
-    update_json_transaction(TASKS_FILE, [], _mutate)
-    if owner_id:
-        try:
-            urgent_prefix = "🔴 СРОЧНО! " if priority == 'срочно' else "📋 "
-            send_telegram_message(int(owner_id), f"{urgent_prefix}Новая потребность от {task['from_name']}: {task['title']}")
-        except Exception:
-            pass
-    return task
-
-
-@app.patch("/api/tasks/{task_id}")
-def update_task_status(task_id: str, body: TaskStatusBody, user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    if body.status not in TASK_STATUSES:
-        raise HTTPException(400, "Недопустимый статус")
-
-    # 23.09 (owner P0, same nested-lock deadlock as create_task above) --
-    # moved to update_json_transaction(). prev_status is captured via the
-    # outer-scope holder since the mutator's own return value (the task
-    # dict) already carries the NEW status by the time it's returned; the
-    # Sheets-archive logic below (outside the lock, does its own network
-    # I/O) still needs to know what the status was BEFORE this change.
-    prev_status_holder = {}
-
-    def _mutate(items):
-        task = next((t for t in items if t['id'] == task_id), None)
-        if not task:
-            raise HTTPException(404, "Потребность не найдена")
-        prev_status_holder['value'] = task.get('status')
-        task['status'] = body.status
-        if body.status == 'закрыто':
-            task['closed_at'] = int(time.time())
-        else:
-            task['closed_at'] = None
-        return task
-
-    task = update_json_transaction(TASKS_FILE, [], _mutate)
-    prev_status = prev_status_holder['value']
-
-    # 04.08 (Раунд 3, задача 5.2): РАНЬШЕ закрытая потребность удалялась из JSON
-    # (архив только в Sheets) -- из-за этого экран Потребности не мог показать
-    # счётчик "Выполнены N" и фильтр "Выполненные". Теперь закрытые ОСТАЮТСЯ в JSON
-    # со статусом 'закрыто'+closed_at (фронт по умолчанию показывает только активные),
-    # архив в Sheets сохраняется best-effort, но только при ПЕРВОМ закрытии
-    # (prev_status != 'закрыто'), чтобы не дублировать строки при повторном PATCH.
-    if body.status == 'закрыто' and prev_status != 'закрыто':
-        try:
-            o = _load_repo_objekte_lib()
-            from datetime import datetime
-            created_str = datetime.fromtimestamp(task.get('created_at', 0)).strftime('%Y-%m-%d %H:%M') if task.get('created_at') else ''
-            closed_str = datetime.fromtimestamp(task['closed_at']).strftime('%Y-%m-%d %H:%M')
-            o.append_row_safe('Потребности', [
-                task.get('id', ''), task.get('object_id', ''), task.get('title', ''),
-                task.get('description', ''), task.get('category', ''), task.get('priority', ''),
-                task.get('from_name', task.get('from_user_id', '')), created_str, closed_str,
-            ])
-        except Exception as e:
-            print(f'WARNING: не удалось заархивировать потребность {task_id} в Sheets: {e}')
-    return task
+# Compatibility names for direct-call tests/internal callers during migration.
+# These are aliases to the extracted implementation only.
+_load_tasks = _needs_handlers.load_tasks
+_save_tasks = _needs_handlers.save_tasks
+_task_is_open = _needs_handlers.task_is_open
+_normalize_task_due_at = _needs_handlers.normalize_task_due_at
+_format_due_at = _needs_handlers.format_due_at
+_overdue_task_alerts = _needs_handlers.overdue_task_alerts
+list_tasks = _needs_handlers.list_tasks
+# This is intentionally the final module-level create_task symbol. Historically
+# it overwrote the earlier object-task function of the same name; Phase 4 keeps
+# that exact public-module behavior and Phase 6 preserves it here.
+create_task = _needs_handlers.create_task
+update_task_status = _needs_handlers.update_task_status
 
 
 # ---------- Mängelmanagement — Фаза 3 ----------
