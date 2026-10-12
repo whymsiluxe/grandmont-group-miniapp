@@ -6,6 +6,8 @@ on:
       - 'scripts/phase-final-extract-calendar-contracts.py'
       - 'backend/routes/worker_calendar.py'
       - 'backend/routes/contracts.py'
+      - 'backend/core/checkin_support.py'
+      - 'tests/test_checkin_execution_routes_extraction.py'
       - '.github/workflows/phase-final-calendar-contracts-transform.yml'
 permissions:
   contents: write
