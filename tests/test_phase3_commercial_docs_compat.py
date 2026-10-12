@@ -1,4 +1,6 @@
 """Commercial Docs must remain independent from backend.main helper wiring."""
+import ast
+import inspect
 import os
 import sys
 
@@ -13,6 +15,17 @@ def test_dead_commercial_main_wiring_is_absent():
 
     fields = set(commercial.CommercialDocsRouteDeps.__dataclass_fields__)
     assert not {"send_pdf", "generate_pdf", "make_pdf_filename"} & fields
+
+
+def test_commercial_docs_never_imports_main_backwards():
+    tree = ast.parse(inspect.getsource(commercial))
+    forbidden = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            forbidden.extend(alias.name for alias in node.names if alias.name in {"main", "backend.main"})
+        elif isinstance(node, ast.ImportFrom) and node.module in {"main", "backend.main"}:
+            forbidden.append(node.module)
+    assert not forbidden, f"Commercial Docs reintroduced a main back-import: {forbidden}"
 
 
 def test_angebot_handler_uses_module_owned_helpers(monkeypatch):
