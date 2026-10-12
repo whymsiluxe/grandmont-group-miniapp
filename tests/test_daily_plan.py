@@ -447,7 +447,6 @@ class DailyPlanRouteTests(unittest.TestCase):
         )
         plan = self.backend.daily_plan_create(body=body, user={'id': 1})
         self.assertEqual(plan['status'], 'published')
-        return plan
 
     def test_worker_can_accept_published_plan(self):
         # Create a plan assigned to worker 555
