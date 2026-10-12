@@ -12,7 +12,7 @@ MAIN = ROOT / "backend" / "main.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "phase2-mangel-transform.yml"
 
 text = MAIN.read_text(encoding="utf-8")
-start_marker = "# 30.07 (Release-аудит P1): было два разных экземпляра mangel_lib в одном процессе"
+start_marker = "# 30.07 (Release-аудит P1): было `import mangel_lib as ml` -- обычный import"
 end_marker = "# ---------- Фотоотчёт старт/финиш смены — Фаза 4a ----------"
 
 if text.count(start_marker) != 1:
@@ -25,11 +25,16 @@ end = text.index(end_marker, start)
 legacy = text[start:end]
 
 required_legacy_tokens = [
+    'ml = _load_repo_mangel_lib()',
     '@app.get("/api/mangel")',
+    '@app.get("/api/mangel/counts")',
+    '@app.get("/api/mangel/{ticket_id}")',
     '@app.post("/api/mangel")',
     '@app.get("/api/mangel/photos/{fname}/file")',
     '@app.patch("/api/mangel/{ticket_id}/status")',
+    '@app.post("/api/mangel/{ticket_id}/comments")',
     '@app.delete("/api/mangel/{ticket_id}")',
+    '@app.get("/api/mangel/{ticket_id}/comments")',
     'def require_mangel_access(',
     'def _enrich_mangel_tickets_with_author(',
 ]
@@ -102,7 +107,12 @@ updated = text[:start] + replacement + text[end:]
 # Structural postconditions before writing.
 if updated.count('create_mangel_router(') != 1:
     raise SystemExit("unexpected Mangel router factory count in main.py")
-for prefix in ('@app.get("/api/mangel', '@app.post("/api/mangel', '@app.patch("/api/mangel', '@app.delete("/api/mangel'):
+for prefix in (
+    '@app.get("/api/mangel',
+    '@app.post("/api/mangel',
+    '@app.patch("/api/mangel',
+    '@app.delete("/api/mangel',
+):
     if prefix in updated:
         raise SystemExit(f"direct Mangel route remained in main.py: {prefix}")
 if len(updated) >= len(text):
