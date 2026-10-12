@@ -2989,191 +2989,7 @@ get_feed_photo_comments = _photo_feed_handlers.get_feed_photo_comments
 delete_feed_photo_comment = _photo_feed_handlers.delete_feed_photo_comment
 
 
-# ---------- Раунд 6 §5: пересылка комментариев + in-app activity alerts ----------
-# Base comment lifecycle (add/get/delete news+photo) уже есть из Раунда 5 — здесь только
-# недостающее: серверная карточка-пересылка в чат и лёгкие in-app алерты о новых
-# комментариях (НЕ critical_alerts — без telegram-пуша/ack, отдельный activity_alerts.json).
-# moved to core/paths.py -- ACTIVITY_ALERTS_FILE
-
-
-def _load_activity_alerts() -> list:
-    return _safe_load_json(ACTIVITY_ALERTS_FILE, [])
-
-
-def _save_activity_alerts(items: list):
-    _atomic_write_json(ACTIVITY_ALERTS_FILE, items)
-
-
-def _news_post_title(post_id: str) -> str:
-    try:
-        if os.path.exists(NEWS_FEED_FILE):
-            with open(NEWS_FEED_FILE, encoding='utf-8') as f:
-                for p in json.load(f):
-                    if p.get('id') == post_id:
-                        return p.get('title', '') or ''
-    except Exception:
-        pass
-    return ''
-
-
-def _find_object_row_by_id(object_id: str) -> dict | None:
-    rows = _cached_get_used_range('Объекты')
-    if not rows:
-        return None
-    header, data = rows[0], rows[1:]
-    for r in data:
-        row = dict(zip(header, r))
-        if str(row.get('ID объекта', '')) == str(object_id):
-            return row
-    return None
-
-
-def _resolve_object_name(object_id: str) -> str:
-    if not object_id:
-        return ''
-    try:
-        rows = _cached_get_used_range('Объекты')
-        if rows:
-            hdr = rows[0]
-            for r in rows[1:]:
-                row = dict(zip(hdr, r))
-                if str(row.get('ID объекта', '')) == str(object_id):
-                    return row.get('Объект', '') or str(object_id)
-    except Exception:
-        pass
-    return str(object_id)
-
-
-def _comment_alert_recipients(actor_id, prior_user_ids, author_id=None) -> set:
-    """§5.2: релевантные получатели — Owner('ы) + кто уже комментировал + автор публикации
-    (если есть user_id). НЕ все Worker. Автор нового комментария исключён."""
-    recips = {str(uid) for uid, r in _load_roles().items() if r == 'owner'}
-    recips |= {str(u) for u in prior_user_ids if u}
-    if author_id:
-        recips.add(str(author_id))
-    recips.discard(str(actor_id))
-    return recips
-
-
-def _emit_comment_activity_alerts(kind, ref_id, comment_id, actor_id, actor_name,
-                                   title, subtitle, recipients):
-    """§5.2 идемпотентность: один comment_id не создаёт повторный alert одному получателю
-    (повторный GET/добавление не плодит алерты)."""
-    if not recipients:
-        return
-    items = _load_activity_alerts()
-    existing = {(a.get('target_user_id'), a.get('comment_id')) for a in items}
-    now = int(time.time())
-    changed = False
-    for uid in recipients:
-        if (str(uid), comment_id) in existing:
-            continue
-        items.append({
-            'id': uuid.uuid4().hex, 'target_user_id': str(uid), 'kind': kind,
-            'ref_id': str(ref_id), 'comment_id': comment_id, 'actor_id': str(actor_id),
-            'actor_name': actor_name, 'title': title, 'subtitle': subtitle,
-            'created_at': now, 'read_at': None,
-        })
-        changed = True
-    if changed:
-        _save_activity_alerts(items)
-
-
-class ActivityReadBody(BaseModel):
-    kind: str
-    ref_id: str
-
-
-@app.post("/api/activity-alerts/read")
-def mark_activity_alerts_read(body: ActivityReadBody, user: dict = Depends(get_current_user)):
-    """§5.2/§5.3: после реального открытия конкретного обсуждения — пометить прочитанным."""
-    items = _load_activity_alerts()
-    now = int(time.time())
-    changed = False
-    for a in items:
-        if (a.get('target_user_id') == str(user['id']) and a.get('kind') == body.kind
-                and a.get('ref_id') == str(body.ref_id) and not a.get('read_at')):
-            a['read_at'] = now
-            changed = True
-    if changed:
-        _save_activity_alerts(items)
-    return {"status": "ok"}
-
-
-class CommentForwardBody(BaseModel):
-    source_type: str  # 'news' | 'photo'
-    source_id: str
-    comment_id: str
-    to_user_id: str | None = None
-    thread_key: str | None = None
-
-
-@app.post("/api/comments/forward")
-def forward_comment(body: CommentForwardBody, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """§5.1: пересылка комментария в существующий чат (общий/личный/объект/дефект/потребность).
-    Карточка строится СЕРВЕРНО из сохранённого комментария и заголовка новости/фото —
-    тексту карточки от frontend не доверяем; существование источника валидируется."""
-    if body.source_type == 'news':
-        plist = _load_news_comments().get(body.source_id, [])
-        comment = next((c for c in plist if c.get('id') == body.comment_id), None)
-        if not comment:
-            raise HTTPException(404, "Комментарий не найден")
-        title = _news_post_title(body.source_id) or 'Новость'
-        card = f"💬 Комментарий к новости\n«{title}»\n{comment.get('name', '')}:\n{comment.get('text', '')}"
-    elif body.source_type == 'photo':
-        with _photo_lock:
-            items = _load_photo_meta()
-        entry = next((p for p in items if p['id'] == body.source_id), None)
-        if not entry:
-            raise HTTPException(404, "Фото не найдено")
-        comment = next((c for c in entry.get('comments', []) if c.get('id') == body.comment_id), None)
-        if not comment:
-            raise HTTPException(404, "Комментарий не найден")
-        obj_name = _resolve_object_name(entry.get('object_id', '')) or 'без объекта'
-        card = f"💬 Комментарий к фотографии\nОбъект: {obj_name}\n{comment.get('name', '')}:\n{comment.get('text', '')}"
-    else:
-        raise HTTPException(400, "Неизвестный тип источника")
-
-    # Проверка доступа к цели — тот же гейт, что и обычная отправка сообщения.
-    if body.thread_key:
-        _check_thread_access(body.thread_key, str(user['id']), role)
-    else:
-        _reject_self_chat(user['id'], body.to_user_id)
-        _validate_dm_recipient(body.to_user_id)
-        thread_id = _chat_thread_id(user['id'], body.to_user_id)
-        thread_meta = _load_chat_thread_meta()
-        if thread_meta.get(thread_id, {}).get('closed') and role != 'owner':
-            raise HTTPException(403, "Чат закрыт руководством")
-
-    msg = {
-        "id": uuid.uuid4().hex, "ts": int(time.time()), "user_id": user['id'],
-        "name": user.get('first_name', str(user['id'])), "text": card,
-        "to_user_id": body.to_user_id, "thread_key": body.thread_key,
-        "forwarded_comment": {"source_type": body.source_type, "source_id": body.source_id,
-                              "comment_id": body.comment_id},
-    }
-    with _chat_lock:
-        messages = _load_chat()
-        messages.append(msg)
-        _save_chat(messages)
-    return {"message": msg, "status": "ok"}
-
-
-@app.get("/api/feed/photos/{photo_id}/file")
-def get_feed_photo_file(photo_id: str, index: int = 0, user: dict = Depends(get_current_user)):
-    with _photo_lock:
-        items = _load_photo_meta()
-    entry = next((p for p in items if p['id'] == photo_id), None)
-    if not entry:
-        raise HTTPException(404, "Фото не найдено")
-    files = entry.get('files') or ([entry['file']] if entry.get('file') else [])
-    if index < 0 or index >= len(files):
-        raise HTTPException(404, "Файл не найден по этому индексу")
-    path = os.path.join(PHOTO_DIR, files[index])
-    if not os.path.exists(path):
-        raise HTTPException(404, "Файл отсутствует")
-    return FileResponse(path)
-
+# ---------- Activity/comment bridge wiring is composed after Chat core. ----------
 
 # ---------- Chat core domain ----------
 # Storage, thread access, read state, reactions and attachment upload now live
@@ -3251,6 +3067,59 @@ get_unread_by_thread = _chat_handlers.get_unread_by_thread
 mark_chat_read = _chat_handlers.mark_chat_read
 post_chat_attachment = _chat_handlers.post_chat_attachment
 
+
+
+# ---------- Activity/comment bridge ----------
+# This integration surface needs Feed/Photo plus Chat handlers, so composition
+# intentionally happens after Chat core has been constructed.
+if __package__:
+    from .routes.activity_bridge import (
+        ActivityBridgeDeps, ActivityReadBody, CommentForwardBody,
+        create_activity_bridge_router,
+    )
+else:
+    from routes.activity_bridge import (  # noqa: E402
+        ActivityBridgeDeps, ActivityReadBody, CommentForwardBody,
+        create_activity_bridge_router,
+    )
+
+_activity_bridge_router, _activity_bridge_handlers = create_activity_bridge_router(
+    ActivityBridgeDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        safe_load_json=lambda path, default: _safe_load_json(path, default),
+        atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+        activity_alerts_file=lambda: ACTIVITY_ALERTS_FILE,
+        news_feed_file=lambda: NEWS_FEED_FILE,
+        photo_dir=lambda: PHOTO_DIR,
+        cached_get_used_range=lambda tab_name: _cached_get_used_range(tab_name),
+        load_roles=lambda: _load_roles(),
+        load_news_comments=lambda: _load_news_comments(),
+        photo_lock=_photo_lock,
+        load_photo_meta=lambda: _load_photo_meta(),
+        check_thread_access=lambda thread_key, uid, role: _check_thread_access(thread_key, uid, role),
+        reject_self_chat=lambda uid, target_uid: _reject_self_chat(uid, target_uid),
+        validate_dm_recipient=lambda target_uid: _validate_dm_recipient(target_uid),
+        chat_thread_id=lambda uid, target_uid: _chat_thread_id(uid, target_uid),
+        load_chat_thread_meta=lambda: _load_chat_thread_meta(),
+        chat_lock=_chat_lock,
+        load_chat=lambda: _load_chat(),
+        save_chat=lambda messages: _save_chat(messages),
+    )
+)
+app.include_router(_activity_bridge_router)
+
+# Compatibility aliases for existing alert aggregation, tests and callers.
+_load_activity_alerts = _activity_bridge_handlers.load_activity_alerts
+_save_activity_alerts = _activity_bridge_handlers.save_activity_alerts
+_news_post_title = _activity_bridge_handlers.news_post_title
+_find_object_row_by_id = _activity_bridge_handlers.find_object_row_by_id
+_resolve_object_name = _activity_bridge_handlers.resolve_object_name
+_comment_alert_recipients = _activity_bridge_handlers.comment_alert_recipients
+_emit_comment_activity_alerts = _activity_bridge_handlers.emit_comment_activity_alerts
+mark_activity_alerts_read = _activity_bridge_handlers.mark_activity_alerts_read
+forward_comment = _activity_bridge_handlers.forward_comment
+get_feed_photo_file = _activity_bridge_handlers.get_feed_photo_file
 
 _whisper_model = None
 
