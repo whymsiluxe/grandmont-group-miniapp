@@ -7476,347 +7476,72 @@ def create_critical_alert_endpoint(body: CriticalAlertCreateBody, user: dict = D
     )
 
 
-# ---------- Abwesenheit — Фаза 5 (календарь отсутствий работников) ----------
-# moved to core/paths.py -- ABWESENHEIT_FILE
-# moved to core/constants.py -- ABWESENHEIT_REASONS
 
-
-def _load_abwesenheit() -> list:
-    return _safe_load_json(ABWESENHEIT_FILE, [])
-
-
-def _save_abwesenheit(items: list):
-    """ВНИМАНИЕ: не использовать в обработчиках запросов для read-modify-write.
-
-    20.09 (merged from upstream c23894d): все шесть мутаций стора переведены на
-    update_json_transaction(), которая делает read-modify-write под ОДНИМ
-    локом. Пара _load_abwesenheit() → мутация → _save_abwesenheit() выглядит
-    безопасной симметрией, но именно она и была гонкой, из-за которой терялись
-    одобрения владельца и воскресали удалённые заявки (auto-close при открытии
-    календаря пишет свой снимок поверх чужого).
-
-    Остаётся как полная перезапись стора: используется тестовыми фикстурами
-    для подготовки состояния, где конкурентности нет по определению."""
-    _atomic_write_json(ABWESENHEIT_FILE, items)
-
-
-def _migrate_abwesenheit_legacy_ids() -> int:
-    def _mutate(items):
-        count = 0
-        if not isinstance(items, list):
-            return count
-        for entry in items:
-            if isinstance(entry, dict) and not entry.get('id'):
-                entry['id'] = uuid.uuid4().hex
-                count += 1
-        return count
-    return update_json_transaction(ABWESENHEIT_FILE, [], _mutate)
-
-
-class AbwesenheitBody(BaseModel):
-    date_from: str
-    date_to: str | None = None
-    reason: str
-    note: str = ''
-    start_time: str | None = None
-    end_time: str | None = None
-
-
-def _notify_owner_abwesenheit_pending(entry: dict):
-    """Критический алерт owner'у при новой заявке на отсутствие (10.15)."""
-    roles = _load_roles()
-    owner_id = next((uid for uid, r in roles.items() if r == 'owner'), None)
-    if not owner_id:
-        return
-    text = (f"🔴 Заявка на отсутствие: {entry['name']}\n"
-            f"{entry['date_from']} — {entry['date_to']} · {entry['reason']}\n"
-            f"{entry['note'] or ''}\n\nПодтвердите или отклоните в приложении.")
-    try:
-        send_telegram_message(owner_id, text)
-    except Exception:
-        pass  # best-effort — не блокировать создание записи
-
-
-def _notify_worker_abwesenheit_decision(entry: dict):
-    """Push worker'у после решения owner'а по заявке (10.15)."""
-    status_text = 'одобрена' if entry['status'] == 'approved' else 'не одобрена'
-    text = (f"{'✅' if entry['status'] == 'approved' else '❌'} Ваша заявка на отсутствие "
-            f"{status_text} руководством\n{entry['date_from']} — {entry['date_to']}")
-    try:
-        send_telegram_message(int(entry['user_id']), text)
-    except Exception:
-        pass
-
-
-def _validate_date_str(date_str: str, field_name: str = 'дата'):
-    """Валидация формата YYYY-MM-DD — без этого кривая дата от клиента доходит
-    до calendar.monthrange()/сравнений строк и валит эндпоинт 500 вместо 400 (10.29)."""
-    try:
-        datetime.strptime(date_str, '%Y-%m-%d')
-    except (ValueError, TypeError):
-        raise HTTPException(400, f"Некорректный формат {field_name}: {date_str!r} (ожидается YYYY-MM-DD)")
-
-
-def _month_end(date_str: str) -> str:
-    import calendar
-    try:
-        y, m, _ = (int(x) for x in date_str.split('-'))
-        if not (1 <= m <= 12):
-            raise ValueError
-    except (ValueError, AttributeError):
-        raise HTTPException(400, f"Некорректная дата: {date_str}")
-    last_day = calendar.monthrange(y, m)[1]
-    return f'{y:04d}-{m:02d}-{last_day:02d}'
-
-
-@app.post("/api/abwesenheit")
-def create_abwesenheit(body: AbwesenheitBody, user: dict = Depends(get_current_user)):
-    if body.reason not in ABWESENHEIT_REASONS:
-        raise HTTPException(400, f"Недопустимая причина: {body.reason}")
-    _validate_date_str(body.date_from, 'date_from')
-    if body.date_to:
-        _validate_date_str(body.date_to, 'date_to')
-        if body.date_to < body.date_from:
-            raise HTTPException(400, "date_to не может быть раньше date_from")
-    # 10.25: "не знаю сколько буду болеть" — date_to не указан, ставим временно до конца
-    # месяца (видимость в календаре), open_ended=true — worker сам закрывает досрочно
-    # через PATCH .../close, когда поправится, owner тоже может закрыть/продлить.
-    open_ended = not body.date_to
-    date_to = body.date_to or _month_end(body.date_from)
-    entry = {
-        "id": uuid.uuid4().hex,
-        "user_id": str(user['id']),
-        "name": user.get('first_name', str(user['id'])),
-        "date_from": body.date_from,
-        "date_to": date_to,
-        "open_ended": open_ended,
-        "reason": body.reason,
-        "note": body.note.strip()[:300],
-        "start_time": body.start_time,
-        "end_time": body.end_time,
-        "created_at": int(time.time()),
-        "status": "pending",
-    }
-    # 20.09 (merged from upstream c23894d): append под локом -- параллельная
-    # заявка другого работника (или auto-close при открытии календаря
-    # владельцем) писала свой снимок поверх, и одна из двух заявок исчезала.
-    update_json_transaction(ABWESENHEIT_FILE, [], lambda items: items.append(entry))
-    _notify_owner_abwesenheit_pending(entry)
-    try:
-        shadow_create_absence(user['id'], entry)
-    except Exception:
-        pass  # Core shadow create is best-effort, must never affect the legacy response
-    return entry
-
-
-@app.patch("/api/abwesenheit/{entry_id}/close")
-def close_abwesenheit(entry_id: str, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """Worker закрывает открытую запись досрочно ('поправился раньше'), owner может закрыть любую."""
-    def _mutate(items):
-        entry = next((i for i in items if i.get('id') == entry_id), None)
-        if not entry:
-            raise HTTPException(404, "Запись не найдена")
-        if entry['user_id'] != str(user['id']) and role != 'owner':
-            raise HTTPException(403, "Можно закрывать только свои записи")
-        entry['date_to'] = business_today_str()
-        entry['open_ended'] = False
-        return dict(entry)
-
-    return update_json_transaction(ABWESENHEIT_FILE, [], _mutate)
-
-
-class AbwesenheitStatusBody(BaseModel):
-    status: str
-
-
-class AbwesenheitMoveBody(BaseModel):
-    date_from: str
-    date_to: str | None = None
-
-
-@app.patch("/api/abwesenheit/{entry_id}/status")
-def update_abwesenheit_status(entry_id: str, body: AbwesenheitStatusBody,
-                               user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    if body.status not in ('approved', 'rejected'):
-        raise HTTPException(400, "status должен быть approved или rejected")
-
-    # 20.09 (merged from upstream c23894d): read-modify-write под одним локом.
-    # Раньше load/save шли раздельно -- параллельный DELETE/close/auto-close
-    # той же записи (или просто открытие календаря владельцем, оно дёргает
-    # _auto_close_expired_open_ended) писал свой снимок поверх, и решение
-    # владельца терялось МОЛЧА: push и critical-alert ниже уже отправлены, а
-    # в файле осталось старое 'pending'.
-    def _mutate(items):
-        entry = next((i for i in items if i.get('id') == entry_id), None)
-        if not entry:
-            raise HTTPException(404, "Запись не найдена")
-        entry['status'] = body.status
-        return dict(entry)
-
-    entry = update_json_transaction(ABWESENHEIT_FILE, [], _mutate)
-    _notify_worker_abwesenheit_decision(entry)
-    _create_critical_alert(
-        target_user_id=entry['user_id'],
-        kind='abwesenheit_decision',
-        title=f"Отсутствие {entry['date_from']}—{entry['date_to']}: "
-              f"{'одобрено' if body.status == 'approved' else 'не одобрено'}",
-        ref_id=entry.get('id', ''),
+# ---------- Abwesenheit domain ----------
+# Persistence, validation, notifications and HTTP handlers live in
+# routes/absence.py. Runtime dependencies are injected here so that the domain
+# module never imports main.py and compatibility aliases contain no implementation.
+if __package__:
+    from .routes.absence import (
+        AbsenceRouteDeps,
+        AbwesenheitBody,
+        AbwesenheitMoveBody,
+        AbwesenheitStatusBody,
+        create_absence_router,
     )
-    return entry
+else:
+    from routes.absence import (  # noqa: E402
+        AbsenceRouteDeps,
+        AbwesenheitBody,
+        AbwesenheitMoveBody,
+        AbwesenheitStatusBody,
+        create_absence_router,
+    )
 
+_absence_router, _absence_handlers = create_absence_router(
+    AbsenceRouteDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        require_owner=require_owner,
+        # Data paths and collaborators are deliberately resolved dynamically:
+        # tests isolate the JSON file and runtime code may replace integrations.
+        absence_file=lambda: ABWESENHEIT_FILE,
+        reasons=ABWESENHEIT_REASONS,
+        public_fields=ABWESENHEIT_PUBLIC_FIELDS,
+        safe_load_json=lambda path, default: _safe_load_json(path, default),
+        atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+        update_json_transaction=lambda path, default, mutator: update_json_transaction(
+            path, default, mutator
+        ),
+        load_roles=lambda: _load_roles(),
+        send_telegram_message=lambda *args, **kwargs: send_telegram_message(*args, **kwargs),
+        business_today_str=lambda: business_today_str(),
+        shadow_create_absence=lambda *args, **kwargs: shadow_create_absence(*args, **kwargs),
+        create_critical_alert=lambda *args, **kwargs: _create_critical_alert(*args, **kwargs),
+        resolve_current_display_name=lambda user_id, fallback: _resolve_current_display_name(
+            user_id, fallback
+        ),
+    )
+)
+app.include_router(_absence_router)
 
-@app.patch("/api/abwesenheit/{entry_id}")
-def update_abwesenheit_dates(entry_id: str, body: AbwesenheitMoveBody,
-                              user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """Move an absence request to another date range.
-
-    Used by the calendar drag/drop UI. Owner can move any request; workers can
-    move only their own. Open-ended requests keep open_ended=true and refresh
-    their temporary visibility window to the end of the new month.
-    """
-    _validate_date_str(body.date_from, 'date_from')
-
-    # 20.09 (merged from upstream c23894d): перенос даты идёт под тем же
-    # локом, что и остальные мутации стора -- раньше параллельный
-    # approve/close/delete этой же записи терялся (или воскрешал уже
-    # удалённую), см. соседние endpoint'ы.
-    def _mutate(items):
-        entry = next((i for i in items if i.get('id') == entry_id), None)
-        if not entry:
-            raise HTTPException(404, "Запись не найдена")
-        if entry['user_id'] != str(user['id']) and role != 'owner':
-            raise HTTPException(403, "Можно переносить только свои записи")
-
-        if body.date_to:
-            _validate_date_str(body.date_to, 'date_to')
-            date_to = body.date_to
-        elif entry.get('open_ended'):
-            date_to = _month_end(body.date_from)
-        else:
-            # 17.09 (real bug found finishing this endpoint off): frontend's
-            # _moveAbwesenheitEntry() computes and sends an explicit date_to that
-            # preserves the entry's original span -- but if date_to is omitted (any
-            # other/future caller, or a client that only sends date_from), this used
-            # to collapse a multi-day entry down to a single day (date_to = date_from)
-            # instead of preserving its original duration. Backend must not depend on
-            # the client remembering to do this -- compute the shift from the
-            # ORIGINAL entry's own span before it gets overwritten below.
-            original_span_days = (datetime.strptime(entry['date_to'], '%Y-%m-%d').date()
-                                   - datetime.strptime(entry['date_from'], '%Y-%m-%d').date()).days
-            original_span_days = max(0, original_span_days)
-            new_from_date = datetime.strptime(body.date_from, '%Y-%m-%d').date()
-            date_to = (new_from_date + timedelta(days=original_span_days)).isoformat()
-        if date_to < body.date_from:
-            raise HTTPException(400, "date_to не может быть раньше date_from")
-
-        entry['date_from'] = body.date_from
-        entry['date_to'] = date_to
-        entry['updated_at'] = int(time.time())
-        return dict(entry)
-
-    return update_json_transaction(ABWESENHEIT_FILE, [], _mutate)
-
-
-def _auto_close_expired_open_ended_abwesenheit():
-    """10.29 (Fable-аудит): open_ended заявка без ручного закрытия молча висела
-    до конца месяца без уведомления. Ленивая проверка при каждом GET (не отдельный
-    systemd timer) — закрывает просроченные и пушит worker'у + owner'у."""
-    today_str = business_today_str()
-
-    # 20.09 (merged from upstream c23894d): этот auto-close дёргается на
-    # КАЖДЫЙ GET календаря, то есть чаще всех остальных мутаций -- именно
-    # он был главным источником затирания чужих изменений (владелец
-    # открывает календарь ровно в тот момент, когда работник подаёт/
-    # закрывает заявку). Под локом и с копиями записей наружу.
-    def _mutate(items):
-        expired_local = [i for i in items if i.get('open_ended') and i['date_to'] < today_str]
-        for entry in expired_local:
-            entry['open_ended'] = False
-        return [dict(e) for e in expired_local]
-
-    expired = update_json_transaction(ABWESENHEIT_FILE, [], _mutate)
-    if not expired:
-        return
-
-    roles = _load_roles()
-    owner_ids = [uid for uid, r in roles.items() if r == 'owner']
-    for entry in expired:
-        text = (f"⏰ Заявка на отсутствие автоматически закрыта (истёк месяц)\n"
-                f"{entry['date_from']} — {entry['date_to']} · {entry.get('name', entry['user_id'])}")
-        try:
-            send_telegram_message(int(entry['user_id']), text)
-        except Exception:
-            pass
-        for owner_id in owner_ids:
-            try:
-                send_telegram_message(owner_id, text)
-            except Exception:
-                pass
-
-
-@app.get("/api/abwesenheit")
-def list_my_abwesenheit(user: dict = Depends(get_current_user)):
-    _auto_close_expired_open_ended_abwesenheit()
-    items = [i for i in _load_abwesenheit() if i['user_id'] == str(user['id'])]
-    for e in items:
-        e.setdefault('status', 'pending')
-        # 22.09 (iPhone screenshot audit): read-side resolve, see
-        # _resolve_current_display_name()'s docstring -- create_abwesenheit
-        # stamps `name` at write time and can freeze a raw user_id into it.
-        e['name'] = _resolve_current_display_name(e.get('user_id'), e.get('name'))
-    return {"entries": items}
-
-
-# 31.07 (доп.раунд, П2): reason убран из публичного набора -- свободная строка,
-# может содержать мед./личные детали не хуже note (изначально П5 прошлого раунда
-# скрыл только note, оставив reason по ошибке).
-# moved to core/constants.py -- ABWESENHEIT_PUBLIC_FIELDS
-
-
-@app.get("/api/abwesenheit/all")
-def list_all_abwesenheit(user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    # 28.07: owner request -- воркер тоже может смотреть общий календарь команды
-    # (view-only). Approve/reject остаются отдельно защищены require_owner на
-    # /api/abwesenheit/{id}/status -- этот endpoint только читает список.
-    # 31.07 (Release-аудит П5): owner и сам автор записи видят все поля (включая
-    # свободный комментарий note, потенциально мед. детали), другие Worker -- только
-    # безопасные поля (имя/даты/общий статус). Свою полную запись Worker всё равно
-    # видит через GET /api/abwesenheit (list_my_abwesenheit), не этот endpoint.
-    _auto_close_expired_open_ended_abwesenheit()
-    my_id = str(user['id'])
-    entries = _load_abwesenheit()
-    result = []
-    for e in entries:
-        e.setdefault('status', 'pending')
-        # 22.09 (iPhone screenshot audit): read-side resolve BEFORE the
-        # public-fields filter below, so the corrected name survives it --
-        # see _resolve_current_display_name()'s docstring.
-        e['name'] = _resolve_current_display_name(e.get('user_id'), e.get('name'))
-        if role == 'owner' or e.get('user_id') == my_id:
-            result.append(e)
-        else:
-            result.append({k: e.get(k) for k in ABWESENHEIT_PUBLIC_FIELDS})
-    return {"entries": result}
-
-
-@app.delete("/api/abwesenheit/{entry_id}")
-def delete_abwesenheit(entry_id: str, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    # 20.09 (merged from upstream c23894d): переведён на update_json_transaction,
-    # как и остальные пять мутаций стора (тот же race: параллельный approve/close/
-    # auto-close этой же записи терялся под read-modify-write без лока).
-    def _mutate(items):
-        entry = next((i for i in items if i.get('id') == entry_id), None)
-        if not entry:
-            raise HTTPException(404, "Запись не найдена")
-        if entry['user_id'] != str(user['id']) and role != 'owner':
-            raise HTTPException(403, "Можно удалять только свои записи")
-        # мутация IN-PLACE: update_json_transaction пишет тот же объект, что
-        # передан в mutator -- переприсваивание локального имени (items = [...])
-        # его бы не затронуло, и удаление молча не сохранилось бы.
-        items[:] = [i for i in items if i.get('id') != entry_id]
-
-    update_json_transaction(ABWESENHEIT_FILE, [], _mutate)
-    return {"status": "ok"}
+# Compatibility names for direct-call tests/internal callers during migration.
+# These are aliases only; no absence implementation remains in main.py.
+_load_abwesenheit = _absence_handlers.load_abwesenheit
+_save_abwesenheit = _absence_handlers.save_abwesenheit
+_migrate_abwesenheit_legacy_ids = _absence_handlers.migrate_abwesenheit_legacy_ids
+_notify_owner_abwesenheit_pending = _absence_handlers.notify_owner_abwesenheit_pending
+_notify_worker_abwesenheit_decision = _absence_handlers.notify_worker_abwesenheit_decision
+_validate_date_str = _absence_handlers.validate_date_str
+_month_end = _absence_handlers.month_end
+create_abwesenheit = _absence_handlers.create_abwesenheit
+close_abwesenheit = _absence_handlers.close_abwesenheit
+update_abwesenheit_status = _absence_handlers.update_abwesenheit_status
+update_abwesenheit_dates = _absence_handlers.update_abwesenheit_dates
+_auto_close_expired_open_ended_abwesenheit = _absence_handlers.auto_close_expired_open_ended_abwesenheit
+list_my_abwesenheit = _absence_handlers.list_my_abwesenheit
+list_all_abwesenheit = _absence_handlers.list_all_abwesenheit
+delete_abwesenheit = _absence_handlers.delete_abwesenheit
 
 
 # ── DailyPlan routes (Round 1 — Production Control) ────────────────────────
