@@ -3121,340 +3121,74 @@ mark_activity_alerts_read = _activity_bridge_handlers.mark_activity_alerts_read
 forward_comment = _activity_bridge_handlers.forward_comment
 get_feed_photo_file = _activity_bridge_handlers.get_feed_photo_file
 
-_whisper_model = None
+# ---------- Voice transcription domain ----------
+if __package__:
+    from .routes.voice import VoiceRouteDeps, create_voice_router
+else:
+    from routes.voice import VoiceRouteDeps, create_voice_router  # noqa: E402
 
-
-def _get_whisper():
-    global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-    return _whisper_model
-
-
-def _transcribe_voice(path: str) -> str:
-    model = _get_whisper()
-    segments, _ = model.transcribe(path, language=None)
-    return ' '.join(s.text.strip() for s in segments).strip()
-
-
-# moved to core/limits.py -- TRANSCRIBE_MAX_BYTES
-# moved to core/paths.py -- TRANSCRIBE_AUDIO_DIR
-os.makedirs(TRANSCRIBE_AUDIO_DIR, exist_ok=True)
-
-
-@app.post("/api/transcribe")
-async def transcribe_voice_endpoint(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    """Голосовой ввод вне чата -- finish-shift wizard (что сделано/доп-работы/
-    потребности), создание дефекта/потребности. Аудио хранится (не temp+delete) --
-    транскрипция бывает кривой, юзер должен иметь возможность переслушать
-    оригинал, не только доверять тексту. Хранится per-user подпапкой, отдаётся
-    только владельцу файла или owner (см. GET /api/transcribe/{file_id}/audio)."""
-    data = await file.read()
-    if len(data) > TRANSCRIBE_MAX_BYTES:
-        raise HTTPException(400, "Голосовое слишком большое (макс. 8 МБ)")
-    if not data:
-        raise HTTPException(400, "Пустой файл")
-    # 30.07 (Release-аудит P0): было -- любой файл принимался (только size limit),
-    # расширение бралось из клиентского filename без проверки. Magic-byte allowlist.
-    detected = sniff_audio(data)
-    if detected is None:
-        raise HTTPException(400, "Недопустимый формат аудио")
-    ext = f'.{_ALLOWED_AUDIO_MIME_EXT[detected]}'
-
-    uid = str(user['id'])
-    user_dir = os.path.join(TRANSCRIBE_AUDIO_DIR, uid)
-    os.makedirs(user_dir, exist_ok=True)
-    file_id = uuid.uuid4().hex
-    fpath = os.path.join(user_dir, f'{file_id}{ext}')
-    with open(fpath, 'wb') as f:
-        f.write(data)
-
-    try:
-        raw_transcript = _transcribe_voice(fpath)
-    except Exception as e:
-        raise HTTPException(502, f"Не удалось распознать голосовое: {str(e)[:200]}")
-
-    if not raw_transcript:
-        raise HTTPException(422, "Не удалось разобрать речь в записи — попробуй ещё раз")
-
-    return {
-        "raw_transcript": raw_transcript,
-        "status": "ok",
-        "file_id": file_id,
-        "audio_url": f"/api/transcribe/{file_id}/audio",
-    }
-
-
-@app.get("/api/transcribe/{file_id}/audio")
-def get_transcribe_audio(file_id: str, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    safe_file_id = os.path.basename(file_id)
-    if safe_file_id != file_id:
-        raise HTTPException(404, "Файл не найден")
-    uid = str(user['id'])
-    search_dirs = [uid] if role != 'owner' else os.listdir(TRANSCRIBE_AUDIO_DIR) if os.path.isdir(TRANSCRIBE_AUDIO_DIR) else []
-    for d in search_dirs:
-        user_dir = os.path.join(TRANSCRIBE_AUDIO_DIR, os.path.basename(d))
-        if not os.path.isdir(user_dir):
-            continue
-        for fname in os.listdir(user_dir):
-            if fname.startswith(safe_file_id):
-                return FileResponse(os.path.join(user_dir, fname))
-    raise HTTPException(404, "Файл не найден")
-
-
-@app.post("/api/chat/messages/voice")
-async def post_chat_voice(thread_key: str = Form(''), to_user_id: str = Form(''), file: UploadFile = File(...),
-                           user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    if thread_key:
-        _check_thread_access(thread_key, str(user['id']), role)
-    else:
-        _reject_self_chat(user['id'], to_user_id or None)
-        _validate_dm_recipient(to_user_id or None)
-        thread_id = _chat_thread_id(user['id'], to_user_id or None)
-        thread_meta = _load_chat_thread_meta()
-        if thread_meta.get(thread_id, {}).get('closed') and role != 'owner':
-            raise HTTPException(403, "Чат закрыт руководством")
-
-    data = await file.read()
-    if len(data) > 8 * 1024 * 1024:
-        raise HTTPException(400, "Голосовое слишком большое (макс. 8 МБ)")
-    # 30.07 (Release-аудит P0): magic-byte allowlist, расширение из таблицы а не
-    # от клиента -- то же обоснование что и в post_chat_attachment выше.
-    detected = sniff_audio(data)
-    if detected is None:
-        raise HTTPException(400, "Недопустимый формат аудио")
-    fname = f'{uuid.uuid4().hex}.{_ALLOWED_AUDIO_MIME_EXT[detected]}'
-    fpath = os.path.join(CHAT_ATTACH_DIR, fname)
-    with open(fpath, 'wb') as f:
-        f.write(data)
-
-    try:
-        transcript = _transcribe_voice(fpath)
-    except Exception as e:
-        transcript = ''
-        print(f'WARNING: транскрипция голосового не удалась: {e}')
-
-    msg = {
-        "id": uuid.uuid4().hex,
-        "ts": int(time.time()),
-        "user_id": user['id'],
-        "name": user.get('first_name', str(user['id'])),
-        "text": '',
-        "to_user_id": to_user_id or None,
-        "thread_key": thread_key or None,
-        "attachment": {"file": fname, "name": file.filename or fname, "content_type": file.content_type or 'audio/ogg'},
-        "voice_transcript": transcript,
-    }
-    with _chat_lock:
-        messages = _load_chat()
-        messages.append(msg)
-        _save_chat(messages)
-    return {"message": msg}
-
-
-class ExtractTaskBody(BaseModel):
-    text: str
-    object_id: str = ''
-
-
-class ManagementCommandBody(BaseModel):
-    text: str
-
-
-def _normalize_ru_lookup(s: str) -> str:
-    return re.sub(r'[^a-zа-я0-9]+', '', str(s or '').lower().replace('ё', 'е'))
-
-
-def _normalize_ru_name_hint(s: str) -> str:
-    value = str(s or '').strip()
-    if len(value) > 3 and value[-1:].lower() in ('у', 'ю'):
-        return value[:-1]
-    return value
-
-
-def _management_command_date(label: str, base_dt: datetime | None = None) -> str:
-    base = base_dt or business_now()
-    key = str(label or '').strip().lower()
-    if key == 'сегодня':
-        return base.date().isoformat()
-    if key == 'завтра':
-        return (base.date() + timedelta(days=1)).isoformat()
-    if key == 'послезавтра':
-        return (base.date() + timedelta(days=2)).isoformat()
-    m = re.match(r'^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?$', key)
-    if not m:
-        return ''
-    day, month = int(m.group(1)), int(m.group(2))
-    year = int(m.group(3)) if m.group(3) else base.year
-    if year < 100:
-        year += 2000
-    try:
-        return datetime(year, month, day).date().isoformat()
-    except ValueError:
-        return ''
-
-
-def _resolve_management_worker(worker_query: str, workers: list[dict] | None = None) -> dict:
-    workers = workers or []
-    query_norm = _normalize_ru_lookup(_normalize_ru_name_hint(worker_query))
-    for w in workers:
-        name = str(w.get('name') or w.get('first_name') or '').strip()
-        if query_norm and query_norm in _normalize_ru_lookup(name):
-            return {"id": str(w.get('user_id') or w.get('id') or ''), "name": name}
-    return {"id": "", "name": _normalize_ru_name_hint(worker_query)}
-
-
-def _resolve_management_object(object_query: str, objects: list[dict] | None = None) -> dict:
-    objects = objects or []
-    query_norm = _normalize_ru_lookup(object_query)
-    for obj in objects:
-        name = str(obj.get('name') or obj.get('Объект') or '').strip()
-        oid = str(obj.get('id') or obj.get('ID объекта') or '').strip()
-        if query_norm and (query_norm in _normalize_ru_lookup(name) or query_norm in _normalize_ru_lookup(oid)):
-            return {"id": oid, "name": name or oid}
-    return {"id": "", "name": object_query.strip()}
-
-
-def parse_management_command(text: str, base_dt: datetime | None = None,
-                             workers: list[dict] | None = None,
-                             objects: list[dict] | None = None) -> dict:
-    """Parse an owner Russian management command into a safe draft.
-
-    This intentionally does not create assignments/tasks. The caller must show
-    the draft and confirm before any mutation.
-    """
-    raw = re.sub(r'\s+', ' ', str(text or '').strip().rstrip('.!?'))
-    if not raw:
-        raise ValueError("Пустая команда")
-    m = re.match(
-        r'(?i)^поставь\s+(?P<worker>.+?)\s+'
-        r'(?P<date>сегодня|завтра|послезавтра|\d{1,2}\.\d{1,2}(?:\.\d{2,4})?)\s+'
-        r'задач[ауи]\s+(?P<body>.+)$',
-        raw,
+_voice_router, _voice_handlers = create_voice_router(
+    VoiceRouteDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        transcribe_audio_dir=lambda: TRANSCRIBE_AUDIO_DIR,
+        transcribe_max_bytes=TRANSCRIBE_MAX_BYTES,
+        chat_attach_dir=lambda: CHAT_ATTACH_DIR,
+        sniff_audio=lambda data: sniff_audio(data),
+        allowed_audio_mime_ext=_ALLOWED_AUDIO_MIME_EXT,
+        check_thread_access=lambda thread_key, uid, role: _check_thread_access(thread_key, uid, role),
+        reject_self_chat=lambda uid, target_uid: _reject_self_chat(uid, target_uid),
+        validate_dm_recipient=lambda target_uid: _validate_dm_recipient(target_uid),
+        chat_thread_id=lambda uid, target_uid: _chat_thread_id(uid, target_uid),
+        load_chat_thread_meta=lambda: _load_chat_thread_meta(),
+        chat_lock=_chat_lock,
+        load_chat=lambda: _load_chat(),
+        save_chat=lambda messages: _save_chat(messages),
     )
-    if not m:
-        raise ValueError("Не удалось разобрать команду управления")
-
-    body = m.group('body').strip()
-    comment = ''
-    comment_match = re.search(r'(?i)\s+и\s+скажи\s+ему\s+(?P<comment>.+)$', body)
-    if comment_match:
-        comment = comment_match.group('comment').strip()
-        body = body[:comment_match.start()].strip()
-
-    object_query = ''
-    task_text = body
-    object_match = re.search(r'(?i)\s+у\s+(?P<object>[^,]+)$', body)
-    if object_match:
-        object_query = object_match.group('object').strip()
-        task_text = body[:object_match.start()].strip()
-
-    worker = _resolve_management_worker(m.group('worker').strip(), workers)
-    obj = _resolve_management_object(object_query, objects) if object_query else {"id": "", "name": ""}
-    due_date = _management_command_date(m.group('date'), base_dt)
-
-    return {
-        "intent": "assign_task",
-        "worker_query": m.group('worker').strip(),
-        "worker_id": worker.get("id", ""),
-        "worker_name": worker.get("name", ""),
-        "date": due_date,
-        "date_text": m.group('date').strip(),
-        "object_query": object_query,
-        "object_id": obj.get("id", ""),
-        "object_name": obj.get("name", ""),
-        "task": task_text,
-        "comment": comment,
-        "requires_confirmation": True,
-    }
+)
+app.include_router(_voice_router)
+_get_whisper = _voice_handlers.get_whisper
+_transcribe_voice = _voice_handlers.transcribe_voice
+transcribe_voice_endpoint = _voice_handlers.transcribe_voice_endpoint
+get_transcribe_audio = _voice_handlers.get_transcribe_audio
+post_chat_voice = _voice_handlers.post_chat_voice
 
 
-def _management_workers_for_parse() -> list[dict]:
-    profiles = _load_worker_profiles()
-    roles = _load_roles()
-    result = []
-    for uid, role in roles.items():
-        if role == 'worker':
-            profile = profiles.get(str(uid), {})
-            result.append({
-                "user_id": str(uid),
-                "name": _sanitize_display_name(profile.get('name') or profile.get('first_name'), str(uid)),
-            })
-    return result
-
-
-def _management_objects_for_parse() -> list[dict]:
-    rows = _cached_get_used_range('Объекты')
-    if not rows:
-        return []
-    header, data = rows[0], rows[1:]
-    result = []
-    for row in data:
-        obj = dict(zip(header, row))
-        result.append({
-            "id": str(obj.get('ID объекта', '')).strip(),
-            "name": str(obj.get('Объект', '')).strip(),
-        })
-    return result
-
-
-@app.post("/api/manager/command/parse")
-def parse_manager_command(body: ManagementCommandBody,
-                          user: dict = Depends(get_current_user),
-                          role: str = Depends(get_role)):
-    if role != 'owner':
-        raise HTTPException(403, "Только для владельца")
-    text = body.text.strip()
-    if not text:
-        raise HTTPException(400, "Пустая команда")
-    try:
-        workers = _management_workers_for_parse()
-    except Exception:
-        workers = []
-    try:
-        objects = _management_objects_for_parse()
-    except Exception:
-        objects = []
-    try:
-        draft = parse_management_command(text, workers=workers, objects=objects)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    return {"draft": draft, "requires_confirmation": True}
-
-
-@app.post("/api/tasks/extract")
-def extract_task_from_text(body: ExtractTaskBody, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """10.37: AI разбирает транскрипт голосового (или любой текст) и предлагает
-    title/description для Потребности — НЕ создаёт заявку сама, только предлагает,
-    подтверждение — отдельным POST /api/tasks с уже готовыми полями (юзер решил:
-    голосовое остаётся в чате, извлечение — явное действие с подтверждением)."""
-    if role == 'owner':
-        raise HTTPException(403, "Потребности создают работники")
-    text = body.text.strip()
-    if not text:
-        raise HTTPException(400, "Пустой текст")
-
-    system = (
-        "Ты помощник, который извлекает из голосового сообщения строителя запрос на "
-        "инструмент/материалы/защиту. Верни СТРОГО валидный JSON без пояснений: "
-        '{"title": "короткое название (макс 60 символов)", "description": "детали, если есть"}. '
-        'Если в тексте нет реального запроса на что-либо — верни {"title": "", "description": ""}.'
+# ---------- Manager assistant domain ----------
+if __package__:
+    from .routes.manager_assistant import (
+        ExtractTaskBody, ManagementCommandBody, ManagerAssistantDeps,
+        create_manager_assistant_router,
     )
-    try:
-        raw = _call_glm_json(system, text)
-    except Exception as e:
-        raise HTTPException(502, f"AI недоступен: {e}")
+else:
+    from routes.manager_assistant import (  # noqa: E402
+        ExtractTaskBody, ManagementCommandBody, ManagerAssistantDeps,
+        create_manager_assistant_router,
+    )
 
-    m = re.search(r'\{.*\}', raw, re.DOTALL)
-    if not m:
-        raise HTTPException(502, "AI вернул не-JSON ответ")
-    try:
-        parsed = json.loads(m.group(0))
-    except Exception:
-        raise HTTPException(502, "Не удалось разобрать ответ AI")
-
-    return {"title": parsed.get("title", "")[:200], "description": parsed.get("description", "")[:1000]}
+_manager_assistant_router, _manager_assistant_handlers = create_manager_assistant_router(
+    ManagerAssistantDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        business_now=lambda: business_now(),
+        load_worker_profiles=lambda: _load_worker_profiles(),
+        load_roles=lambda: _load_roles(),
+        sanitize_display_name=lambda raw, fallback: _sanitize_display_name(raw, fallback),
+        cached_get_used_range=lambda tab_name: _cached_get_used_range(tab_name),
+        call_glm_json=lambda system, text: _call_glm_json(system, text),
+    )
+)
+app.include_router(_manager_assistant_router)
+_normalize_ru_lookup = _manager_assistant_handlers.normalize_ru_lookup
+_normalize_ru_name_hint = _manager_assistant_handlers.normalize_ru_name_hint
+_management_command_date = _manager_assistant_handlers.management_command_date
+_resolve_management_worker = _manager_assistant_handlers.resolve_management_worker
+_resolve_management_object = _manager_assistant_handlers.resolve_management_object
+parse_management_command = _manager_assistant_handlers.parse_management_command
+_management_workers_for_parse = _manager_assistant_handlers.management_workers_for_parse
+_management_objects_for_parse = _manager_assistant_handlers.management_objects_for_parse
+parse_manager_command = _manager_assistant_handlers.parse_manager_command
+extract_task_from_text = _manager_assistant_handlers.extract_task_from_text
 
 
 # ---------- Chat write/actions domain ----------
