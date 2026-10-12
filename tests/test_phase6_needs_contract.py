@@ -1,4 +1,4 @@
-"""Strict public-contract and behavior guard for Phase 6 Needs extraction."""
+"""Strict public-contract and behavior guard for the final clean Phase 6 Needs extraction."""
 import ast
 import inspect
 import os
