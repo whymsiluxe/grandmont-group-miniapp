@@ -3315,346 +3315,55 @@ _call_glm_vision = _execution_handlers.call_glm_vision
 
 
 
-# ---------- Critical Alerts — persisted, с deadline/comment/photo (Фаза 10.16) ----------
-# moved to core/paths.py -- CRITICAL_ALERTS_FILE
-# moved to core/paths.py -- CRITICAL_ALERT_PHOTO_DIR
-os.makedirs(CRITICAL_ALERT_PHOTO_DIR, exist_ok=True)
-
-
-def _load_critical_alerts() -> list:
-    return _safe_load_json(CRITICAL_ALERTS_FILE, [])
-
-
-def _save_critical_alerts(items: list):
-    _atomic_write_json(CRITICAL_ALERTS_FILE, items)
-
-
-def _is_legacy_bare_uid_birthday_ref(alert: dict) -> bool:
-    """23.09 (owner review): identifies the OLD, pre-fix birthday alert shape --
-    kind='birthday' with ref_id set to the bare worker uid (digits only), from
-    before ref_id=idem (birthday:<uid>:<year>:3days / :today) existed. New
-    birthday alerts always have an 'idem'-shaped ref_id (contains ':') and
-    must never be touched by this legacy-only logic. Deliberately narrow: only
-    kind='birthday' with a non-empty, purely-numeric ref_id qualifies -- any
-    other kind, or a blank ref_id, or a ref_id that already looks like the new
-    idem shape, is left alone."""
-    if alert.get('kind') != 'birthday':
-        return False
-    ref_id = alert.get('ref_id') or ''
-    return bool(ref_id) and ref_id.isdigit()
-
-
-def _supersede_legacy_siblings(items: list, canonical: dict) -> int:
-    """23.09 (owner review): when a legacy bare-uid birthday alert is
-    acknowledged, every OTHER unresolved alert sharing the exact same legacy
-    semantic key (kind, target_user_id, ref_id) is superseded in the SAME
-    transaction -- acknowledged_at set, superseded_by recorded, nothing
-    deleted. This is the live-request equivalent of
-    cleanup_legacy_critical_alert_duplicates.py's one-off migration: that
-    script handles the 196 records that already existed; this handles any
-    legacy sibling a poll still manages to surface between deploy and the
-    migration actually running (or if the migration is deliberately not run
-    immediately). Scoped to _is_legacy_bare_uid_birthday_ref() ONLY -- new
-    alerts (idem-shaped ref_id, any other kind, blank ref_id) are never
-    touched by this, matching _create_critical_alert()'s own dedup scoping."""
-    if not _is_legacy_bare_uid_birthday_ref(canonical):
-        return 0
-    now = canonical.get('acknowledged_at') or int(time.time())
-    superseded = 0
-    for a in items:
-        if a['id'] == canonical['id']:
-            continue
-        if a.get('acknowledged_at'):
-            continue
-        if not _is_legacy_bare_uid_birthday_ref(a):
-            continue
-        if a['kind'] != canonical['kind'] or a['target_user_id'] != canonical['target_user_id'] \
-                or a.get('ref_id') != canonical.get('ref_id'):
-            continue
-        a['acknowledged_at'] = now
-        a['superseded_by'] = canonical['id']
-        superseded += 1
-    return superseded
-
-
-def _create_critical_alert(target_user_id: str, kind: str, title: str, ref_id: str = '',
-                            subtitle: str = '', deadline_at: int | None = None) -> dict:
-    """Создаёт persisted критический алерт + пуш + авто-чат-тред (владельцы + назначенный worker).
-
-    22.09 (iPhone screenshot audit, item found live): this used to unconditionally
-    append a new alert with a fresh UUID on every call -- callers that can fire
-    more than once for the same underlying event (daily_plan_cutoff_check.py's
-    idempotency guard only covers ONE call site; anything else calling this
-    directly for the same semantic situation had no protection at all) could
-    create duplicate UNRESOLVED alerts, which then queue up back-to-back in the
-    frontend's critical-alert popup -- confirmed live on a real device. Dedup
-    key: (kind, target_user_id, ref_id) -- if an alert with that exact triple is
-    still unacknowledged, return it instead of creating a new one. Two semantically
-    different alerts of the same kind for the same user are still allowed to
-    coexist as long as ref_id differs (e.g. two different plan_overdue alerts for
-    two different business dates, if ref_id carries the date).
-
-    23.09 (owner review, before the legacy-birthday-cleanup rollout): a BLANK
-    ref_id ('' -- the default for any caller that doesn't pass one, e.g. a
-    manually-created owner alert with no natural reference id) must NEVER
-    dedupe against another blank-ref_id alert -- two genuinely unrelated manual
-    alerts of the same kind for the same user would otherwise silently collapse
-    into one. Dedup only applies when ref_id is non-empty; every call with a
-    blank ref_id always creates a fresh alert, exactly like before this
-    function had any dedup at all."""
-    def _mutate(items):
-        existing = next(
-            (a for a in items
-             if ref_id and a['target_user_id'] == str(target_user_id) and a['kind'] == kind
-             and a.get('ref_id', '') == ref_id and not a.get('acknowledged_at')),
-            None,
-        )
-        if existing:
-            return existing, False
-        alert = {
-            "id": uuid.uuid4().hex,
-            "target_user_id": str(target_user_id),
-            "kind": kind,
-            "title": title,
-            "subtitle": subtitle,
-            "ref_id": ref_id,
-            "created_at": int(time.time()),
-            "deadline_at": deadline_at,
-            "acknowledged_at": None,
-            "comment": None,
-            "resolution": None,  # 'yes' | 'no' — ответ на "вопрос решён?"
-            "resolution_note": None,
-            "resolution_photos": [],
-        }
-        items.append(alert)
-        return alert, True
-
-    alert, was_created = update_json_transaction(CRITICAL_ALERTS_FILE, [], _mutate)
-    if not was_created:
-        # Returned an already-existing alert (dedup hit, not a fresh create) --
-        # the chat thread/push notification for it already happened the first
-        # time; sending them again here would itself create a duplicate.
-        return alert
-
-    roles = _load_roles()
-    owner_ids = [uid for uid, r in roles.items() if r == 'owner']
-    thread_id = _chat_thread_id(target_user_id, owner_ids[0] if owner_ids else None) \
-        if owner_ids else 'group'
-    _ensure_critical_alert_chat(alert, thread_id, owner_ids)
-
-    try:
-        send_telegram_message(int(target_user_id), f"🔴 {title}")
-    except Exception:
-        pass
-    return alert
-
-
-def _ensure_critical_alert_chat(alert: dict, thread_id: str, owner_ids: list):
-    """Авто-сообщение в тред алерта — создаётся независимо от того, ответит ли worker."""
-    msg = {
-        "id": uuid.uuid4().hex,
-        "ts": int(time.time()),
-        "user_id": "system",
-        "name": "Система",
-        "text": f"🔴 Критический алерт: {alert['title']}",
-        "to_user_id": None if thread_id == 'group' else thread_id,
-        "critical_alert_id": alert['id'],
-    }
-    with _chat_lock:
-        messages = _load_chat()
-        messages.append(msg)
-        _save_chat(messages)
-
-
-class CriticalAlertAckBody(BaseModel):
-    comment: str = ''
-
-
-@app.post("/api/critical-alerts/{alert_id}/ack")
-def ack_critical_alert(alert_id: str, body: CriticalAlertAckBody, user: dict = Depends(get_current_user)):
-    # 23.09 (owner review): was a plain _load_critical_alerts() -> mutate ->
-    # _save_critical_alerts() -- the read-modify-write race storage.py's own
-    # _atomic_write_json docstring warns against (lock only covers the write,
-    # not the read). A concurrent _create_critical_alert() append (already
-    # correctly using update_json_transaction) landing between this read and
-    # this write could be silently discarded, or this ack itself could be
-    # lost, leaving the alert looking unacknowledged on the next poll.
-    #
-    # Also supersedes every other unresolved LEGACY sibling sharing this
-    # alert's semantic key (kind, target_user_id, ref_id) in the same
-    # transaction -- see _supersede_legacy_siblings()'s docstring for why this
-    # is scoped to legacy birthday records specifically, not a general rule.
-    def _mutate(items):
-        alert = next((a for a in items if a['id'] == alert_id), None)
-        if not alert:
-            raise HTTPException(404, "Алерт не найден")
-        if alert['target_user_id'] != str(user['id']):
-            raise HTTPException(403, "Не ваш алерт")
-        alert['acknowledged_at'] = int(time.time())
-        alert['comment'] = body.comment.strip()[:500] or None
-        _supersede_legacy_siblings(items, alert)
-        return alert
-
-    alert = update_json_transaction(CRITICAL_ALERTS_FILE, [], _mutate)
-
-    if alert['comment']:
-        roles = _load_roles()
-        owner_ids = [uid for uid, r in roles.items() if r == 'owner']
-        thread_id = _chat_thread_id(alert['target_user_id'], owner_ids[0] if owner_ids else None) \
-            if owner_ids else 'group'
-        msg = {
-            "id": uuid.uuid4().hex, "ts": int(time.time()), "user_id": user['id'],
-            "name": user.get('first_name', str(user['id'])), "text": alert['comment'],
-            "to_user_id": None if thread_id == 'group' else thread_id,
-            "critical_alert_id": alert['id'],
-        }
-        with _chat_lock:
-            messages = _load_chat()
-            messages.append(msg)
-            _save_chat(messages)
-    return alert
-
-
-@app.post("/api/critical-alerts/{alert_id}/resolve")
-def resolve_critical_alert(alert_id: str, resolution: str = Form(...), note: str = Form(''),
-                            files: list[UploadFile] = File(default=[]),
-                            user: dict = Depends(get_current_user)):
-    if resolution not in ('yes', 'no'):
-        raise HTTPException(400, "resolution должен быть yes или no")
-    # Read-only lookup for the 404/403 checks -- NOT the final write path, see
-    # the update_json_transaction call below for why (same race class as
-    # ack_critical_alert, 23.09 owner review).
-    existing = next((a for a in _load_critical_alerts() if a['id'] == alert_id), None)
-    if not existing:
-        raise HTTPException(404, "Алерт не найден")
-    if existing['target_user_id'] != str(user['id']):
-        raise HTTPException(403, "Не ваш алерт")
-
-    saved_photos = []
-    if resolution == 'yes' and files:
-        # 30.07 (Release-аудит P1-8): basename на write-стороне для согласованности
-        # с read-стороной (GET .../photo/{filename} уже санитирует). alert_id уже
-        # проверен выше, практическая эксплуатируемость низкая (id -- server-
-        # generated uuid), но раз паттерн есть на чтении -- должен быть и на записи.
-        # File I/O deliberately stays OUTSIDE the JSON transaction lock below --
-        # it doesn't touch critical_alerts.json and must not hold that lock for
-        # the duration of a photo upload.
-        alert_dir = os.path.join(CRITICAL_ALERT_PHOTO_DIR, os.path.basename(alert_id))
-        os.makedirs(alert_dir, exist_ok=True)
-        for f in files:
-            data = f.file.read()
-            if len(data) > 8 * 1024 * 1024:
-                raise HTTPException(400, "Файл слишком большой (макс. 8 МБ)")
-            detected = sniff_image(data)
-            if not detected:
-                raise HTTPException(400, "Файл должен быть изображением")
-            ext = '.' + _ALLOWED_IMAGE_MIME_EXT[detected]
-            fname = f"{uuid.uuid4().hex}{ext}"
-            with open(os.path.join(alert_dir, fname), 'wb') as out:
-                out.write(data)
-            saved_photos.append(fname)
-
-    def _mutate(items):
-        alert = next((a for a in items if a['id'] == alert_id), None)
-        if not alert:
-            raise HTTPException(404, "Алерт не найден")
-        if alert['target_user_id'] != str(user['id']):
-            raise HTTPException(403, "Не ваш алерт")
-        alert['resolution'] = resolution
-        alert['resolution_note'] = note.strip()[:500] or None
-        alert['resolution_photos'] = saved_photos
-        return alert
-
-    alert = update_json_transaction(CRITICAL_ALERTS_FILE, [], _mutate)
-
-    roles = _load_roles()
-    owner_ids = [uid for uid, r in roles.items() if r == 'owner']
-    thread_id = _chat_thread_id(alert['target_user_id'], owner_ids[0] if owner_ids else None) \
-        if owner_ids else 'group'
-    text = f"Вопрос решён: {'да' if resolution == 'yes' else 'нет'}"
-    if note:
-        text += f"\n{note}"
-    if saved_photos:
-        text += f"\n📷 {len(saved_photos)} фото"
-    msg = {
-        "id": uuid.uuid4().hex, "ts": int(time.time()), "user_id": user['id'],
-        "name": user.get('first_name', str(user['id'])), "text": text,
-        "to_user_id": None if thread_id == 'group' else thread_id,
-        "critical_alert_id": alert['id'],
-    }
-    with _chat_lock:
-        messages = _load_chat()
-        messages.append(msg)
-        _save_chat(messages)
-    return alert
-
-
-@app.get("/api/critical-alerts/{alert_id}/photo/{filename}")
-def get_critical_alert_photo(alert_id: str, filename: str, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    # path traversal: alert_id/filename идут из URL напрямую в os.path.join без
-    # проверки против known-хранимых значений (в отличие от object documents/chat
-    # attachments, которые матчат fname против JSON-store перед сборкой пути) --
-    # basename() режет любой ../ компонент до склейки.
-    safe_alert_id = os.path.basename(alert_id)
-    safe_filename = os.path.basename(filename)
-    if safe_alert_id != alert_id or safe_filename != filename:
-        raise HTTPException(404, "Фото не найдено")
-    path = os.path.join(CRITICAL_ALERT_PHOTO_DIR, safe_alert_id, safe_filename)
-    if not os.path.exists(path):
-        raise HTTPException(404, "Фото не найдено")
-    if role != 'owner':
-        alert = next((a for a in _load_critical_alerts() if a['id'] == alert_id), None)
-        if not alert or alert['target_user_id'] != str(user['id']):
-            raise HTTPException(403, "Нет доступа к этому фото")
-    return FileResponse(path)
-
-
-@app.get("/api/critical-alerts/pending")
-def list_pending_critical_alerts(user: dict = Depends(get_current_user)):
-    """Polling endpoint для глобального попапа — только непрочитанные алерты текущего юзера.
-
-    23.09 (owner review): defensively collapses legacy bare-uid birthday
-    siblings (see _is_legacy_bare_uid_birthday_ref()) down to ONE canonical
-    record before returning -- in case cleanup_legacy_critical_alert_
-    duplicates.py's migration hasn't run yet, or a stale poll response still
-    surfaces a sibling _supersede_legacy_siblings() hasn't caught yet. This
-    is read-side only (never writes) -- the actual persistent fix is the
-    migration script + the write-side supersede in ack_critical_alert().
-    Non-legacy alerts (new idem-shaped birthday ref_id, every other kind)
-    pass through completely unfiltered."""
-    items = [a for a in _load_critical_alerts()
-             if a['target_user_id'] == str(user['id']) and not a.get('acknowledged_at')]
-
-    legacy_by_key: dict[tuple, dict] = {}
-    result = []
-    for a in items:
-        if not _is_legacy_bare_uid_birthday_ref(a):
-            result.append(a)
-            continue
-        key = (a['kind'], a['target_user_id'], a.get('ref_id'))
-        current = legacy_by_key.get(key)
-        if current is None or a.get('created_at', 0) > current.get('created_at', 0):
-            legacy_by_key[key] = a
-    result.extend(legacy_by_key.values())
-    return {"alerts": result}
-
-
-class CriticalAlertCreateBody(BaseModel):
-    target_user_id: str
-    title: str
-    subtitle: str = ''
-    deadline_minutes: int | None = None
-
-
-@app.post("/api/critical-alerts")
-def create_critical_alert_endpoint(body: CriticalAlertCreateBody, user: dict = Depends(get_current_user),
-                                    _: None = Depends(require_owner)):
-    deadline_at = int(time.time()) + body.deadline_minutes * 60 if body.deadline_minutes else None
-    return _create_critical_alert(
-        target_user_id=body.target_user_id, kind='manual', title=body.title,
-        subtitle=body.subtitle, deadline_at=deadline_at,
+# ---------- Critical Alerts domain ----------
+try:
+    from .routes.critical_alerts import (
+        CriticalAlertAckBody,
+        CriticalAlertCreateBody,
+        CriticalAlertsDeps,
+        create_critical_alerts_router,
+    )
+except ImportError:
+    from routes.critical_alerts import (  # noqa: E402
+        CriticalAlertAckBody,
+        CriticalAlertCreateBody,
+        CriticalAlertsDeps,
+        create_critical_alerts_router,
     )
 
+_critical_alerts_router, _critical_alerts_handlers = create_critical_alerts_router(
+    CriticalAlertsDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        require_owner=require_owner,
+        critical_alerts_file=lambda: CRITICAL_ALERTS_FILE,
+        critical_alert_photo_dir=lambda: CRITICAL_ALERT_PHOTO_DIR,
+        safe_load_json=lambda path, default: _safe_load_json(path, default),
+        atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+        update_json_transaction=lambda path, default, mutator: update_json_transaction(path, default, mutator),
+        load_roles=lambda: _load_roles(),
+        send_telegram_message=lambda chat_id, text: send_telegram_message(chat_id, text),
+        chat_lock=_chat_lock,
+        load_chat=lambda: _load_chat(),
+        save_chat=lambda messages: _save_chat(messages),
+        chat_thread_id=lambda a, b: _chat_thread_id(a, b),
+        sniff_image=lambda raw: sniff_image(raw),
+        allowed_image_mime_ext=_ALLOWED_IMAGE_MIME_EXT,
+    )
+)
+app.include_router(_critical_alerts_router)
+
+_load_critical_alerts = _critical_alerts_handlers.load_critical_alerts
+_save_critical_alerts = _critical_alerts_handlers.save_critical_alerts
+_is_legacy_bare_uid_birthday_ref = _critical_alerts_handlers.is_legacy_bare_uid_birthday_ref
+_supersede_legacy_siblings = _critical_alerts_handlers.supersede_legacy_siblings
+_create_critical_alert = _critical_alerts_handlers.create_critical_alert
+_ensure_critical_alert_chat = _critical_alerts_handlers.ensure_critical_alert_chat
+ack_critical_alert = _critical_alerts_handlers.ack_critical_alert
+resolve_critical_alert = _critical_alerts_handlers.resolve_critical_alert
+get_critical_alert_photo = _critical_alerts_handlers.get_critical_alert_photo
+list_pending_critical_alerts = _critical_alerts_handlers.list_pending_critical_alerts
+create_critical_alert_endpoint = _critical_alerts_handlers.create_critical_alert_endpoint
 
 
 # ---------- Abwesenheit domain ----------

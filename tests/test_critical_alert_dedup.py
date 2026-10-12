@@ -134,7 +134,8 @@ class CriticalAlertDedupTests(unittest.TestCase):
         # genuine first create, not on every dedup-returned call -- otherwise
         # the same "duplicate popup" problem just moves to duplicate chat
         # messages/push notifications instead.
-        with patch.object(backend, '_ensure_critical_alert_chat') as mock_chat, \
+        with patch.object(backend, '_load_chat', return_value=[]), \
+             patch.object(backend, '_save_chat') as mock_chat_save, \
              patch.object(backend, 'send_telegram_message') as mock_push:
             backend._create_critical_alert(
                 target_user_id=OWNER_ID, kind='plan_overdue', title='t', ref_id='2026-09-22',
@@ -142,7 +143,7 @@ class CriticalAlertDedupTests(unittest.TestCase):
             backend._create_critical_alert(
                 target_user_id=OWNER_ID, kind='plan_overdue', title='t', ref_id='2026-09-22',
             )
-        self.assertEqual(mock_chat.call_count, 1)
+        self.assertEqual(mock_chat_save.call_count, 1)
         self.assertEqual(mock_push.call_count, 1)
 
 
