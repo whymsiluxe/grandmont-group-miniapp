@@ -2697,127 +2697,50 @@ get_tasks = _tasks_handlers.get_tasks
 complete_task = _tasks_handlers.complete_task
 
 
-# ---------- Инфо объекта (24.07, Step 3): work-items + документы ----------
-# moved to core/paths.py -- OBJECT_INFO_FILE
-# moved to core/paths.py -- OBJECT_DOC_DIR
+# ---------- Shared object info store + Documents domain ----------
+if __package__:
+    from .core.object_info_store import ObjectInfoStore
+    from .routes.documents import DocumentsRouteDeps, create_documents_router
+else:
+    from core.object_info_store import ObjectInfoStore  # noqa: E402
+    from routes.documents import DocumentsRouteDeps, create_documents_router  # noqa: E402
+
+# Preserve the legacy import-time directory creation behavior.
 os.makedirs(OBJECT_DOC_DIR, exist_ok=True)
 
+_object_info_store = ObjectInfoStore(
+    file_path=lambda: OBJECT_INFO_FILE,
+    safe_load_json=lambda path, default: _safe_load_json(path, default),
+    atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+)
 
-def _load_object_info() -> dict:
-    return _safe_load_json(OBJECT_INFO_FILE, {})
+# Temporary helper aliases for existing direct-call tests/internal callers. No
+# object-info implementation remains in main.py.
+_load_object_info = _object_info_store.load
+_save_object_info = _object_info_store.save
+_new_object_info_entry = _object_info_store.new_entry
+_ensure_object_info_entry = _object_info_store.ensure_entry
+_object_info_entry = _object_info_store.entry
 
-
-def _save_object_info(data: dict):
-    _atomic_write_json(OBJECT_INFO_FILE, data)
-
-
-def _new_object_info_entry() -> dict:
-    return {"items": [], "documents": [], "description": ""}
-
-
-def _ensure_object_info_entry(data: dict, object_id: str) -> dict:
-    entry = data.setdefault(object_id, _new_object_info_entry())
-    entry.setdefault("items", [])
-    entry.setdefault("documents", [])
-    entry.setdefault("description", "")
-    return entry
-
-
-def _object_info_entry(object_id: str) -> dict:
-    data = _load_object_info()
-    return data.get(object_id, _new_object_info_entry())
-
-
-# 25.07: Инфо-таб реструктурирован (6 плоских табов -> 2), владелец попросил
-# добавить нормальный блок "Описание объекта" -- переиспользуем тот же per-object
-# JSON store, что уже хранит items/documents, не заводим отдельный файл.
-
-
-@app.get("/api/objects/{object_id}/documents")
-def get_object_documents(object_id: str, user: dict = Depends(get_current_user), _: None = Depends(require_object_access)):
-    entry = _object_info_entry(object_id)
-    if not isinstance(entry, dict):
-        entry = {}
-    docs = entry.get("documents", [])
-    return {"documents": [d for d in docs if isinstance(d, dict)] if isinstance(docs, list) else []}
-
-
-@app.post("/api/objects/{object_id}/documents")
-async def upload_object_document(object_id: str, file: UploadFile = File(...), user: dict = Depends(get_current_user), _: None = Depends(require_object_access)):
-    data_bytes = await file.read()
-    if len(data_bytes) > 8 * 1024 * 1024:
-        raise HTTPException(400, "Файл слишком большой (макс. 8 МБ)")
-    detected = sniff_image_or_pdf(data_bytes)
-    if not detected:
-        raise HTTPException(400, "Разрешены только изображения и PDF")
-    content_type = detected
-    ext = ('.pdf' if detected == 'application/pdf' else '.' + _ALLOWED_IMAGE_MIME_EXT[detected])
-    fname = f'{uuid.uuid4().hex}{ext}'
-    with open(os.path.join(OBJECT_DOC_DIR, fname), 'wb') as f:
-        f.write(data_bytes)
-
-    doc = {
-        "id": uuid.uuid4().hex,
-        "file": fname,
-        "name": file.filename or fname,
-        "content_type": content_type,
-        "uploaded_by": user.get('first_name', str(user['id'])),
-        "uploaded_at": int(time.time()),
-    }
-
-    def _mutator(data):
-        entry = _ensure_object_info_entry(data, object_id)
-        entry["documents"].append(doc)
-        return doc
-
-    update_json_transaction(OBJECT_INFO_FILE, {}, _mutator)
-    _append_object_history_best_effort(
-        object_id, 'document_uploaded', 'Документ загружен',
-        user=user, subtitle=doc.get('name', ''),
-        at=datetime.fromtimestamp(doc['uploaded_at'], timezone.utc).replace(tzinfo=None).isoformat(),
-        meta={
-            "document_id": doc.get('id', ''),
-            "file": doc.get('file', ''),
-            "content_type": doc.get('content_type', ''),
-        },
+_documents_router, _documents_handlers = create_documents_router(
+    DocumentsRouteDeps(
+        get_current_user=get_current_user,
+        require_owner=require_owner,
+        require_object_access=require_object_access,
+        store=_object_info_store,
+        object_doc_dir=lambda: OBJECT_DOC_DIR,
+        sniff_image_or_pdf=lambda data: sniff_image_or_pdf(data),
+        allowed_image_mime_ext=_ALLOWED_IMAGE_MIME_EXT,
+        update_json_transaction=lambda path, default, mutator: update_json_transaction(path, default, mutator),
+        append_object_history_best_effort=lambda *args, **kwargs: _append_object_history_best_effort(*args, **kwargs),
     )
-    return {"document": doc}
+)
+app.include_router(_documents_router)
 
-
-@app.delete("/api/objects/{object_id}/documents/{doc_id}")
-def delete_object_document(object_id: str, doc_id: str, user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    def _mutator(data):
-        entry = data.get(object_id)
-        if not isinstance(entry, dict):
-            raise HTTPException(404, "Не найдено")
-        docs = entry.get("documents", [])
-        docs = docs if isinstance(docs, list) else []
-        doc = next((d for d in docs if isinstance(d, dict) and d.get("id") == doc_id), None)
-        if not doc:
-            raise HTTPException(404, "Не найдено")
-        entry["documents"] = [d for d in docs if not (isinstance(d, dict) and d.get("id") == doc_id)]
-        return doc
-
-    doc = update_json_transaction(OBJECT_INFO_FILE, {}, _mutator)
-    fpath = os.path.join(OBJECT_DOC_DIR, doc.get("file", ""))
-    if doc.get("file") and os.path.exists(fpath):
-        os.remove(fpath)
-    return {"status": "ok"}
-
-
-@app.get("/api/objects/{object_id}/documents/{fname}/file")
-def get_object_document_file(object_id: str, fname: str, user: dict = Depends(get_current_user), _: None = Depends(require_object_access)):
-    entry = _object_info_entry(object_id)
-    docs = entry.get("documents", []) if isinstance(entry, dict) else []
-    docs = docs if isinstance(docs, list) else []
-    doc = next((d for d in docs if isinstance(d, dict) and d.get("file") == fname), None)
-    if not doc:
-        raise HTTPException(404, "Файл не найден")
-    path = os.path.join(OBJECT_DOC_DIR, fname)
-    if not os.path.exists(path):
-        raise HTTPException(404, "Файл не найден")
-    return FileResponse(path, media_type=doc.get("content_type") or None)
-
+get_object_documents = _documents_handlers.get_object_documents
+upload_object_document = _documents_handlers.upload_object_document
+delete_object_document = _documents_handlers.delete_object_document
+get_object_document_file = _documents_handlers.get_object_document_file
 
 # moved to core/constants.py -- VALID_OBJECT_STATUSES
 
@@ -2892,8 +2815,8 @@ _objects_router, _objects_handlers = create_objects_router(ObjectsRouteDeps(
     sanitize_display_name=lambda raw, fallback: _sanitize_display_name(raw, fallback),
     object_history_worker_name=lambda user_id: _object_history_worker_name(user_id),
     append_object_history_best_effort=lambda *args, **kwargs: _append_object_history_best_effort(*args, **kwargs),
-    object_info_entry=lambda object_id: _object_info_entry(object_id),
-    ensure_object_info_entry=lambda data, object_id: _ensure_object_info_entry(data, object_id),
+    object_info_entry=_object_info_store.entry,
+    ensure_object_info_entry=_object_info_store.ensure_entry,
     require_server_script=lambda script_path, label: _require_server_script(script_path, label),
     create_object_script=lambda: CREATE_OBJECT_SCRIPT,
     create_object_folder_script=lambda: CREATE_OBJECT_FOLDER_SCRIPT,
