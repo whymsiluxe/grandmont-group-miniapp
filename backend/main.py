@@ -2673,34 +2673,28 @@ create_angebot = _commercial_docs_handlers.create_angebot
 create_rechnung = _commercial_docs_handlers.create_rechnung
 
 
-# ---------- Aufgaben (tasks) ----------
-@app.get("/api/objects/{object_id}/tasks")
-def get_tasks(object_id: str, user: dict = Depends(get_current_user), _: None = Depends(require_object_access)):
-    o = _load_repo_objekte_lib()
-    return {"tasks": o.list_tasks(object_id)}
+# ---------- Tasks domain ----------
+if __package__:
+    from .routes.tasks import TaskBody, TasksRouteDeps, create_tasks_router
+else:
+    from routes.tasks import TaskBody, TasksRouteDeps, create_tasks_router  # noqa: E402
 
+_tasks_router, _tasks_handlers = create_tasks_router(
+    TasksRouteDeps(
+        get_current_user=get_current_user,
+        require_owner=require_owner,
+        require_object_access=require_object_access,
+        load_objekte_lib=lambda: _load_repo_objekte_lib(),
+    )
+)
+app.include_router(_tasks_router)
 
-class TaskBody(BaseModel):
-    text: str
-
-
-@app.post("/api/objects/{object_id}/tasks")
-def create_task(object_id: str, body: TaskBody, user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    o = _load_repo_objekte_lib()
-    if not body.text.strip():
-        raise HTTPException(400, "Текст не может быть пустым")
-    task_id = o.add_task(object_id, body.text.strip(), user.get('first_name', str(user['id'])))
-    return {"task_id": task_id}
-
-
-@app.patch("/api/tasks/{task_id}/complete")
-def complete_task(task_id: str, user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    o = _load_repo_objekte_lib()
-    try:
-        o.complete_task(task_id)
-    except ValueError as e:
-        raise HTTPException(404, str(e))
-    return {"status": "ok"}
+# Temporary direct-call compatibility only for names that were actually stable
+# in legacy main.py. The object-task POST handler was also named create_task, but
+# a later /api/tasks handler historically overwrites that module name; exporting
+# it here would invent a compatibility contract that never existed.
+get_tasks = _tasks_handlers.get_tasks
+complete_task = _tasks_handlers.complete_task
 
 
 # ---------- Инфо объекта (24.07, Step 3): work-items + документы ----------
