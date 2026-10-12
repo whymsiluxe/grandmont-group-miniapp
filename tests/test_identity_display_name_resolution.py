@@ -8,6 +8,7 @@ from unittest.mock import patch
 os.environ.setdefault('BOT_TOKEN', 'ci-dummy')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 import main as backend  # noqa: E402
+from chat_domain_testkit import ChatDomainHarness  # noqa: E402
 
 
 WORKER_ID = '10'
@@ -26,13 +27,16 @@ class ResolveCurrentDisplayNameTests(unittest.TestCase):
 
 class ChatDisplayNameResolutionTests(unittest.TestCase):
     def test_legacy_chat_message_resolves_current_name(self):
-        with patch.object(backend, '_load_chat', return_value=[{
-            'id': 'm1', 'ts': 1000, 'user_id': int(WORKER_ID), 'name': WORKER_ID,
-            'text': 'hi', 'to_user_id': None, 'thread_key': None,
-        }]), patch.object(backend, '_save_chat'), patch.object(backend, '_load_chat_reactions', return_value=[]), \
-             patch.object(backend, '_load_worker_profiles', return_value={WORKER_ID: {'name': 'Марат'}}):
-            result = backend.get_chat_messages(user=OWNER, role='owner')
-        self.assertEqual(result['messages'][0]['name'], 'Марат')
+        harness = ChatDomainHarness(worker_profiles={WORKER_ID: {'name': 'Марат'}})
+        try:
+            harness.messages = [{
+                'id': 'm1', 'ts': 10_000_000_000, 'user_id': int(WORKER_ID), 'name': WORKER_ID,
+                'text': 'hi', 'to_user_id': None, 'thread_key': None,
+            }]
+            result = harness.core.get_chat_messages(user=OWNER, role='owner')
+            self.assertEqual(result['messages'][0]['name'], 'Марат')
+        finally:
+            harness.close()
 
 
 class FeedPostNameResolutionTests(unittest.TestCase):
