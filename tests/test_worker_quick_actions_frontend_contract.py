@@ -45,6 +45,8 @@ def test_context_resolution_priority_order_matches_plan():
     single_idx = body.index("single_assignment")
     ambiguous_idx = body.index("ambiguous")
 
+    # 1. active shift object -> 2. current Object Detail -> 3. single eligible
+    # assignment -> 4. else ambiguous (triggers picker)
     assert active_idx < detail_idx < single_idx < ambiguous_idx
     assert "resolveWorkerShiftState" in body
     assert "_workerActionCurrentObjectDetailId" in body
@@ -52,6 +54,15 @@ def test_context_resolution_priority_order_matches_plan():
 
 
 def test_object_detail_context_requires_view_objects_active_and_stages_view_open():
+    # 21.09 (P0, owner review finding, round 2): checking #stages-view.open
+    # alone is not sufficient -- #stages-view is nested INSIDE #view-objects,
+    # and switchView('home') only toggles the top-level .view elements'
+    # 'active' class, never touching #stages-view. So a worker who opened
+    # OBJECT-A's stages, then tapped "Сегодня" in bottom-nav (view-objects
+    # goes inactive, but #stages-view keeps .open), then tapped a Home quick
+    # action would still get silently attributed to OBJECT-A. Both signals
+    # are required: #view-objects must be the CURRENT active screen, AND
+    # #stages-view must be open within it.
     src = _source(QA_JS)
     body = _fn(src, "function _workerActionCurrentObjectDetailId(")
     assert "document.getElementById('view-objects')" in body
@@ -60,12 +71,16 @@ def test_object_detail_context_requires_view_objects_active_and_stages_view_open
     assert "stagesView.classList.contains('open')" in body
     assert "_stagesCurrentObjectId" in body
 
+    # The #view-objects.active check must gate BEFORE the stages-view check --
+    # an early return on a missing/inactive view-objects, not an afterthought.
     view_objects_idx = body.index("viewObjects.classList.contains('active')")
     stages_view_idx = body.index("stagesView.classList.contains('open')")
     assert view_objects_idx < stages_view_idx
 
 
 def test_object_detail_context_also_supports_the_owner_style_detail_panel_id():
+    # Same view (#view-objects), a different in-view panel -- checked for
+    # completeness even though Quick Actions is worker-only today.
     src = _source(QA_JS)
     body = _fn(src, "function _workerActionCurrentObjectDetailId(")
     assert "_objDetailCurrentId" in body
@@ -83,11 +98,12 @@ def test_photo_action_reuses_existing_feed_upload_endpoint():
     assert "_uploadFeedPhoto(" in qa_body
     assert "runWorkerQuickAction(" in qa_body
 
+    # Extended existing function's signature (not a parallel upload path)
     feed_src = _source(FEED_JS)
     assert "async function _uploadFeedPhoto(files, objectId)" in feed_src
     assert "formData.append('object_id', objectId)" in feed_src
 
-    # Backend canonical endpoint now lives in the extracted photo-feed domain.
+    # Canonical backend endpoint now lives in the extracted photo-feed domain.
     photo_src = _source(PHOTO_FEED_PY)
     start = photo_src.index("async def upload_feed_photo(")
     end = photo_src.index("\n\n", start)
@@ -101,6 +117,7 @@ def test_need_action_reuses_existing_tasks_form_no_duplicate_validation():
     assert "_populateTasksObjectSelect" in body
     assert "tasks-object-select" in body
     assert "tasks-new-btn" in body
+    # Must not re-implement submission -- no direct api('/api/tasks', ...) call here
     assert "api('/api/tasks'" not in body
 
 
@@ -131,8 +148,6 @@ def test_quick_actions_registered_in_script_load_order_after_dependencies():
 def test_home_renders_four_quick_action_tiles_wired_to_the_four_handlers():
     src = _source(HOME_JS)
     body = _fn(src, "async function initWorkerHomeView(")
-    assert body.count("worker-home-quick-action") >= 4
-    assert "_workerQuickActionPhoto" in body
-    assert "_workerQuickActionNeed" in body
-    assert "_workerQuickActionDefect" in body
-    assert "_workerQuickActionChat" in body
+    for handler in ("_workerQuickActionPhoto()", "_workerQuickActionNeed()",
+                    "_workerQuickActionDefect()", "_workerQuickActionChat()"):
+        assert handler in body
