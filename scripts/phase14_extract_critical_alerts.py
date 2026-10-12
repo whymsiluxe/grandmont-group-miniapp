@@ -64,3 +64,24 @@ create_critical_alert_endpoint = _critical_alerts_handlers.create_critical_alert
 source = source[:start] + replacement + source[end:]
 path.write_text(source, encoding='utf-8')
 print(f'critical alerts block replaced: {old_lines} old lines -> {replacement.count(chr(10))} wiring lines')
+
+# Move white-box guards to the actual implementation owner. The guarantees stay
+# the same; only the obsolete assumption that implementation lives in main.py is removed.
+race_path = Path('tests/test_critical_alert_ack_race.py')
+race = race_path.read_text(encoding='utf-8')
+race = race.replace(
+    "assert 'update_json_transaction(CRITICAL_ALERTS_FILE' in src",
+    "assert 'deps.update_json_transaction(' in src\n        assert 'deps.critical_alerts_file()' in src",
+)
+race_path.write_text(race, encoding='utf-8')
+
+dedup_path = Path('tests/test_critical_alert_dedup.py')
+dedup = dedup_path.read_text(encoding='utf-8')
+old = '''        with patch.object(backend, '_ensure_critical_alert_chat') as mock_chat, \\
+             patch.object(backend, 'send_telegram_message') as mock_push:\n            backend._create_critical_alert(\n                target_user_id=OWNER_ID, kind='plan_overdue', title='t', ref_id='2026-09-22',\n            )\n            backend._create_critical_alert(\n                target_user_id=OWNER_ID, kind='plan_overdue', title='t', ref_id='2026-09-22',\n            )\n        self.assertEqual(mock_chat.call_count, 1)\n        self.assertEqual(mock_push.call_count, 1)\n'''
+new = '''        with patch.object(backend, '_load_chat', return_value=[]), \\
+             patch.object(backend, '_save_chat') as mock_chat_save, \\
+             patch.object(backend, 'send_telegram_message') as mock_push:\n            backend._create_critical_alert(\n                target_user_id=OWNER_ID, kind='plan_overdue', title='t', ref_id='2026-09-22',\n            )\n            backend._create_critical_alert(\n                target_user_id=OWNER_ID, kind='plan_overdue', title='t', ref_id='2026-09-22',\n            )\n        self.assertEqual(mock_chat_save.call_count, 1)\n        self.assertEqual(mock_push.call_count, 1)\n'''
+if dedup.count(old) != 1:
+    raise SystemExit('critical alert dedup test marker mismatch')
+dedup_path.write_text(dedup.replace(old, new), encoding='utf-8')
