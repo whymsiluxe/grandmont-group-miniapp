@@ -1,7 +1,6 @@
 """Regression coverage for current-profile display-name resolution."""
 import os
 import sys
-import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -9,6 +8,7 @@ os.environ.setdefault('BOT_TOKEN', 'ci-dummy')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 import main as backend  # noqa: E402
 from chat_domain_testkit import ChatDomainHarness  # noqa: E402
+from photo_feed_testkit import PhotoFeedHarness  # noqa: E402
 
 
 WORKER_ID = '10'
@@ -40,41 +40,24 @@ class ChatDisplayNameResolutionTests(unittest.TestCase):
 
 
 class FeedPostNameResolutionTests(unittest.TestCase):
-    def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self.tmp = self.tmpdir.name
-        self._orig_photo_dir = backend.PHOTO_DIR
-        backend.PHOTO_DIR = self.tmp
-        self._patchers = [
-            patch.object(backend, '_load_photo_reactions', return_value={}),
-            patch.object(backend, '_load_feed_saved', return_value={}),
-        ]
-        for p in self._patchers:
-            p.start()
-
-    def tearDown(self):
-        backend.PHOTO_DIR = self._orig_photo_dir
-        for p in self._patchers:
-            p.stop()
-        self.tmpdir.cleanup()
-
     def test_legacy_feed_post_with_id_as_name_resolves_on_read(self):
-        fname = 'test.jpg'
-        with open(os.path.join(self.tmp, fname), 'wb') as f:
-            f.write(b'fake')
-        with patch.object(backend, '_load_photo_meta', return_value=[{
-            'id': 'p1', 'user_id': WORKER_ID, 'name': WORKER_ID,
-            'files': [fname], 'ts': 1000, 'object_id': 'OBJ-1', 'caption': '',
-        }]), patch.object(backend, '_load_worker_profiles', return_value={WORKER_ID: {'name': 'Лох'}}):
-            result = backend.list_feed_photos(user=OWNER)
-        self.assertEqual(result['photos'][0]['name'], 'Лох')
+        harness = PhotoFeedHarness(worker_profiles={WORKER_ID: {'name': 'Лох'}})
+        try:
+            harness.create_photo_file('test.jpg', b'fake')
+            harness.metadata = [{
+                'id': 'p1', 'user_id': WORKER_ID, 'name': WORKER_ID,
+                'files': ['test.jpg'], 'ts': 1000, 'object_id': 'OBJ-1', 'caption': '',
+            }]
+            result = harness.handlers.list_feed_photos(user=OWNER)
+            self.assertEqual(result['photos'][0]['name'], 'Лох')
+        finally:
+            harness.close()
 
 
 class FeedCommentNameResolutionTests(unittest.TestCase):
     """Past comments must resolve against the current profile name on read."""
 
     def test_news_comment_with_legacy_id_as_name_resolves_on_read(self):
-        # Seed the real isolated store so this test survives implementation moves.
         original = backend._safe_load_json(backend.NEWS_COMMENTS_FILE, {})
         try:
             backend._atomic_write_json(backend.NEWS_COMMENTS_FILE, {
@@ -90,12 +73,19 @@ class FeedCommentNameResolutionTests(unittest.TestCase):
             backend._atomic_write_json(backend.NEWS_COMMENTS_FILE, original)
 
     def test_feed_photo_comment_with_legacy_id_as_name_resolves_on_read(self):
-        with patch.object(backend, '_load_photo_meta', return_value=[{
-            'id': 'p1', 'user_id': WORKER_ID,
-            'comments': [{'id': 'c1', 'user_id': WORKER_ID, 'name': WORKER_ID, 'text': 'hi', 'at': '2026-01-01T00:00:00'}],
-        }]), patch.object(backend, '_load_worker_profiles', return_value={WORKER_ID: {'name': 'Марат'}}):
-            result = backend.get_feed_photo_comments('p1', user=OWNER)
-        self.assertEqual(result['comments'][0]['name'], 'Марат')
+        harness = PhotoFeedHarness(worker_profiles={WORKER_ID: {'name': 'Марат'}})
+        try:
+            harness.metadata = [{
+                'id': 'p1', 'user_id': WORKER_ID,
+                'comments': [{
+                    'id': 'c1', 'user_id': WORKER_ID, 'name': WORKER_ID,
+                    'text': 'hi', 'at': '2026-01-01T00:00:00',
+                }],
+            }]
+            result = harness.handlers.get_feed_photo_comments('p1', user=OWNER)
+            self.assertEqual(result['comments'][0]['name'], 'Марат')
+        finally:
+            harness.close()
 
 
 if __name__ == '__main__':
