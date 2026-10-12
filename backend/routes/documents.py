@@ -38,6 +38,25 @@ class DocumentsHandlers:
     get_object_document_file: Callable[..., Any]
 
 
+def _contained_document_path(base_dir: str, file_name: str) -> str | None:
+    """Return a path inside ``base_dir`` or ``None`` for unsafe legacy metadata.
+
+    Uploaded document names are server-generated basenames.  Older/corrupt JSON
+    metadata is nevertheless treated as untrusted so serving/deletion can never
+    escape the document directory via ``..`` or an absolute path.
+    """
+    if not file_name or os.path.basename(file_name) != file_name:
+        return None
+    base_real = os.path.realpath(base_dir)
+    candidate = os.path.realpath(os.path.join(base_real, file_name))
+    try:
+        if os.path.commonpath([base_real, candidate]) != base_real:
+            return None
+    except ValueError:
+        return None
+    return candidate
+
+
 def create_documents_router(deps: DocumentsRouteDeps) -> tuple[APIRouter, DocumentsHandlers]:
     router = APIRouter()
 
@@ -73,7 +92,10 @@ def create_documents_router(deps: DocumentsRouteDeps) -> tuple[APIRouter, Docume
         content_type = detected
         ext = ".pdf" if detected == "application/pdf" else "." + deps.allowed_image_mime_ext[detected]
         fname = f"{uuid.uuid4().hex}{ext}"
-        with open(os.path.join(deps.object_doc_dir(), fname), "wb") as output:
+        file_path = _contained_document_path(deps.object_doc_dir(), fname)
+        if file_path is None:  # defensive: server-generated fname should always pass
+            raise HTTPException(500, "Некорректный путь документа")
+        with open(file_path, "wb") as output:
             output.write(data_bytes)
 
         doc = {
@@ -90,7 +112,17 @@ def create_documents_router(deps: DocumentsRouteDeps) -> tuple[APIRouter, Docume
             entry["documents"].append(doc)
             return doc
 
-        deps.update_json_transaction(deps.store.file_path(), {}, _mutator)
+        try:
+            deps.update_json_transaction(deps.store.file_path(), {}, _mutator)
+        except Exception:
+            # The binary is written first so metadata never references a missing
+            # file.  If metadata persistence fails, roll the fresh binary back.
+            try:
+                os.remove(file_path)
+            except FileNotFoundError:
+                pass
+            raise
+
         deps.append_object_history_best_effort(
             object_id,
             "document_uploaded",
@@ -139,9 +171,10 @@ def create_documents_router(deps: DocumentsRouteDeps) -> tuple[APIRouter, Docume
             return doc
 
         doc = deps.update_json_transaction(deps.store.file_path(), {}, _mutator)
-        file_name = doc.get("file", "")
-        file_path = os.path.join(deps.object_doc_dir(), file_name)
-        if file_name and os.path.exists(file_path):
+        file_path = _contained_document_path(deps.object_doc_dir(), str(doc.get("file") or ""))
+        # Unsafe/corrupt legacy metadata is removed from JSON but is never allowed
+        # to make deletion touch a path outside OBJECT_DOC_DIR.
+        if file_path and os.path.exists(file_path):
             os.remove(file_path)
         return {"status": "ok"}
 
@@ -165,8 +198,8 @@ def create_documents_router(deps: DocumentsRouteDeps) -> tuple[APIRouter, Docume
         )
         if not doc:
             raise HTTPException(404, "Файл не найден")
-        path = os.path.join(deps.object_doc_dir(), fname)
-        if not os.path.exists(path):
+        path = _contained_document_path(deps.object_doc_dir(), fname)
+        if path is None or not os.path.exists(path):
             raise HTTPException(404, "Файл не найден")
         return FileResponse(path, media_type=doc.get("content_type") or None)
 

@@ -1,10 +1,6 @@
-"""Regression tests for the owner-reported Documents-500.
-
-Malformed document records must never break valid siblings.  These tests use the
-real temporary JSON store and filesystem path instead of monkey-patching helpers
-that used to live in ``main.py``; that keeps the regression contract independent
-of the implementation module while exercising more of the production path.
-"""
+"""Regression tests for object-document storage resilience and containment."""
+import asyncio
+import io
 import os
 import sys
 import tempfile
@@ -12,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
@@ -53,7 +49,6 @@ class DocumentsResilienceTests(unittest.TestCase):
         self.assertEqual(result['documents'][0]['id'], 'd1')
 
     def test_get_documents_handles_malformed_entry_shape(self):
-        """object_info.json['OBJ-1'] itself may be a corrupt legacy non-dict."""
         info = {'OBJ-1': ['not', 'a', 'dict']}
         result = self._with_store(
             info,
@@ -115,6 +110,66 @@ class DocumentsResilienceTests(unittest.TestCase):
             self.assertEqual(persisted['OBJ-1']['documents'], ['garbage'])
 
         self._with_store(info, _delete, files={'real.pdf': b'%PDF-test'})
+
+    def test_upload_removes_fresh_binary_when_metadata_transaction_fails(self):
+        info = {'OBJ-1': {'documents': [], 'items': [], 'description': ''}}
+
+        def _upload(doc_dir):
+            upload = UploadFile(filename='safety.pdf', file=io.BytesIO(b'%PDF-1.4\n'))
+            with patch.object(backend, 'sniff_image_or_pdf', return_value='application/pdf'), \
+                 patch.object(backend, 'update_json_transaction', side_effect=RuntimeError('disk full')):
+                with self.assertRaisesRegex(RuntimeError, 'disk full'):
+                    asyncio.run(
+                        backend.upload_object_document(
+                            'OBJ-1', upload, user=USER, _=None
+                        )
+                    )
+            self.assertEqual(os.listdir(doc_dir), [])
+
+        self._with_store(info, _upload)
+
+    def test_serve_rejects_legacy_path_traversal_metadata(self):
+        info = {
+            'OBJ-1': {
+                'documents': [
+                    {'id': 'd1', 'file': '../outside.pdf', 'name': 'unsafe'}
+                ]
+            }
+        }
+
+        def _read(doc_dir):
+            outside = os.path.join(os.path.dirname(doc_dir), 'outside.pdf')
+            with open(outside, 'wb') as handle:
+                handle.write(b'%PDF-outside')
+            with pytest.raises(HTTPException) as exc_info:
+                backend.get_object_document_file(
+                    'OBJ-1', '../outside.pdf', user=USER, _=None
+                )
+            self.assertEqual(exc_info.value.status_code, 404)
+            self.assertTrue(os.path.exists(outside))
+
+        self._with_store(info, _read)
+
+    def test_delete_never_unlinks_path_outside_document_directory(self):
+        info = {
+            'OBJ-1': {
+                'documents': [
+                    {'id': 'd1', 'file': '../outside.pdf', 'name': 'unsafe'}
+                ]
+            }
+        }
+
+        def _delete(doc_dir):
+            outside = os.path.join(os.path.dirname(doc_dir), 'outside.pdf')
+            with open(outside, 'wb') as handle:
+                handle.write(b'%PDF-outside')
+            result = backend.delete_object_document('OBJ-1', 'd1', user=USER, _=None)
+            self.assertEqual(result, {'status': 'ok'})
+            self.assertTrue(os.path.exists(outside))
+            persisted = backend._load_object_info()
+            self.assertEqual(persisted['OBJ-1']['documents'], [])
+
+        self._with_store(info, _delete)
 
 
 if __name__ == '__main__':

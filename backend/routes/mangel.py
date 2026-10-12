@@ -136,6 +136,7 @@ def create_mangel_router(deps: MangelRouteDeps) -> tuple[APIRouter, MangelHandle
             raise HTTPException(400, "Описание обязательно")
 
         photo_paths: list[str] = []
+        written_photo_paths: list[str] = []
         if file and file.filename:
             raw = await file.read()
             if len(raw) > 8 * 1024 * 1024:
@@ -146,18 +147,31 @@ def create_mangel_router(deps: MangelRouteDeps) -> tuple[APIRouter, MangelHandle
             ext = deps.allowed_image_mime_ext[detected]
             photo_id = uuid.uuid4().hex
             filename = f"mangel_{photo_id}.{ext}"
-            with open(os.path.join(deps.mangel_photo_dir(), filename), "wb") as output:
+            photo_path = os.path.join(deps.mangel_photo_dir(), filename)
+            with open(photo_path, "wb") as output:
                 output.write(raw)
             photo_paths.append(filename)
+            written_photo_paths.append(photo_path)
 
         mangel_lib = deps.load_mangel_lib()
-        ticket = mangel_lib.create_ticket(
-            object_id=object_id.strip()[:100],
-            description=description.strip()[:500],
-            created_by=str(user["id"]),
-            photo_paths=photo_paths,
-            assigned_worker_id=assigned_worker_id.strip() if role == "owner" else "",
-        )
+        try:
+            ticket = mangel_lib.create_ticket(
+                object_id=object_id.strip()[:100],
+                description=description.strip()[:500],
+                created_by=str(user["id"]),
+                photo_paths=photo_paths,
+                assigned_worker_id=assigned_worker_id.strip() if role == "owner" else "",
+            )
+        except Exception:
+            # Ticket JSON is the source of truth. If persistence fails after the
+            # binary write, remove only photos created by this request so no orphan
+            # files accumulate in the upload directory.
+            for photo_path in written_photo_paths:
+                try:
+                    os.remove(photo_path)
+                except FileNotFoundError:
+                    pass
+            raise
 
         # Google Sheets is a best-effort viewing mirror; JSON remains the source
         # of truth and a mirror outage must not fail defect creation.
