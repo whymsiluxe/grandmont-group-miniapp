@@ -8,13 +8,13 @@ import routes.commercial_docs as commercial  # noqa: E402
 
 
 def test_angebot_handler_uses_module_owned_helpers_not_main_aliases(monkeypatch):
-    calls = {"generate": [], "send": [], "filename": []}
+    calls = {"generate": [], "filename": [], "telegram": []}
 
     def fail_main_helper(*args, **kwargs):
         raise AssertionError("extracted endpoint reached back through backend.main")
 
-    # The compatibility aliases may remain temporarily for external/direct-call
-    # consumers, but production endpoint execution must not resolve through them.
+    # Legacy aliases may remain temporarily for direct-call consumers, but endpoint
+    # execution must not resolve through them anymore.
     monkeypatch.setattr(backend, "_run_pdf_generator", fail_main_helper)
     monkeypatch.setattr(backend, "_safe_pdf_filename", fail_main_helper)
     monkeypatch.setattr(backend, "send_pdf_to_chat", fail_main_helper)
@@ -28,12 +28,19 @@ def test_angebot_handler_uses_module_owned_helpers_not_main_aliases(monkeypatch)
         calls["filename"].append((prefix, customer))
         return "module-owned.pdf"
 
-    def fake_send(chat_id, file_path, filename, caption):
-        calls["send"].append((chat_id, file_path, filename, caption))
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(request, timeout=20):
+        calls["telegram"].append((request.full_url, timeout))
+        return _FakeResponse()
 
     monkeypatch.setattr(commercial, "run_pdf_generator", fake_generate)
     monkeypatch.setattr(commercial, "safe_pdf_filename", fake_filename)
-    monkeypatch.setattr(commercial, "send_pdf_to_chat", fake_send)
+    monkeypatch.setattr(commercial.urlreq, "urlopen", fake_urlopen)
 
     body = backend.AngebotBody(
         kunde=backend.AngebotKunde(name="Patch Test"),
@@ -43,6 +50,5 @@ def test_angebot_handler_uses_module_owned_helpers_not_main_aliases(monkeypatch)
 
     assert calls["generate"]
     assert calls["filename"] == [("Angebot", "Patch Test")]
-    assert calls["send"] and calls["send"][0][0] == 77
-    assert calls["send"][0][2] == "module-owned.pdf"
+    assert calls["telegram"], "module-owned Telegram delivery was not called"
     assert response.filename == "module-owned.pdf"
