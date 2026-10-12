@@ -10,7 +10,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -184,7 +184,7 @@ def create_mangel_router(deps: MangelRouteDeps) -> tuple[APIRouter, MangelHandle
                     ticket.get("object_id", ""),
                     ticket.get("description", ""),
                     ticket.get("status", ""),
-                    datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
                 ],
             )
         except Exception as exc:

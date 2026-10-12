@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -243,7 +243,7 @@ def create_photo_feed_router(deps: PhotoFeedRouteDeps) -> tuple[APIRouter, Photo
                 'name': actor_name,
                 'text': text,
                 'reply_to': body.reply_to or None,
-                'at': datetime.utcnow().isoformat(),
+                'at': datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             })
             save_photo_meta(items)
         try:
