@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 import main as backend  # noqa: E402
+from conftest import iter_app_routes  # noqa: E402
 
 
 EXPECTED = {
@@ -22,24 +23,8 @@ EXPECTED = {
 }
 
 
-def _flatten_routes(router):
-    """Flatten FastAPI 0.139 included-router wrappers recursively."""
-    seen = set()
-
-    def walk(routes):
-        for route in routes:
-            nested = getattr(route, 'routes', None)
-            if nested is not None and id(route) not in seen:
-                seen.add(id(route))
-                yield from walk(nested)
-            if getattr(route, 'path', None) and getattr(route, 'methods', None):
-                yield route
-
-    return list(walk(router.routes))
-
-
 def test_chat_core_routes_registered_once_and_owned_by_extracted_module():
-    routes = _flatten_routes(backend.app.router)
+    routes = list(iter_app_routes(backend.app))
     for (method, path), expected_name in EXPECTED.items():
         matches = [r for r in routes if r.path == path and method in r.methods]
         assert len(matches) == 1, f'{method} {path}: expected one route, got {len(matches)}'
