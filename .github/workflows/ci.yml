@@ -28,6 +28,9 @@ jobs:
       - name: Install test dependencies
         run: pip install -r requirements-test.txt
 
+      - name: Ruff correctness check (extracted backend modules)
+        run: ruff check backend/core backend/routes --select F --output-format concise
+
       - name: Python syntax check (backend/*.py, backend/core/*.py, backend/routes/*.py, tests/*.py)
         run: |
           python -m py_compile backend/*.py backend/core/*.py backend/routes/*.py tests/*.py
