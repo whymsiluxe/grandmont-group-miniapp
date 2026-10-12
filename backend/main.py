@@ -6097,201 +6097,62 @@ def update_task_status(task_id: str, body: TaskStatusBody, user: dict = Depends(
 
 
 # ---------- Mängelmanagement — Фаза 3 ----------
-# 30.07 (Release-аудит P1): было `import mangel_lib as ml` -- обычный import
-# зависит от глобального sys.path (см. _load_repo_mangel_lib выше). Изолированная
-# загрузка по точному пути, ml остаётся module-level именем как раньше -- все
-# вызовы ml.xxx() ниже по файлу не меняются.
+# ---------- Mangel / defects domain ----------
+# The full defects HTTP/orchestration flow lives in routes/mangel.py. main.py is
+# only the composition root and retains aliases for existing direct-call callers.
+# Keep the canonical repo-backed module object for backwards compatibility with
+# tests/internal code that patch backend.ml directly during the migration.
 ml = _load_repo_mangel_lib()
 
-# moved to core/paths.py -- MANGEL_PHOTO_DIR
-
-
-class MangelStatusBody(BaseModel):
-    status: str
-
-
-class MangelCommentBody(BaseModel):
-    text: str
-
-
-def require_mangel_access(ticket_id: str, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """28.07: owner request -- любой воркер видит/комментирует дефект любого объекта,
-    не только назначенный. Резолвит только существование тикета, не access-проверку."""
-    try:
-        ml.get_ticket(ticket_id)
-    except KeyError as e:
-        raise HTTPException(404, str(e))
-
-
-def _enrich_mangel_tickets_with_author(tickets: list) -> list:
-    # 28.07: owner request -- "фиксация кто добавил дефект" уже была на бэкенде
-    # (created_by в mangel_lib), но фронтенд её не показывал -- не было имени,
-    # только сырой user_id. Резолвим здесь, а не в mangel_lib.py (тот файл живёт
-    # вне git-репо, прямые prod-правки там рискованны -- см. HANDOFF).
-    profiles = _load_worker_profiles()
-    for t in tickets:
-        created_by = t.get('created_by')
-        if created_by:
-            t['created_by_name'] = _sanitize_display_name(profiles.get(str(created_by), {}).get('name'), str(created_by))
-        # 04.08 (Раунд 3, задача 3.1/4): резолвим имя ответственного (назначенного)
-        # работника, чтобы UI показывал "Ответственный: Иван", а не сырой user_id.
-        assigned = t.get('assigned_worker_id')
-        if assigned:
-            t['assigned_worker_name'] = _sanitize_display_name(profiles.get(str(assigned), {}).get('name'), str(assigned))
-    return tickets
-
-
-@app.get("/api/mangel")
-def get_mangel_list(object_id: str = '', user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    # 28.07: owner request -- любой воркер видит дефекты любого объекта, не только
-    # назначенного. Раньше worker без object_id получал только дефекты своих объектов.
-    tickets = _enrich_mangel_tickets_with_author(ml.list_tickets(object_id or None))
-    return {"tickets": tickets, "total": len(tickets)}
-
-
-@app.get("/api/mangel/counts")
-def get_mangel_counts(user: dict = Depends(get_current_user)):
-    return ml.count_by_status()
-
-
-@app.get("/api/mangel/{ticket_id}")
-def get_mangel_ticket(ticket_id: str, user: dict = Depends(get_current_user), _: None = Depends(require_mangel_access)):
-    try:
-        return _enrich_mangel_tickets_with_author([ml.get_ticket(ticket_id)])[0]
-    except KeyError as e:
-        raise HTTPException(404, str(e))
-
-
-@app.post("/api/mangel")
-async def create_mangel_ticket(
-    object_id: str = Form(''),
-    description: str = Form(''),
-    assigned_worker_id: str = Form(''),
-    file: UploadFile = File(None),
-    user: dict = Depends(get_current_user),
-    role: str = Depends(get_role),
-):
-    # 28.07: owner request -- любой воркер может добавить дефект на любом объекте.
-    if not description.strip():
-        raise HTTPException(400, "Описание обязательно")
-
-    photo_paths: list = []
-    if file and file.filename:
-        raw = await file.read()
-        if len(raw) > 8 * 1024 * 1024:
-            raise HTTPException(400, "Фото слишком большое (макс. 8 МБ)")
-        detected = sniff_image(raw)
-        if not detected:
-            raise HTTPException(400, "Файл должен быть изображением")
-        ext = _ALLOWED_IMAGE_MIME_EXT[detected]
-        photo_id = __import__('uuid').uuid4().hex
-        fname = f"mangel_{photo_id}.{ext}"
-        with open(os.path.join(MANGEL_PHOTO_DIR, fname), 'wb') as f_out:
-            f_out.write(raw)
-        photo_paths.append(fname)
-
-    ticket = ml.create_ticket(
-        object_id=object_id.strip()[:100],
-        description=description.strip()[:500],
-        created_by=str(user['id']),
-        photo_paths=photo_paths,
-        assigned_worker_id=assigned_worker_id.strip() if role == 'owner' else '',
+if __package__:
+    from .routes.mangel import (
+        MangelCommentBody,
+        MangelRouteDeps,
+        MangelStatusBody,
+        create_mangel_router,
     )
-    # 22.07: зеркало в Google Sheets (лист "Дефекты") — юзер хочет видеть дефекты в таблице,
-    # так же как объекты. JSON остаётся источником правды приложения, Sheets — только для просмотра;
-    # сбой записи в Sheets НЕ должен ронять создание тикета (как и остальные Sheets-интеграции).
-    try:
-        o = _load_repo_objekte_lib()
-        o.append_row_safe('Дефекты', [
-            ticket.get('id', ''),
-            ticket.get('object_id', ''),
-            ticket.get('description', ''),
-            ticket.get('status', ''),
-            datetime.utcnow().strftime('%Y-%m-%d %H:%M'),
-        ])
-    except Exception as e:
-        print(f'WARNING: mangel-create Sheets mirror failed for ticket {ticket.get("id")}: {e}')
-    _append_object_history_best_effort(
-        ticket.get('object_id', ''), 'defect_created', 'Создан дефект',
-        user=user, subtitle=ticket.get('description', ''),
-        meta={
-            "ticket_id": ticket.get('id', ''),
-            "assigned_worker_id": ticket.get('assigned_worker_id', ''),
-            "photo_count": len(ticket.get('photo_paths') or []),
-        },
+else:
+    from routes.mangel import (  # noqa: E402
+        MangelCommentBody,
+        MangelRouteDeps,
+        MangelStatusBody,
+        create_mangel_router,
     )
-    return ticket
 
+_mangel_router, _mangel_handlers = create_mangel_router(
+    MangelRouteDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        require_owner=require_owner,
+        load_mangel_lib=lambda: ml,
+        load_objekte_lib=lambda: _load_repo_objekte_lib(),
+        load_worker_profiles=lambda: _load_worker_profiles(),
+        sanitize_display_name=lambda value, fallback: _sanitize_display_name(value, fallback),
+        sniff_image=lambda raw: sniff_image(raw),
+        allowed_image_mime_ext=_ALLOWED_IMAGE_MIME_EXT,
+        mangel_photo_dir=lambda: MANGEL_PHOTO_DIR,
+        photo_dir=lambda: PHOTO_DIR,
+        can_access_object=lambda user, role, object_id: can_access_object(user, role, object_id),
+        append_object_history_best_effort=lambda *args, **kwargs: _append_object_history_best_effort(
+            *args, **kwargs
+        ),
+    )
+)
+app.include_router(_mangel_router)
 
-@app.get("/api/mangel/photos/{fname}/file")
-def get_mangel_photo_file(fname: str, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    # Mängel-фото хранятся в той же feed_photos/, но без записи в feed_photos.json —
-    # отдаём по basename имени файла (не по id, как feed), с защитой от path traversal.
-    safe_name = os.path.basename(fname)
-    if safe_name != fname or not safe_name.startswith('mangel_'):
-        raise HTTPException(404, "Файл отсутствует")
-    if role != 'owner':
-        owning_ticket = next((t for t in ml.list_tickets(None) if safe_name in t.get('photo_paths', [])), None)
-        if not owning_ticket or not can_access_object(user, role, owning_ticket.get('object_id', '')):
-            raise HTTPException(403, "Нет доступа к этому файлу")
-    path = os.path.join(PHOTO_DIR, safe_name)
-    if not os.path.exists(path):
-        raise HTTPException(404, "Файл отсутствует")
-    return FileResponse(path)
-
-
-@app.patch("/api/mangel/{ticket_id}/status")
-def update_mangel_status(ticket_id: str, body: MangelStatusBody, user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    try:
-        result = ml.update_status(ticket_id, body.status)
-    except KeyError as e:
-        raise HTTPException(404, str(e))
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    # 22.07: зеркалим смену статуса в Sheets тоже (та же best-effort защита, не роняем запрос)
-    try:
-        o = _load_repo_objekte_lib()
-        rows = o.get_used_range('Дефекты')
-        if rows:
-            for i, row in enumerate(rows[1:], start=2):
-                if row and row[0] == ticket_id:
-                    o.update_range(f'Дефекты!D{i}:D{i}', [[body.status]])
-                    break
-    except Exception as e:
-        print(f'WARNING: mangel-status Sheets mirror failed for ticket {ticket_id}: {e}')
-    return result
-
-
-@app.post("/api/mangel/{ticket_id}/comments")
-def add_mangel_comment(ticket_id: str, body: MangelCommentBody, user: dict = Depends(get_current_user), _: None = Depends(require_mangel_access)):
-    if not body.text.strip():
-        raise HTTPException(400, "Текст комментария обязателен")
-    try:
-        return ml.add_comment(ticket_id, str(user['id']), body.text.strip()[:500],
-                               name=user.get('first_name', str(user['id'])))
-    except KeyError as e:
-        raise HTTPException(404, str(e))
-
-
-@app.delete("/api/mangel/{ticket_id}")
-def delete_mangel_ticket(ticket_id: str, user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    # 04.08 (Раунд 3, задача 3.3): Owner-only мягкое удаление дефекта. Тикет
-    # исчезает из рабочих списков (list/get фильтруют deleted_at), но остаётся
-    # на диске с меткой -- фото/чат/audit не трогаем. Идемпотентно.
-    try:
-        ml.soft_delete_ticket(ticket_id, str(user['id']))
-    except KeyError as e:
-        raise HTTPException(404, str(e))
-    return {"ok": True, "id": ticket_id}
-
-
-@app.get("/api/mangel/{ticket_id}/comments")
-def get_mangel_comments(ticket_id: str, user: dict = Depends(get_current_user), _: None = Depends(require_mangel_access)):
-    try:
-        ticket = ml.get_ticket(ticket_id)
-        return {"comments": ticket.get('comments', [])}
-    except KeyError as e:
-        raise HTTPException(404, str(e))
+# Temporary compatibility surface. These are references to the extracted
+# implementation; no Mangel business logic remains in main.py.
+require_mangel_access = _mangel_handlers.require_mangel_access
+_enrich_mangel_tickets_with_author = _mangel_handlers.enrich_mangel_tickets_with_author
+get_mangel_list = _mangel_handlers.get_mangel_list
+get_mangel_counts = _mangel_handlers.get_mangel_counts
+get_mangel_ticket = _mangel_handlers.get_mangel_ticket
+create_mangel_ticket = _mangel_handlers.create_mangel_ticket
+get_mangel_photo_file = _mangel_handlers.get_mangel_photo_file
+update_mangel_status = _mangel_handlers.update_mangel_status
+add_mangel_comment = _mangel_handlers.add_mangel_comment
+delete_mangel_ticket = _mangel_handlers.delete_mangel_ticket
+get_mangel_comments = _mangel_handlers.get_mangel_comments
 
 
 # ---------- Фотоотчёт старт/финиш смены — Фаза 4a ----------
