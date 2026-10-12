@@ -1,92 +1,77 @@
 import os
 import sys
 import unittest
-from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
+sys.path.insert(0, os.path.dirname(__file__))
 
 from fastapi import HTTPException  # noqa: E402
 import main as backend  # noqa: E402
 from conftest import iter_app_routes  # noqa: E402
-import core.permissions as permissions  # noqa: E402
+from routes.chat_actions import BroadcastBody  # noqa: E402
+from chat_domain_testkit import ChatDomainHarness  # noqa: E402
 
 
 OWNER = {'id': '1', 'first_name': 'Борис'}
 
 
 class ManagerBroadcastTests(unittest.TestCase):
+    def setUp(self):
+        self.h = ChatDomainHarness()
+
+    def tearDown(self):
+        self.h.close()
+
     def test_company_broadcast_appends_group_chat_message(self):
-        saved = {}
-
-        def fake_save(messages):
-            saved['messages'] = messages
-
-        with patch.object(backend, '_load_chat', return_value=[]), \
-             patch.object(backend, '_save_chat', side_effect=fake_save), \
-             patch.object(backend, '_load_roles', return_value={'1': 'owner', '10': 'worker'}):
-            result = backend.send_manager_broadcast(
-                backend.BroadcastBody(scope='company', text='Завтра общий сбор в 8:00'),
-                user=OWNER, _=None,
-            )
-
+        result = self.h.actions.send_manager_broadcast(
+            BroadcastBody(scope='company', text='Завтра общий сбор в 8:00'),
+            user=OWNER, _=None,
+        )
         self.assertEqual(result['status'], 'ok')
         self.assertEqual(result['thread_key'], 'group')
-        self.assertEqual(result['audience_count'], 2)
-        self.assertEqual(len(saved['messages']), 1)
-        msg = saved['messages'][0]
+        self.assertEqual(result['audience_count'], 4)
+        self.assertEqual(len(self.h.messages), 1)
+        msg = self.h.messages[0]
         self.assertIsNone(msg['thread_key'])
         self.assertIsNone(msg['to_user_id'])
         self.assertEqual(msg['text'], 'Завтра общий сбор в 8:00')
         self.assertEqual(msg['broadcast']['scope'], 'company')
 
     def test_object_broadcast_appends_object_chat_and_history(self):
-        saved = {}
-
-        def fake_save(messages):
-            saved['messages'] = messages
-
-        with patch.object(backend, '_load_chat', return_value=[]), \
-             patch.object(backend, '_save_chat', side_effect=fake_save), \
-             patch.object(backend, '_find_object_row_by_id', return_value={'ID объекта': 'OBJ-1', 'Объект': 'Мюллер'}), \
-             patch.object(backend, '_object_chat_participants', return_value=['1', '10', '20']), \
-             patch.object(backend, '_append_object_history_best_effort') as history_mock:
-            result = backend.send_manager_broadcast(
-                backend.BroadcastBody(scope='object', object_id='OBJ-1', text='Берём лазер и защиту пола'),
-                user=OWNER, _=None,
-            )
-
+        self.h.objects['OBJ-1'] = {'ID объекта': 'OBJ-1', 'Объект': 'Мюллер'}
+        self.h.grant_object('OBJ-1', '10', '20')
+        result = self.h.actions.send_manager_broadcast(
+            BroadcastBody(scope='object', object_id='OBJ-1', text='Берём лазер и защиту пола'),
+            user=OWNER, _=None,
+        )
         self.assertEqual(result['thread_key'], 'obj:OBJ-1')
         self.assertEqual(result['audience_count'], 3)
-        msg = saved['messages'][0]
+        msg = self.h.messages[0]
         self.assertEqual(msg['thread_key'], 'obj:OBJ-1')
         self.assertEqual(msg['broadcast']['object_name'], 'Мюллер')
-        history_mock.assert_called_once()
-        args, kwargs = history_mock.call_args
+        self.assertEqual(len(self.h.history), 1)
+        args, kwargs = self.h.history[0]
         self.assertEqual(args[:3], ('OBJ-1', 'broadcast_sent', 'Объявление отправлено'))
         self.assertIn('Берём лазер', kwargs['subtitle'])
         self.assertEqual(kwargs['meta']['message_id'], msg['id'])
 
     def test_object_broadcast_requires_existing_object(self):
-        with patch.object(backend, '_find_object_row_by_id', return_value=None):
-            with self.assertRaises(HTTPException) as ctx:
-                backend.send_manager_broadcast(
-                    backend.BroadcastBody(scope='object', object_id='MISSING', text='Текст'),
-                    user=OWNER, _=None,
-                )
+        with self.assertRaises(HTTPException) as ctx:
+            self.h.actions.send_manager_broadcast(
+                BroadcastBody(scope='object', object_id='MISSING', text='Текст'),
+                user=OWNER, _=None,
+            )
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_broadcast_validates_scope_and_text(self):
         with self.assertRaises(HTTPException) as ctx:
-            backend.send_manager_broadcast(
-                backend.BroadcastBody(scope='team', text='Привет'),
-                user=OWNER, _=None,
+            self.h.actions.send_manager_broadcast(
+                BroadcastBody(scope='team', text='Привет'), user=OWNER, _=None,
             )
         self.assertEqual(ctx.exception.status_code, 400)
-
         with self.assertRaises(HTTPException) as empty_ctx:
-            backend.send_manager_broadcast(
-                backend.BroadcastBody(scope='company', text='   '),
-                user=OWNER, _=None,
+            self.h.actions.send_manager_broadcast(
+                BroadcastBody(scope='company', text='   '), user=OWNER, _=None,
             )
         self.assertEqual(empty_ctx.exception.status_code, 400)
 
