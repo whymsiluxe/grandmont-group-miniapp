@@ -2518,326 +2518,74 @@ def dismiss_alerts(body: AlertDismissBody, user: dict = Depends(get_current_user
     return {"ok": True}
 
 
-@app.get("/api/tools")
-def list_tools(user: dict = Depends(get_current_user)):
-    tl = _load_repo_tools_lib()
-    try:
-        return {"tools": tl.list_tools()}
-    except Exception as e:
-        # Инструменты живут в отдельной Google Sheet. Если лист/диапазон временно
-        # недоступен, это не должно ронять bootstrap всего miniapp и показывать
-        # глобальный баннер поверх других вкладок.
-        print(f"[tools] list_tools unavailable: {type(e).__name__}: {e}")
-        return {"tools": [], "warning": "tools_unavailable"}
 
+# ---------- Tools domain ----------
+# The tools HTTP/business flow lives in routes/tools.py. Dependencies are injected
+# here so the route module does not import main.py and therefore cannot form a
+# circular dependency. Public names are temporarily re-exported for existing tests
+# and callers while the monolith is decomposed incrementally.
+if __package__:
+    from .routes.tools import (
+        CheckoutBody,
+        NewToolBody,
+        ToolBookingBody,
+        ToolUpdateBody,
+        ToolsRouteDeps,
+        create_tools_router,
+        holder_name_from_user as _holder_name_from_user,
+        lock_for_tool as _lock_for_tool,
+        parse_tool_booking_date as _parse_tool_booking_date,
+        tool_booking_default_store as _tool_booking_default_store,
+        tool_booking_overlaps as _tool_booking_overlaps,
+    )
+else:
+    from routes.tools import (  # noqa: E402
+        CheckoutBody,
+        NewToolBody,
+        ToolBookingBody,
+        ToolUpdateBody,
+        ToolsRouteDeps,
+        create_tools_router,
+        holder_name_from_user as _holder_name_from_user,
+        lock_for_tool as _lock_for_tool,
+        parse_tool_booking_date as _parse_tool_booking_date,
+        tool_booking_default_store as _tool_booking_default_store,
+        tool_booking_overlaps as _tool_booking_overlaps,
+    )
 
-@app.get("/api/tools/{serial}/history")
-def tool_history(serial: str, user: dict = Depends(get_current_user)):
-    tl = _load_repo_tools_lib()
-    return {"history": tl.tool_history(serial)}
+_tools_router, _tools_handlers = create_tools_router(
+    ToolsRouteDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        require_owner=require_owner,
+        # Keep these lookups dynamic: tests intentionally monkey-patch the loader
+        # and TOOL_BOOKINGS_FILE, and production may override data paths at runtime.
+        load_tools_lib=lambda: _load_repo_tools_lib(),
+        load_worker_profiles=lambda: _load_worker_profiles(),
+        sanitize_display_name=lambda value, fallback: _sanitize_display_name(value, fallback),
+        business_today=lambda: business_today(),
+        business_today_str=lambda: business_today_str(),
+        safe_load_json=lambda path, default: _safe_load_json(path, default),
+        update_json_transaction=lambda path, default_factory, mutator: update_json_transaction(
+            path, default_factory, mutator
+        ),
+        tool_bookings_file=lambda: TOOL_BOOKINGS_FILE,
+    )
+)
+app.include_router(_tools_router)
 
-
-class ToolBookingBody(BaseModel):
-    date_from: str
-    date_to: str
-    object_name: str
-    holder_id: str = ''
-    holder: str = ''
-    note: str = ''
-
-
-def _parse_tool_booking_date(value: str, field_name: str):
-    raw = (value or '').strip()
-    try:
-        return datetime.strptime(raw, '%Y-%m-%d').date()
-    except ValueError:
-        raise HTTPException(400, f"{field_name} должен быть YYYY-MM-DD")
-
-
-def _tool_booking_default_store():
-    return {"bookings": []}
-
-
-def _tool_booking_overlaps(a_from: str, a_to: str, b_from: str, b_to: str) -> bool:
-    return bool(a_from and a_to and b_from and b_to and a_from <= b_to and b_from <= a_to)
-
-
-def _tool_booking_holder(body: ToolBookingBody, user: dict, role: str) -> tuple[str, str]:
-    if role != 'owner':
-        return str(user['id']), _holder_name_from_user(user)
-    holder_id = (body.holder_id or '').strip()
-    if holder_id:
-        profiles = _load_worker_profiles()
-        holder_name = _sanitize_display_name(profiles.get(holder_id, {}).get('name'), holder_id)
-        return holder_id, holder_name
-    return str(user['id']), (body.holder or _holder_name_from_user(user)).strip() or str(user['id'])
-
-
-@app.get("/api/tools/bookings")
-def list_tool_bookings(serial: str = '', date_from: str = '', date_to: str = '',
-                       user: dict = Depends(get_current_user)):
-    data = _safe_load_json(TOOL_BOOKINGS_FILE, _tool_booking_default_store())
-    today = business_today_str()
-    start = (date_from or today).strip()
-    end = (date_to or start).strip()
-    start_date = _parse_tool_booking_date(start, 'date_from')
-    end_date = _parse_tool_booking_date(end, 'date_to')
-    if end_date < start_date:
-        raise HTTPException(400, "date_to раньше date_from")
-    serial_filter = (serial or '').strip()
-    bookings = []
-    for b in data.get('bookings', []):
-        if b.get('status') == 'cancelled':
-            continue
-        if serial_filter and str(b.get('serial', '')) != serial_filter:
-            continue
-        if not _tool_booking_overlaps(start, end, b.get('date_from', ''), b.get('date_to', '')):
-            continue
-        bookings.append(b)
-    bookings.sort(key=lambda b: (b.get('date_from', ''), b.get('tool_name', ''), b.get('serial', '')))
-    return {"bookings": bookings}
-
-
-@app.post("/api/tools/{serial}/bookings")
-def create_tool_booking(serial: str, body: ToolBookingBody,
-                        user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    date_from = (body.date_from or '').strip()
-    date_to = (body.date_to or '').strip()
-    start_date = _parse_tool_booking_date(date_from, 'date_from')
-    end_date = _parse_tool_booking_date(date_to, 'date_to')
-    if end_date < start_date:
-        raise HTTPException(400, "date_to раньше date_from")
-    if start_date < business_today():
-        raise HTTPException(400, "Нельзя бронировать инструмент в прошлом")
-    object_name = (body.object_name or '').strip()
-    if not object_name:
-        raise HTTPException(400, "Укажи объект")
-
-    tl = _load_repo_tools_lib()
-    tool = tl.get_tool(serial)
-    if tool is None:
-        raise HTTPException(404, f'инструмент {serial} не найден')
-    if tl.mapped_status(tool) in ('repair', 'missing'):
-        raise HTTPException(409, "Инструмент недоступен для брони")
-    # 17.09 (audit finding, P1): booking used to ignore the tool's CURRENT physical
-    # possession entirely -- only repair/missing blocked it, so booking a tool for
-    # TODAY while someone else already has it in-use/reserved right now silently
-    # created a booking the requester could never actually fulfill today. Only
-    # checked for start_date == today -- a future-dated booking is fine even if the
-    # tool is in-use right now, since whoever holds it will plausibly return it
-    # before then, and the existing overlap-check between bookings already protects
-    # future-date conflicts between two bookings.
-    if start_date == business_today() and tl.mapped_status(tool) in ('in-use', 'reserved'):
-        raise HTTPException(409, "Инструмент сейчас занят -- бронь на сегодня недоступна")
-
-    holder_id, holder_name = _tool_booking_holder(body, user, role)
-    booking_id = uuid.uuid4().hex
-    now = int(time.time())
-
-    def _mutator(data):
-        data.setdefault('bookings', [])
-        for existing in data['bookings']:
-            if existing.get('status') == 'cancelled':
-                continue
-            if str(existing.get('serial', '')) != str(serial):
-                continue
-            if _tool_booking_overlaps(date_from, date_to, existing.get('date_from', ''), existing.get('date_to', '')):
-                raise HTTPException(409, "Инструмент уже забронирован на эти даты")
-        booking = {
-            "id": booking_id,
-            "serial": str(serial),
-            "tool_name": tool.get('Название Инструмента', ''),
-            "category": tool.get('Категория', ''),
-            "date_from": date_from,
-            "date_to": date_to,
-            "object_name": object_name,
-            "holder_id": holder_id,
-            "holder_name": holder_name,
-            "note": (body.note or '').strip()[:300],
-            "status": "active",
-            "created_at": now,
-            "created_by": str(user['id']),
-        }
-        data['bookings'].append(booking)
-        return booking
-
-    booking = update_json_transaction(TOOL_BOOKINGS_FILE, _tool_booking_default_store, _mutator)
-    return {"booking": booking}
-
-
-@app.delete("/api/tools/{serial}/bookings/{booking_id}")
-def cancel_tool_booking(serial: str, booking_id: str,
-                        user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    uid = str(user['id'])
-
-    def _mutator(data):
-        for booking in data.get('bookings', []):
-            if booking.get('id') != booking_id or str(booking.get('serial', '')) != str(serial):
-                continue
-            if booking.get('status') == 'cancelled':
-                return booking
-            if role != 'owner' and booking.get('holder_id') != uid and booking.get('created_by') != uid:
-                raise HTTPException(403, "Можно удалить только свою бронь")
-            booking['status'] = 'cancelled'
-            booking['cancelled_at'] = int(time.time())
-            booking['cancelled_by'] = uid
-            return booking
-        raise HTTPException(404, "Бронь не найдена")
-
-    booking = update_json_transaction(TOOL_BOOKINGS_FILE, _tool_booking_default_store, _mutator)
-    return {"booking": booking}
-
-
-class CheckoutBody(BaseModel):
-    object_name: str
-    # 30.07 (Инструменты cleanup): optional только для обратной совместимости --
-    # backend больше НЕ доверяет holder от клиента (реальный найденный баг: Worker
-    # мог вписать чужое имя, "Кто взял" и "ID держателя" относились бы к разным людям).
-    # Держатель всегда определяется из авторизованного Telegram user ниже.
-    holder: str = ''
-
-
-def _holder_name_from_user(user: dict) -> str:
-    """Порядок: first_name+last_name -> first_name -> username -> str(id).
-    Единственный источник имени держателя для self-checkout -- клиентский holder
-    из CheckoutBody игнорируется целиком, не подмешивается ни в каком виде."""
-    first_name = (user.get('first_name') or '').strip()
-    last_name = (user.get('last_name') or '').strip()
-    holder_name = ' '.join(v for v in [first_name, last_name] if v).strip()
-    if not holder_name:
-        holder_name = (user.get('username') or '').strip()
-    if not holder_name:
-        holder_name = str(user['id'])
-    return holder_name
-
-
-_tool_locks: dict = {}
-_tool_locks_guard = __import__('threading').Lock()
-
-
-def _lock_for_tool(serial: str):
-    """31.07 (Release-аудит П6): один Lock на serial -- checkout/return читают статус
-    из Sheets (tools_lib.py, никакого threading.Lock внутри) и пишут отдельным вызовом;
-    без лока, охватывающего ВЕСЬ цикл read-check-write, два конкурентных checkout на
-    один serial могли оба пройти проверку mapped_status()=='free' до того как первый
-    успевал записать нового держателя -- тот же класс гонки, что _lock_for()/
-    update_json_transaction закрывают для JSON-сторов (см. их docstring выше), только
-    здесь бэкенд данных -- Google Sheets, не JSON-файл."""
-    with _tool_locks_guard:
-        if serial not in _tool_locks:
-            _tool_locks[serial] = __import__('threading').Lock()
-        return _tool_locks[serial]
-
-
-def _active_tool_booking_conflict(serial: str, on_date: str, requester_id: str):
-    """17.09 (audit finding, P1): booking ('/api/tools/{serial}/bookings') was
-    purely advisory -- checkout_tool never consulted TOOL_BOOKINGS_FILE, so a
-    worker could book a tool for tomorrow and have someone else walk up and
-    take it today via the plain checkout flow with zero warning. Returns the
-    conflicting booking dict if an ACTIVE booking for this serial covers
-    on_date and belongs to someone other than requester_id -- the booking's
-    own holder checking the tool out early is allowed (that IS them fulfilling
-    their reservation), a different person is not."""
-    data = _safe_load_json(TOOL_BOOKINGS_FILE, _tool_booking_default_store())
-    for b in data.get('bookings', []):
-        if b.get('status') == 'cancelled':
-            continue
-        if str(b.get('serial', '')) != str(serial):
-            continue
-        b_from, b_to = b.get('date_from', ''), b.get('date_to', '')
-        if not (b_from and b_to and b_from <= on_date <= b_to):
-            continue
-        if str(b.get('holder_id', '')) == str(requester_id):
-            continue
-        return b
-    return None
-
-
-@app.patch("/api/tools/{serial}/checkout")
-def checkout_tool(serial: str, body: CheckoutBody, user: dict = Depends(get_current_user)):
-    tl = _load_repo_tools_lib()
-    if not body.object_name.strip():
-        raise HTTPException(400, "Укажи объект")
-    with _lock_for_tool(serial):
-        tool = tl.get_tool(serial)
-        if tool is None:
-            raise HTTPException(404, f'инструмент {serial} не найден')
-        if tl.mapped_status(tool) != 'free':
-            raise HTTPException(409, "Инструмент уже выдан или недоступен")
-        conflict = _active_tool_booking_conflict(serial, business_today_str(), str(user['id']))
-        if conflict is not None:
-            raise HTTPException(409, f"Инструмент забронирован на сегодня: {conflict.get('holder_name', '')} ({conflict.get('object_name', '')})")
-        # 22.07: worker сам оформляет checkout — user['id'] это и есть реальный держатель,
-        # пишем как holder_id чтобы avatar на карточке инструмента был кликабельным (openUserCard).
-        holder_name = _holder_name_from_user(user)
-        tl.checkout_tool(serial, holder_name, body.object_name, holder_name, holder_id=str(user['id']))
-    return {"status": "ok"}
-
-
-@app.patch("/api/tools/{serial}/return")
-def return_tool(serial: str, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """30.07 (Инструменты-редизайн, п.11, реальный найденный баг): предыдущая версия
-    "возврата" вызывала /checkout с пустыми holder/object_name -- checkout_tool всё равно
-    пишет holder_id текущего юзера безусловно, так что "возврат" на деле мог сделать
-    держателем СВОБОДНОГО инструмента того, кто на самом деле его не брал. Отдельный
-    endpoint: текущий держатель или owner -- разрешено, посторонний worker -- 403.
-
-    31.07 (Release-аудит П6): read-check-write под тем же _lock_for_tool(serial), что
-    checkout -- та же гонка, зеркально (два одновременных return, или return+checkout
-    на один serial)."""
-    tl = _load_repo_tools_lib()
-    with _lock_for_tool(serial):
-        tool = tl.get_tool(serial)
-        if tool is None:
-            raise HTTPException(404, f'инструмент {serial} не найден')
-        holder_id = (tool.get('ID держателя') or '').strip()
-        if role != 'owner' and str(user['id']) != holder_id:
-            raise HTTPException(403, "Можно вернуть только инструмент, который взят вами")
-        tl.return_tool(serial, user.get('first_name', str(user['id'])))
-    return {"status": "ok"}
-
-
-class ToolUpdateBody(BaseModel):
-    status: str
-    holder: str = ''
-    object_name: str = ''
-    # 30.07 (Инструменты-редизайн, п.7): Owner теперь выбирает Worker из /api/workers
-    # вместо ручного ввода имени -- holder_id делает avatar держателя в карточке
-    # кликабельным (openUserCard), тот же смысл что уже есть у worker-self checkout.
-    holder_id: str = ''
-
-
-@app.patch("/api/tools/{serial}")
-def update_tool(serial: str, body: ToolUpdateBody, user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    tl = _load_repo_tools_lib()
-    try:
-        tl.update_tool_status(serial, body.status, body.holder, body.object_name,
-                               user.get('first_name', str(user['id'])), holder_id=body.holder_id)
-    except ValueError as e:
-        raise HTTPException(404, str(e))
-    return {"status": "ok"}
-
-
-class NewToolBody(BaseModel):
-    name: str
-    category: str
-
-
-_tool_create_lock = __import__('threading').Lock()
-
-
-@app.post("/api/tools")
-def create_tool(body: NewToolBody, user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    # 31.07 (доп.раунд, П5): tl.add_tool() читает существующие serial, вычисляет
-    # next=max+1, добавляет строку и пишет историю -- без lock, охватывающего весь
-    # цикл, два конкурентных POST могли оба прочитать один и тот же max ДО того как
-    # первый успевал записать новую строку, оба бы вычислили ОДИНАКОВЫЙ serial.
-    # Отдельный module-level lock (не per-serial -- serial ещё не существует на
-    # момент входа в этот эндпоинт, в отличие от checkout/return выше).
-    tl = _load_repo_tools_lib()
-    with _tool_create_lock:
-        serial = tl.add_tool(body.name, body.category, user.get('first_name', str(user['id'])))
-    return {"serial": serial}
+# Temporary compatibility surface for direct-call tests and any internal callers.
+# There is no duplicated implementation here; every alias points at routes/tools.py.
+list_tools = _tools_handlers.list_tools
+tool_history = _tools_handlers.tool_history
+list_tool_bookings = _tools_handlers.list_tool_bookings
+create_tool_booking = _tools_handlers.create_tool_booking
+cancel_tool_booking = _tools_handlers.cancel_tool_booking
+checkout_tool = _tools_handlers.checkout_tool
+return_tool = _tools_handlers.return_tool
+update_tool = _tools_handlers.update_tool
+create_tool = _tools_handlers.create_tool
+_active_tool_booking_conflict = _tools_handlers.active_tool_booking_conflict
 
 
 # ---------- Angebot generator ----------
