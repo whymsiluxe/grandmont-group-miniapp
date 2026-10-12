@@ -17,6 +17,7 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 
 import main as backend
+import routes.commercial_docs as commercial_docs
 from fastapi import HTTPException
 
 # main.py inserts /home/promonta/agent into sys.path[0], so plain `import objekte_lib`
@@ -149,7 +150,7 @@ class PdfGeneratorPathTests(unittest.TestCase):
         self.assertEqual(backend.RECHNUNG_SCRIPT, os.path.join(backend.BACKEND_DIR, 'rechnung.js'))
 
     def test_pdf_filename_is_safe_for_multipart_header(self):
-        filename = backend._safe_pdf_filename('Angebot', ' ACME "bad"\r\n.pdf ')
+        filename = commercial_docs.safe_pdf_filename('Angebot', ' ACME "bad"\r\n.pdf ')
         self.assertEqual(filename, 'Angebot_ACME_bad.pdf')
         self.assertNotIn('\r', filename)
         self.assertNotIn('\n', filename)

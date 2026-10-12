@@ -87,13 +87,6 @@ class CommercialDocsRouteDeps:
     rechnung_script: Callable[[], str]
     angebot_out_dir: Callable[[], str]
     rechnung_out_dir: Callable[[], str]
-    # Deprecated migration-only fields. They are intentionally NOT consulted by
-    # endpoint execution anymore. main.py still passes them temporarily so this
-    # cleanup can land without editing the monolith again, but production flow is
-    # now fully owned by this module and no longer reaches back through main aliases.
-    send_pdf: Callable[..., None] | None = None
-    generate_pdf: Callable[..., subprocess.CompletedProcess] | None = None
-    make_pdf_filename: Callable[[str, str], str] | None = None
 
 
 @dataclass(frozen=True)
@@ -191,9 +184,8 @@ def create_commercial_docs_router(
         if config.get("signatureBase64"):
             config["signedAt"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-        # Production execution deliberately resolves helpers in THIS module.
-        # Deprecated deps.* compatibility callbacks are ignored so the route can
-        # no longer call back through aliases in backend.main.
+        # PDF generation, filename creation and Telegram delivery are owned by
+        # this extracted domain; there is no runtime callback through backend.main.
         run_pdf_generator(deps.angebot_script(), config)
         filename = safe_pdf_filename("Angebot", body.kunde.name)
         send_pdf_to_chat(

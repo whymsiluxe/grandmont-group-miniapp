@@ -1,4 +1,6 @@
-"""Migration guard: Commercial Docs execution must not depend on main aliases."""
+"""Commercial Docs must remain independent from backend.main helper wiring."""
+import ast
+import inspect
 import os
 import sys
 
@@ -7,17 +9,27 @@ import main as backend  # noqa: E402
 import routes.commercial_docs as commercial  # noqa: E402
 
 
-def test_angebot_handler_uses_module_owned_helpers_not_main_aliases(monkeypatch):
+def test_dead_commercial_main_wiring_is_absent():
+    for name in ("send_pdf_to_chat", "_run_pdf_generator", "_safe_pdf_filename"):
+        assert not hasattr(backend, name), f"dead Commercial Docs alias returned: {name}"
+
+    fields = set(commercial.CommercialDocsRouteDeps.__dataclass_fields__)
+    assert not {"send_pdf", "generate_pdf", "make_pdf_filename"} & fields
+
+
+def test_commercial_docs_never_imports_main_backwards():
+    tree = ast.parse(inspect.getsource(commercial))
+    forbidden = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            forbidden.extend(alias.name for alias in node.names if alias.name in {"main", "backend.main"})
+        elif isinstance(node, ast.ImportFrom) and node.module in {"main", "backend.main"}:
+            forbidden.append(node.module)
+    assert not forbidden, f"Commercial Docs reintroduced a main back-import: {forbidden}"
+
+
+def test_angebot_handler_uses_module_owned_helpers(monkeypatch):
     calls = {"generate": [], "filename": [], "telegram": []}
-
-    def fail_main_helper(*args, **kwargs):
-        raise AssertionError("extracted endpoint reached back through backend.main")
-
-    # Legacy aliases may remain temporarily for direct-call consumers, but endpoint
-    # execution must not resolve through them anymore.
-    monkeypatch.setattr(backend, "_run_pdf_generator", fail_main_helper)
-    monkeypatch.setattr(backend, "_safe_pdf_filename", fail_main_helper)
-    monkeypatch.setattr(backend, "send_pdf_to_chat", fail_main_helper)
 
     def fake_generate(script_path, config, timeout=30):
         calls["generate"].append((script_path, dict(config), timeout))
