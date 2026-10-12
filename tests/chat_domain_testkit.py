@@ -27,6 +27,7 @@ class ChatDomainHarness:
     tasks: list | None = None
     mangel_tickets: dict | None = None
     objects: dict | None = None
+    worker_profiles: dict | None = None
 
     def __post_init__(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='chat-domain-')
@@ -54,6 +55,7 @@ class ChatDomainHarness:
         self.tasks = copy.deepcopy(self.tasks or [])
         self.mangel_tickets = copy.deepcopy(self.mangel_tickets or {})
         self.objects = copy.deepcopy(self.objects or {})
+        self.worker_profiles = copy.deepcopy(self.worker_profiles or {})
         self.history = []
         self.telegram = []
 
@@ -74,6 +76,13 @@ class ChatDomainHarness:
                 if not (date_from and date_to) or date_from <= today <= date_to:
                     return True
             return False
+
+        def resolve_current_display_name(uid, fallback):
+            profile = self.worker_profiles.get(str(uid), {})
+            current_name = profile.get('name')
+            if current_name:
+                return str(current_name)
+            return str(fallback or uid)
 
         _, self.core = create_chat_router(ChatRouteDeps(
             get_current_user=lambda: {},
@@ -99,10 +108,10 @@ class ChatDomainHarness:
             load_mangel_lib=lambda: _MangelLib(self.mangel_tickets),
             load_tasks=lambda: copy.deepcopy(self.tasks),
             cached_get_used_range=lambda tab: [],
-            load_worker_profiles=lambda: {},
+            load_worker_profiles=lambda: copy.deepcopy(self.worker_profiles),
             last_seen_for=lambda uid: None,
             sanitize_display_name=lambda raw, fallback: raw or fallback,
-            resolve_current_display_name=lambda uid, fallback: fallback or str(uid),
+            resolve_current_display_name=resolve_current_display_name,
             sniff_chat_attachment=lambda data: ('image/jpeg', 'jpg') if data.startswith(b'\xff\xd8\xff') else None,
         ))
 
