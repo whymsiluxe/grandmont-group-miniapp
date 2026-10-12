@@ -1,10 +1,9 @@
-"""Regression coverage for the checkin/execution router split.
+"""Regression coverage for the checkin/execution/worker-calendar router split.
 
-Checkin shift-lifecycle routes (start/pause/finish/list/export/finish-context/
-photo) went to routes/checkin.py; manual time entry + AI photo analysis went
-to routes/execution.py -- different coupling profile per the Execution
-dependency-map decision (no lock/idempotency/outbox involvement beyond a
-simple lock+idempotency pair for manual entry).
+Checkin shift-lifecycle routes live in routes/checkin.py; manual time entry +
+AI photo analysis live in routes/execution.py; worker availability/calendar
+statistics now live in routes/worker_calendar.py.  These guards protect route
+uniqueness and ownership without coupling tests to the old main.py monolith.
 """
 import os
 import sys
@@ -33,9 +32,6 @@ EXECUTION_ROUTE_KEYS = {
     ('POST', '/api/checkin/{session_id}/analyze-defects'),
 }
 
-# Physically interleaved with the old checkin block in main.py but a
-# different domain (worker profile/absence stats) -- must stay in main.py,
-# not accidentally swept into either new router.
 WORKER_CALENDAR_ROUTE_KEYS = {
     ('GET', '/api/workers/{target_user_id}/calendar'),
     ('GET', '/api/workers/{target_user_id}/calendar-stats'),
@@ -69,12 +65,13 @@ def test_execution_domain_routes_are_registered_once_and_owned_by_routes_module(
         assert route.endpoint.__module__.endswith('routes.execution')
 
 
-def test_worker_calendar_routes_stayed_in_main_not_swept_into_either_router():
+def test_worker_calendar_routes_are_registered_once_and_owned_by_calendar_module():
     rows = list(_route_rows())
-    by_key = {(m, p): r for m, p, r in rows}
+    keys = [(method, path) for method, path, _ in rows]
     for key in WORKER_CALENDAR_ROUTE_KEYS:
-        assert key in by_key, key
-        assert by_key[key].endpoint.__module__ == 'main'
+        assert keys.count(key) == 1, key
+        route = next(route for method, path, route in rows if (method, path) == key)
+        assert route.endpoint.__module__.endswith('routes.worker_calendar')
 
 
 def test_no_duplicate_routes_anywhere_in_the_app():
@@ -101,8 +98,7 @@ def test_route_count_invariant():
     # onboarding request for CRM admin review). Both depend on
     # get_verified_telegram_user, not get_current_user, since the calling
     # Telegram user is by definition not in roles.json yet.
-    # Bump this number again, with the same explanation discipline, the next
-    # time a route is added or removed.
+    # Router extraction does not add/remove routes, so this invariant stays 193.
     assert len(list(iter_app_routes(backend.app))) == 193
 
 
@@ -114,6 +110,12 @@ def test_checkin_router_has_no_main_import():
 
 def test_execution_router_has_no_main_import():
     src = Path(backend.BACKEND_DIR, 'routes', 'execution.py').read_text()
+    assert 'import main' not in src
+    assert 'from main import' not in src
+
+
+def test_worker_calendar_router_has_no_main_import():
+    src = Path(backend.BACKEND_DIR, 'routes', 'worker_calendar.py').read_text()
     assert 'import main' not in src
     assert 'from main import' not in src
 
@@ -133,6 +135,12 @@ def test_main_reexports_legacy_execution_handlers_from_router():
     assert backend.analyze_checkin_progress.__module__.endswith('routes.execution')
     assert backend.analyze_checkin_materials.__module__.endswith('routes.execution')
     assert backend.analyze_checkin_defects.__module__.endswith('routes.execution')
+
+
+def test_main_reexports_worker_calendar_handlers_from_router():
+    assert backend.get_worker_calendar.__module__.endswith('routes.worker_calendar')
+    assert backend.get_worker_calendar_stats.__module__.endswith('routes.worker_calendar')
+    assert backend._worker_period_stats.__module__.endswith('routes.worker_calendar')
 
 
 def test_auth_objects_stages_daily_plan_routes_are_untouched():
