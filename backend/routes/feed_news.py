@@ -12,7 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Callable, Collection, Mapping
+from typing import Any, Callable, Collection
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
