@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 
+# 1) Extract the contiguous Chat core implementation from main.py.
 path = Path('backend/main.py')
 text = path.read_text(encoding='utf-8')
 start_marker = '# ---------- Team Chat ----------\n'
@@ -18,3 +19,16 @@ if len(new_text) >= len(text):
     raise SystemExit('expected main.py to shrink')
 path.write_text(new_text, encoding='utf-8')
 print(f'main.py: {text.count(chr(10)) + 1} -> {new_text.count(chr(10)) + 1} lines')
+
+# 2) Migrate the one remaining attachment test that monkey-patched main.py
+# internals. Seed the real isolated JSON stores instead, call the extracted
+# handler through the public compatibility alias, and read persisted chat back.
+test_path = Path('tests/test_chat_actions.py')
+test_src = test_path.read_text(encoding='utf-8')
+if 'import json\n' not in test_src:
+    test_src = test_src.replace('import os\n', 'import json\nimport os\n', 1)
+old = '''    def test_attachment_sent_to_object_thread_gets_thread_key(self):\n        captured = {}\n\n        def fake_save(messages):\n            captured['messages'] = messages\n\n        with patch.object(backend, '_load_chat', return_value=[]), \\\n             patch.object(backend, '_save_chat', side_effect=fake_save), \\\n             patch.object(backend, '_check_thread_access'), \\\n             patch.object(backend, 'sniff_chat_attachment', return_value=('image/jpeg', 'jpg')), \\\n             patch('builtins.open', unittest.mock.mock_open()):\n            fake_file = unittest.mock.MagicMock()\n            fake_file.file.read.return_value = b'fake-image-bytes'\n            fake_file.filename = 'photo.jpg'\n            fake_file.content_type = 'image/jpeg'\n            result = backend.post_chat_attachment(\n                thread_key='obj:OBJ-1', to_user_id='', file=fake_file,\n                user=WORKER_A, role='worker',\n            )\n        self.assertEqual(result['message']['thread_key'], 'obj:OBJ-1')\n        self.assertIsNone(result['message']['to_user_id'])\n        self.assertEqual(captured['messages'][0]['thread_key'], 'obj:OBJ-1')\n'''
+new = '''    def test_attachment_sent_to_object_thread_gets_thread_key(self):\n        # Exercise the extracted handler against the real pytest-isolated stores.\n        # This deliberately avoids monkey-patching legacy main.py helper aliases.\n        for critical_path in (backend.ROLES_FILE, backend.OBJECT_ASSIGNMENTS_FILE, backend.CHAT_FILE):\n            marker = backend._corrupt_lock_path(critical_path)\n            if os.path.exists(marker):\n                os.remove(marker)\n        backend._atomic_write_json(backend.ROLES_FILE, {'10': 'worker'})\n        backend._atomic_write_json(backend.OBJECT_ASSIGNMENTS_FILE, {\n            'OBJ-1': [{'id': 'a1', 'user_id': '10', 'status': 'accepted'}],\n        })\n        backend._atomic_write_json(backend.CHAT_FILE, [])\n\n        fake_file = unittest.mock.MagicMock()\n        # Minimal JPEG magic is enough for sniff_chat_attachment().\n        fake_file.file.read.return_value = b'\\xff\\xd8\\xff\\xe0' + b'chat-test'\n        fake_file.filename = 'photo.jpg'\n        fake_file.content_type = 'image/jpeg'\n        result = backend.post_chat_attachment(\n            thread_key='obj:OBJ-1', to_user_id='', file=fake_file,\n            user=WORKER_A, role='worker',\n        )\n        persisted = backend._safe_load_json(backend.CHAT_FILE, [])\n        self.assertEqual(result['message']['thread_key'], 'obj:OBJ-1')\n        self.assertIsNone(result['message']['to_user_id'])\n        self.assertEqual(persisted[-1]['thread_key'], 'obj:OBJ-1')\n'''
+if old not in test_src:
+    raise SystemExit('attachment test migration target not found')
+test_path.write_text(test_src.replace(old, new, 1), encoding='utf-8')
