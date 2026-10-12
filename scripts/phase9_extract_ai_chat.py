@@ -1,0 +1,15 @@
+from pathlib import Path
+
+path = Path('backend/main.py')
+text = path.read_text(encoding='utf-8')
+start = '# ---------- AI Chat (GLM / Sonnet / Opus, переключаемо) ----------\n'
+end = '# ---------- Этапы объекта / План работ (Roadmap) ----------\n'
+assert text.count(start) == 1, f'ai start marker count={text.count(start)}'
+assert text.count(end) == 1, f'ai end marker count={text.count(end)}'
+
+replacement = '''# ---------- AI Chat domain ----------\nif __package__:\n    from .routes import ai_chat as _ai_chat_domain\n    from .routes.ai_chat import (\n        AiChatBody, AiChatRouteDeps, AiModelBody, WorkerAiChatBody,\n        create_ai_chat_router,\n    )\nelse:\n    import routes.ai_chat as _ai_chat_domain  # noqa: E402\n    from routes.ai_chat import (  # noqa: E402\n        AiChatBody, AiChatRouteDeps, AiModelBody, WorkerAiChatBody,\n        create_ai_chat_router,\n    )\n\n_ai_chat_router, _ai_chat_handlers = create_ai_chat_router(\n    AiChatRouteDeps(\n        get_current_user=get_current_user,\n        get_role=get_role,\n        ai_rate_file=lambda: AI_RATE_FILE,\n        worker_ai_rate_file=lambda: WORKER_AI_RATE_FILE,\n        ai_model_file=lambda: AI_MODEL_FILE,\n        ai_rate_limit=AI_RATE_LIMIT,\n        worker_ai_rate_limit=WORKER_AI_RATE_LIMIT,\n        ai_rate_window=AI_RATE_WINDOW,\n        ai_models=AI_MODELS,\n        ai_model_default=AI_MODEL_DEFAULT,\n        owner_ai_env_allowlist=_OWNER_AI_ENV_ALLOWLIST,\n        agent_root=lambda: AGENT_ROOT,\n        ai_upload_max_bytes=AI_UPLOAD_MAX_BYTES,\n        sniff_image_or_pdf=lambda raw: sniff_image_or_pdf(raw),\n        allowed_image_mime_ext=_ALLOWED_IMAGE_MIME_EXT,\n    )\n)\napp.include_router(_ai_chat_router)\n\n# Compatibility names for task extraction/direct-call tests during migration.\nCLAUDE_BIN = _ai_chat_domain.CLAUDE_BIN\nOWNER_AI_ENABLED = _ai_chat_domain.OWNER_AI_ENABLED\nAI_SYSTEM_PROMPT = _ai_chat_domain.AI_SYSTEM_PROMPT\nWORKER_AI_SYSTEM_PROMPT = _ai_chat_domain.WORKER_AI_SYSTEM_PROMPT\n_claude_cli_lock = _ai_chat_domain._claude_cli_lock\n_owner_ai_subprocess_env = _ai_chat_handlers.owner_ai_subprocess_env\n_get_ai_model = _ai_chat_handlers.get_ai_model_value\n_set_ai_model = _ai_chat_handlers.set_ai_model_value\n_check_ai_rate = _ai_chat_handlers.check_ai_rate\n_call_glm = _ai_chat_handlers.call_glm\n_call_glm_json = _ai_chat_handlers.call_glm_json\n_messages_to_prompt = _ai_chat_handlers.messages_to_prompt\n_call_claude_cli = _ai_chat_handlers.call_claude_cli\n_call_ai = _ai_chat_handlers.call_ai\n_is_multimodal_content = _ai_chat_handlers.is_multimodal_content\nai_chat = _ai_chat_handlers.ai_chat\nworker_ai_chat = _ai_chat_handlers.worker_ai_chat\nget_ai_model = _ai_chat_handlers.get_ai_model\nset_ai_model = _ai_chat_handlers.set_ai_model\nai_chat_upload = _ai_chat_handlers.ai_chat_upload\n\n\n'''
+
+before, rest = text.split(start, 1)
+old, after = rest.split(end, 1)
+path.write_text(before + replacement + end + after, encoding='utf-8')
+print('AI chat block replaced:', len(old.splitlines()), 'old lines ->', len(replacement.splitlines()), 'wiring lines')
