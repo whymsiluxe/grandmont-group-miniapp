@@ -56,8 +56,6 @@ ROUTES = [
     ("GET", "/api/mangel", "get_mangel_list", "get_mangel_list_api_mangel_get", [("user","user"),("role","role")], [("object_id","query",False,"string","")], None, None, None),
     ("GET", "/api/mangel/counts", "get_mangel_counts", "get_mangel_counts_api_mangel_counts_get", [("user","user")], [], None, None, None),
     ("GET", "/api/mangel/{ticket_id}", "get_mangel_ticket", "get_mangel_ticket_api_mangel__ticket_id__get", [("user","user"),("_","mangel_access")], [("ticket_id","path",True,"string","<required>")], None, None, None),
-    # All multipart fields have defaults in the legacy endpoint, so the whole
-    # requestBody is optional. This is intentionally pinned as part of the API.
     ("POST", "/api/mangel", "create_mangel_ticket", "create_mangel_ticket_api_mangel_post", [("user","user"),("role","role")], [], "Body_create_mangel_ticket_api_mangel_post", "multipart/form-data", False),
     ("GET", "/api/mangel/photos/{fname}/file", "get_mangel_photo_file", "get_mangel_photo_file_api_mangel_photos__fname__file_get", [("user","user"),("role","role")], [("fname","path",True,"string","<required>")], None, None, None),
     ("PATCH", "/api/mangel/{ticket_id}/status", "update_mangel_status", "update_mangel_status_api_mangel__ticket_id__status_patch", [("user","user"),("_","owner")], [("ticket_id","path",True,"string","<required>")], "MangelStatusBody", "application/json", True),
@@ -98,27 +96,31 @@ for method, path, handler_name, operation_id, deps, local_params, body_component
     else:
         assert request_body is None, (method, path, request_body)
 
-# Exact Pydantic JSON-body contracts.
 assert {
     name: (str(field.annotation), field.is_required(), "<required>" if field.is_required() else field.default)
     for name, field in backend.MangelStatusBody.model_fields.items()
-} == {"status": ("<class 'str'>", True, "<required>")}
+} == {"status": ("<class 'str'>", True, "<required>")}, "MangelStatusBody contract changed"
 assert {
     name: (str(field.annotation), field.is_required(), "<required>" if field.is_required() else field.default)
     for name, field in backend.MangelCommentBody.model_fields.items()
-} == {"text": ("<class 'str'>", True, "<required>")}
+} == {"text": ("<class 'str'>", True, "<required>")}, "MangelCommentBody contract changed"
 
-# Multipart body component is part of the external API too. Pin its public schema.
+# Pin the complete generated multipart component rather than relying on a series
+# of silent partial assertions. If FastAPI emits something different, CI prints
+# the complete actual schema for review.
 multipart_schema = openapi["components"]["schemas"]["Body_create_mangel_ticket_api_mangel_post"]
-assert multipart_schema["type"] == "object"
-assert multipart_schema.get("required") == [] or "required" not in multipart_schema
-props = multipart_schema["properties"]
-assert props["object_id"].get("default") == "" and props["object_id"].get("type") == "string"
-assert props["description"].get("default") == "" and props["description"].get("type") == "string"
-assert props["assigned_worker_id"].get("default") == "" and props["assigned_worker_id"].get("type") == "string"
-assert props["file"].get("format") == "binary"
+expected_multipart_schema = {
+    "properties": {
+        "object_id": {"type": "string", "title": "Object Id", "default": ""},
+        "description": {"type": "string", "title": "Description", "default": ""},
+        "assigned_worker_id": {"type": "string", "title": "Assigned Worker Id", "default": ""},
+        "file": {"type": "string", "format": "binary", "title": "File"},
+    },
+    "type": "object",
+    "title": "Body_create_mangel_ticket_api_mangel_post",
+}
+assert multipart_schema == expected_multipart_schema, (multipart_schema, expected_multipart_schema)
 
-# No duplicate Mangel registrations.
 expected = {(method, path) for method, path, *_ in ROUTES}
 seen = {}
 for route in routes:
@@ -128,7 +130,6 @@ for route in routes:
             seen[key] = seen.get(key, 0) + 1
 assert seen == {key: 1 for key in expected}, seen
 
-# Dependency direction: extracted route module must never import main.py.
 tree = ast.parse(inspect.getsource(mangel_routes))
 offenders = []
 for node in ast.walk(tree):
@@ -140,7 +141,6 @@ for node in ast.walk(tree):
             offenders.append(name)
 assert not offenders, offenders
 
-# No direct Mangel @app.* implementation may return to main.py.
 main_tree = ast.parse(inspect.getsource(backend))
 for node in ast.walk(main_tree):
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -155,12 +155,11 @@ for node in ast.walk(main_tree):
         if isinstance(first, ast.Constant) and isinstance(first.value, str):
             assert not first.value.startswith("/api/mangel"), (node.name, first.value)
 
-# Compatibility is alias-only and retains the canonical repo-backed module object.
-assert backend.ml is backend._load_repo_mangel_lib()
+assert backend.ml is backend._load_repo_mangel_lib(), "backend.ml is not the canonical repo-backed module"
 assert backend.delete_mangel_ticket is next(
     r.endpoint for r in routes
     if getattr(r, "path", None) == "/api/mangel/{ticket_id}" and "DELETE" in getattr(r, "methods", set())
-)
+), "delete_mangel_ticket compatibility alias drifted"
 
 print("phase2-mangel-contract-ok", len(ROUTES))
 '''
