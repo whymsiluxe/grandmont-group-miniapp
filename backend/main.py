@@ -1400,160 +1400,37 @@ _format_assignment_wait = _owner_dashboard_handlers.format_assignment_wait
 _assignment_confirmation_alerts = _owner_dashboard_handlers.assignment_confirmation_alerts
 
 
-# ---------- Alerts inbox — role-aware агрегация (Фаза 2g, восстановлено после инцидента Фазы 3) ----------
-@app.get("/api/alerts")
-def get_alerts(user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    alerts = []
+# ---------- Alerts domain ----------
+try:
+    from .routes.alerts import AlertDismissBody, AlertsDeps, create_alerts_router
+except ImportError:
+    from routes.alerts import AlertDismissBody, AlertsDeps, create_alerts_router  # noqa: E402
 
-    # Budget alerts (owner sees) — жёлтый ≥60%, красный ≥90%
-    try:
-        rows = _cached_get_used_range('Объекты')
-        if rows:
-            header, data_rows = rows[0], rows[1:]
-            for row in data_rows:
-                obj = dict(zip(header, row))
-                try:
-                    pct = float(_load_repo_objekte_lib().get_budget_percent(obj) or 0)
-                except (ValueError, TypeError):
-                    pct = 0
-                oid = obj.get('ID объекта', '')
-                name = obj.get('Объект', oid)
-                if pct >= 90:
-                    alerts.append({
-                        'id': f'budget-red-{oid}', 'type': 'red', 'role_filter': 'owner',
-                        'title': f'Бюджет перегружен: {name}',
-                        'subtitle': f'{int(pct)}% использовано', 'at': None
-                    })
-                elif pct >= 60:
-                    alerts.append({
-                        'id': f'budget-yellow-{oid}', 'type': 'yellow', 'role_filter': 'owner',
-                        'title': f'Бюджет под угрозой: {name}',
-                        'subtitle': f'{int(pct)}% использовано', 'at': None
-                    })
-    except Exception:
-        pass
+_alerts_router, _alerts_handlers = create_alerts_router(
+    AlertsDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        cached_get_used_range=lambda tab: _cached_get_used_range(tab),
+        load_repo_objekte_lib=lambda: _load_repo_objekte_lib(),
+        load_repo_tools_lib=lambda: _load_repo_tools_lib(),
+        load_assignments=lambda: _load_assignments(),
+        load_abwesenheit=lambda: _load_abwesenheit(),
+        assignment_confirmation_alerts=lambda: _assignment_confirmation_alerts(),
+        overdue_task_alerts=lambda: _overdue_task_alerts(),
+        load_critical_alerts=lambda: _load_critical_alerts(),
+        load_activity_alerts=lambda: _load_activity_alerts(),
+        safe_load_json=lambda path, default: _safe_load_json(path, default),
+        atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+        alert_dismissals_file=lambda: ALERT_DISMISSALS_FILE,
+        alert_dismiss_ttl=ALERT_DISMISS_TTL,
+    )
+)
+app.include_router(_alerts_router)
 
-    # Tool issues (owner) — красный при ремонте/не найден
-    try:
-        tl = _load_repo_tools_lib()
-        tools_list = tl.list_tools()
-        for t in tools_list:
-            raw_st = (t.get('Статус') or '').strip().lower()
-            if raw_st in ('в ремонте', 'не найден'):
-                alerts.append({
-                    'id': f'tool-{t.get("Серийный #","")}', 'type': 'red', 'role_filter': 'owner',
-                    'title': f'Инструмент: {t.get("Название Инструмента","")}',
-                    'subtitle': f'Статус: {t.get("Статус","")}', 'at': None
-                })
-    except Exception:
-        pass
-
-    # Worker assignment alerts (worker sees yellow when assigned)
-    if role == 'worker':
-        assignments = _load_assignments()
-        uid = str(user['id'])
-        for obj_id, assigned_list in assignments.items():
-            for a in assigned_list:
-                if a.get('user_id') == uid:
-                    stage_txt = f'Этап: {a["stage_id"]}' if a.get('stage_id') else 'Новое назначение'
-                    alerts.append({
-                        'id': f'assign-{obj_id}-{a.get("stage_id","")}', 'type': 'yellow',
-                        'role_filter': 'worker',
-                        'title': 'Вы назначены на объект',
-                        'subtitle': stage_txt, 'at': a.get('assigned_at')
-                    })
-
-    # Pending abwesenheit requests (owner sees red until decided) — 10.15
-    if role == 'owner':
-        for e in _load_abwesenheit():
-            if e.get('status', 'pending') == 'pending':
-                alerts.append({
-                    'id': f'abw-pending-{e.get("id", "")}', 'type': 'red', 'role_filter': 'owner',
-                    'title': f'Заявка на отсутствие: {e.get("name", e.get("user_id", "?"))}',
-                    'subtitle': f'{e.get("date_from", "?")} — {e.get("date_to", "?")} · {e.get("reason", "?")}',
-                    'at': e.get('created_at')
-                })
-
-        alerts.extend(_assignment_confirmation_alerts())
-        alerts.extend(_overdue_task_alerts())
-
-    # Persisted critical alerts (Фаза 10.16 — global critical alert popup)
-    for ca in _load_critical_alerts():
-        if ca.get('target_user_id') != str(user['id']):
-            continue
-        if ca.get('acknowledged_at'):
-            continue
-        alerts.append({
-            'id': f'critical-{ca["id"]}', 'type': 'red', 'role_filter': role,
-            'title': ca['title'], 'subtitle': ca.get('subtitle', ''), 'at': ca.get('created_at'),
-            'critical_alert_id': ca['id'],
-        })
-
-    # Раунд 6 §5.2: in-app activity alerts о новых комментариях (агрегируем по публикации).
-    try:
-        acts = [a for a in _load_activity_alerts()
-                if a.get('target_user_id') == str(user['id']) and not a.get('read_at')]
-        agg = {}
-        for a in acts:
-            agg.setdefault((a['kind'], a['ref_id']), []).append(a)
-        for (kind, ref_id), group in agg.items():
-            n = len(group)
-            latest = max(group, key=lambda x: x.get('created_at', 0))
-            noun = 'новости' if kind == 'news_comment' else 'фото'
-            title = (f"{n} новых комментария к {noun}" if n > 1 else latest.get('title', ''))
-            alerts.append({
-                'id': f'activity-{kind}-{ref_id}', 'type': 'info', 'role_filter': role,
-                'title': title, 'subtitle': latest.get('subtitle', ''),
-                'at': latest.get('created_at'),
-                'activity_kind': kind, 'activity_ref_id': ref_id,
-                'activity_deep_link': ('news' if kind == 'news_comment' else 'photos'),
-            })
-    except Exception:
-        pass
-
-    filtered = [a for a in alerts if a['role_filter'] == role]
-
-    # 25.07: "прочитано" для derived-алертов (бюджет/инструмент/назначение) -- раньше
-    # счётчик на Home всегда показывал реальное активное количество, юзер жаловался
-    # "не сбрасывается после просмотра". Persisted critical alerts уже имеют свой
-    # ack-механизм (acknowledged_at) выше -- не трогаем их отдельным dismiss-слоем.
-    # Dismiss истекает через 24ч: если проблема (перегруженный бюджет и т.п.) всё ещё
-    # активна на следующий день, алерт напоминает о себе снова -- не даёт навсегда
-    # забыть про нерешённую проблему, просто не мозолит глаза сразу после просмотра.
-    dismissals = _load_alert_dismissals().get(str(user['id']), {})
-    now = int(time.time())
-    filtered = [a for a in filtered if now - dismissals.get(a['id'], 0) > ALERT_DISMISS_TTL]
-
-    return {"alerts": filtered, "count": len(filtered)}
-
-
-# moved to core/paths.py -- ALERT_DISMISSALS_FILE
-# moved to core/limits.py -- ALERT_DISMISS_TTL
-
-
-def _load_alert_dismissals() -> dict:
-    return _safe_load_json(ALERT_DISMISSALS_FILE, {})
-
-
-def _save_alert_dismissals(data: dict):
-    _atomic_write_json(ALERT_DISMISSALS_FILE, data)
-
-
-class AlertDismissBody(BaseModel):
-    alert_ids: list[str]
-
-
-@app.post("/api/alerts/dismiss")
-def dismiss_alerts(body: AlertDismissBody, user: dict = Depends(get_current_user)):
-    data = _load_alert_dismissals()
-    my_id = str(user['id'])
-    entry = data.setdefault(my_id, {})
-    now = int(time.time())
-    for aid in body.alert_ids:
-        entry[aid] = now
-    _save_alert_dismissals(data)
-    return {"ok": True}
-
+_load_alert_dismissals = _alerts_handlers.load_alert_dismissals
+_save_alert_dismissals = _alerts_handlers.save_alert_dismissals
+get_alerts = _alerts_handlers.get_alerts
+dismiss_alerts = _alerts_handlers.dismiss_alerts
 
 
 # ---------- Tools domain ----------
