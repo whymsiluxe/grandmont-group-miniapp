@@ -109,21 +109,19 @@ class AbwesenheitNameResolutionTests(unittest.TestCase):
     def _seed(self, user_id, name):
         backend._save_abwesenheit([{
             'id': 'abw-1', 'user_id': user_id, 'name': name,
-            'date_from': '2026-09-22', 'date_to': '2026-09-23',
+            'date_from': '2099-09-22', 'date_to': '2099-09-23',
             'open_ended': False, 'status': 'approved',
         }])
 
     def test_list_my_abwesenheit_resolves_legacy_id_as_name(self):
         self._seed(WORKER_ID, WORKER_ID)
-        with patch.object(backend, '_load_worker_profiles', return_value={WORKER_ID: {'name': 'Лох'}}), \
-             patch.object(backend, '_auto_close_expired_open_ended_abwesenheit'):
+        with patch.object(backend, '_load_worker_profiles', return_value={WORKER_ID: {'name': 'Лох'}}):
             result = backend.list_my_abwesenheit(user={'id': int(WORKER_ID)})
         self.assertEqual(result['entries'][0]['name'], 'Лох')
 
     def test_list_all_abwesenheit_resolves_legacy_id_as_name_for_owner(self):
         self._seed(WORKER_ID, WORKER_ID)
-        with patch.object(backend, '_load_worker_profiles', return_value={WORKER_ID: {'name': 'Лох'}}), \
-             patch.object(backend, '_auto_close_expired_open_ended_abwesenheit'):
+        with patch.object(backend, '_load_worker_profiles', return_value={WORKER_ID: {'name': 'Лох'}}):
             result = backend.list_all_abwesenheit(user=OWNER, role='owner')
         self.assertEqual(result['entries'][0]['name'], 'Лох')
 
@@ -133,8 +131,7 @@ class AbwesenheitNameResolutionTests(unittest.TestCase):
         # not the raw legacy value, since the resolve happens before filtering.
         self._seed(WORKER_ID, WORKER_ID)
         other_worker = {'id': 999}
-        with patch.object(backend, '_load_worker_profiles', return_value={WORKER_ID: {'name': 'Лох'}}), \
-             patch.object(backend, '_auto_close_expired_open_ended_abwesenheit'):
+        with patch.object(backend, '_load_worker_profiles', return_value={WORKER_ID: {'name': 'Лох'}}):
             result = backend.list_all_abwesenheit(user=other_worker, role='worker')
         self.assertEqual(result['entries'][0]['name'], 'Лох')
 

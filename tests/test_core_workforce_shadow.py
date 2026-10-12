@@ -262,11 +262,17 @@ class TestLegacyRouteWiringUnaffected:
 
         import main as backend
 
-        source = inspect.getsource(backend.create_abwesenheit)
+        route = next(
+            route for route in backend.app.routes
+            if getattr(route, 'path', None) == '/api/abwesenheit'
+            and 'POST' in getattr(route, 'methods', set())
+        )
+        assert route.endpoint is backend.create_abwesenheit
+        source = inspect.getsource(route.endpoint)
         assert 'shadow_create_absence' in source
         tree = ast.parse(source)
         found_try_guard = any(
             isinstance(node, ast.Try) and 'shadow_create_absence' in ast.dump(node)
             for node in ast.walk(tree)
         )
-        assert found_try_guard, "shadow_create_absence call must be wrapped in try/except in create_abwesenheit"
+        assert found_try_guard, "registered create_abwesenheit route must guard shadow_create_absence"

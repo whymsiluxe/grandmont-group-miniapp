@@ -7521,8 +7521,6 @@ _absence_router, _absence_handlers = create_absence_router(
         resolve_current_display_name=lambda user_id, fallback: _resolve_current_display_name(
             user_id, fallback
         ),
-        compat_load_abwesenheit=lambda: _load_abwesenheit(),
-        compat_auto_close=lambda: _auto_close_expired_open_ended_abwesenheit(),
     )
 )
 app.include_router(_absence_router)

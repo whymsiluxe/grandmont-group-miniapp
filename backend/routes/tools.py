@@ -14,7 +14,6 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from types import SimpleNamespace
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -66,6 +65,20 @@ class ToolsRouteDeps:
     tool_bookings_file: Callable[[], str]
 
 
+@dataclass(frozen=True)
+class ToolsHandlers:
+    list_tools: Callable[..., dict]
+    tool_history: Callable[..., dict]
+    list_tool_bookings: Callable[..., dict]
+    create_tool_booking: Callable[..., dict]
+    cancel_tool_booking: Callable[..., dict]
+    checkout_tool: Callable[..., dict]
+    return_tool: Callable[..., dict]
+    update_tool: Callable[..., dict]
+    create_tool: Callable[..., dict]
+    active_tool_booking_conflict: Callable[..., Any]
+
+
 def parse_tool_booking_date(value: str, field_name: str):
     raw = (value or "").strip()
     try:
@@ -107,7 +120,7 @@ def lock_for_tool(serial: str) -> threading.Lock:
         return _tool_locks[serial]
 
 
-def create_tools_router(deps: ToolsRouteDeps):
+def create_tools_router(deps: ToolsRouteDeps) -> tuple[APIRouter, ToolsHandlers]:
     router = APIRouter()
 
     def _tool_booking_holder(body: ToolBookingBody, user: dict, role: str) -> tuple[str, str]:
@@ -368,7 +381,7 @@ def create_tools_router(deps: ToolsRouteDeps):
             serial = tools_lib.add_tool(body.name, body.category, user.get("first_name", str(user["id"])))
         return {"serial": serial}
 
-    handlers = SimpleNamespace(
+    handlers = ToolsHandlers(
         list_tools=list_tools,
         tool_history=tool_history,
         list_tool_bookings=list_tool_bookings,
