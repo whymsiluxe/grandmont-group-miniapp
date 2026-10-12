@@ -43,7 +43,7 @@ jobs:
           git rm scripts/phase14_extract_critical_alerts.py .github/workflows/phase14-critical-alerts-transform.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add backend/main.py
+          git add backend/main.py tests/test_critical_alert_ack_race.py tests/test_critical_alert_dedup.py
           git commit -m 'refactor: extract critical alerts from main'
           for attempt in 1 2 3; do
             git push origin HEAD:refactor/main-monolith-phase-6 && exit 0
