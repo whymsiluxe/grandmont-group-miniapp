@@ -20,7 +20,11 @@ import os
 
 _CORE_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.dirname(_CORE_DIR)
-DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/promonta/agent/miniapp')
+# Keep the unset-env default identical to backend/main.py. During the Grandmont
+# rebrand the serving path moved from /home/promonta/... to /home/grandmont/...;
+# allowing core.paths and main.py to disagree would split JSON stores across two
+# roots when MINIAPP_DATA_ROOT is not explicitly set.
+DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/grandmont/agent/miniapp')
 
 ROLES_FILE = os.path.join(DATA_ROOT, 'roles.json')
 DAILY_PLAN_STORE_FILE = os.path.join(DATA_ROOT, 'daily_plan_store.json')
