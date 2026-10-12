@@ -1,0 +1,40 @@
+name: Phase 5 documents transform
+
+on:
+  push:
+    branches:
+      - refactor/main-monolith-phase-5
+
+permissions:
+  contents: write
+
+jobs:
+  transform:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/main-monolith-phase-5
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply extraction
+        run: python scripts/phase5_documents_transform.py
+      - name: Verify focused tests
+        env:
+          BOT_TOKEN: ci-dummy-token-not-a-real-secret
+          MINIAPP_DATA_ROOT: /tmp/phase5-miniapp-data
+        run: |
+          pip install -r requirements-test.txt
+          python -m pytest tests/test_phase5_documents_contract.py -q
+      - name: Remove one-shot files and commit
+        run: |
+          rm scripts/phase5_documents_transform.py
+          rm .github/workflows/phase5-documents-transform.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/main.py backend/core/object_info_store.py backend/routes/documents.py tests/test_phase5_documents_contract.py scripts/phase5_documents_transform.py .github/workflows/phase5-documents-transform.yml
+          git commit -m "refactor: wire shared object info store and documents"
+          git push origin HEAD:refactor/main-monolith-phase-5
