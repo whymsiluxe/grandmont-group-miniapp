@@ -2606,127 +2606,66 @@ except ImportError:
     from core.telegram import send_telegram_message  # noqa: E402
 
 
-def send_pdf_to_chat(chat_id, file_path, filename, caption):
-    """Отправляет PDF пользователю в чат с ботом (multipart/form-data вручную,
-    т.к. в проекте нет requests — только стандартная библиотека)."""
-    boundary = uuid.uuid4().hex
-    with open(file_path, 'rb') as f:
-        file_data = f.read()
-
-    parts = []
-    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n'.encode())
-    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'.encode())
-    parts.append(
-        f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\n'
-        f'Content-Type: application/pdf\r\n\r\n'.encode()
-    )
-    parts.append(file_data)
-    parts.append(f'\r\n--{boundary}--\r\n'.encode())
-    body = b''.join(parts)
-
-    req = _urlreq.Request(
-        f'https://api.telegram.org/bot{BOT_TOKEN}/sendDocument',
-        data=body, method='POST',
-        headers={'Content-Type': f'multipart/form-data; boundary={boundary}'}
-    )
-    try:
-        _urlreq.urlopen(req, timeout=20)
-    except Exception as e:
-        print(f'WARNING: sendDocument fehlgeschlagen: {e}')
-
-
-def _run_pdf_generator(script_path: str, config: dict, timeout: int = 30):
-    if not os.path.isfile(script_path):
-        raise HTTPException(500, f'PDF-Generator fehlt: {os.path.basename(script_path)}')
-
-    tmp = tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.json', delete=False)
-    try:
-        with tmp:
-            json.dump(config, tmp, ensure_ascii=False)
-        result = subprocess.run(['node', script_path, tmp.name], capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired as e:
-        raise HTTPException(504, 'PDF-Generierung dauert zu lange') from e
-    finally:
-        try:
-            os.remove(tmp.name)
-        except FileNotFoundError:
-            pass
-
-    if result.returncode != 0:
-        raise HTTPException(500, f'PDF-Generierung fehlgeschlagen: {result.stderr[-500:]}')
-    return result
-
-
-def _safe_pdf_filename(prefix: str, customer_name: str) -> str:
-    name = re.sub(r'[^\w.-]+', '_', (customer_name or '').strip(), flags=re.UNICODE).strip('._')
-    if name.lower().endswith('.pdf'):
-        name = name[:-4].rstrip('._')
-    return f"{prefix}_{(name or 'kunde')[:80]}.pdf"
-
-
 def _require_server_script(script_path: str, label: str):
+    # Shared infrastructure helper: Objects also depends on this, so it stays in
+    # the composition/core area rather than being owned by commercial documents.
     if not script_path or not os.path.isfile(script_path):
         raise HTTPException(500, f'{label} не найден: {script_path or "-"}')
     return script_path
 
 
 ANGEBOT_SCRIPT = os.path.join(BACKEND_DIR, 'angebot_free.js')
-# moved to core/paths.py -- ANGEBOT_OUT_DIR
+RECHNUNG_SCRIPT = os.path.join(BACKEND_DIR, 'rechnung.js')
+# moved to core/paths.py -- ANGEBOT_OUT_DIR / RECHNUNG_OUT_DIR
 os.makedirs(ANGEBOT_OUT_DIR, exist_ok=True)
+os.makedirs(RECHNUNG_OUT_DIR, exist_ok=True)
 
 
-def require_angebot_access(role: str = Depends(get_role)):
-    # 'manager' role is intentionally excluded: set_role() hard-rejects any role
-    # other than 'owner'/'worker', so 'manager' can never be assigned in practice.
-    # Keeping it here would be a latent escalation path if that validation is ever relaxed.
-    if role != 'owner':
-        raise HTTPException(403, "только owner может создавать Angebot")
+# ---------- Commercial documents domain (Angebot + Rechnung) ----------
+if __package__:
+    from .routes.commercial_docs import (
+        AngebotBody,
+        AngebotKunde,
+        AngebotPosition,
+        CommercialDocsRouteDeps,
+        RechnungBody,
+        RechnungKunde,
+        RechnungPosition,
+        create_commercial_docs_router,
+    )
+else:
+    from routes.commercial_docs import (  # noqa: E402
+        AngebotBody,
+        AngebotKunde,
+        AngebotPosition,
+        CommercialDocsRouteDeps,
+        RechnungBody,
+        RechnungKunde,
+        RechnungPosition,
+        create_commercial_docs_router,
+    )
 
+_commercial_docs_router, _commercial_docs_handlers = create_commercial_docs_router(
+    CommercialDocsRouteDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        bot_token=lambda: BOT_TOKEN,
+        angebot_script=lambda: ANGEBOT_SCRIPT,
+        rechnung_script=lambda: RECHNUNG_SCRIPT,
+        angebot_out_dir=lambda: ANGEBOT_OUT_DIR,
+        rechnung_out_dir=lambda: RECHNUNG_OUT_DIR,
+    )
+)
+app.include_router(_commercial_docs_router)
 
-class AngebotKunde(BaseModel):
-    typ: str = 'privat'
-    anrede: str = ''
-    name: str
-    kontakt: str = ''
-    ustId: str = ''
-    adresse: str = ''
-    email: str = ''
-
-
-class AngebotPosition(BaseModel):
-    titel: str
-    beschreibung: str = ''
-    menge: float
-    einheit: str = 'Stk'
-    preis: float
-
-
-class AngebotBody(BaseModel):
-    kunde: AngebotKunde
-    objektAdresse: str = ''
-    positionen: list[AngebotPosition]
-    gueltigTage: int = 14
-    mwstSatz: float = 19
-    anzahlungPct: float = 40
-    signatureBase64: str | None = None  # Фаза 7: canvas-подпись, PNG data без префикса data:...
-
-
-@app.post("/api/angebot")
-def create_angebot(body: AngebotBody, user: dict = Depends(get_current_user), _: None = Depends(require_angebot_access)):
-    if not body.positionen:
-        raise HTTPException(400, "mindestens eine Position erforderlich")
-
-    out_path = os.path.join(ANGEBOT_OUT_DIR, f'{uuid.uuid4().hex}.pdf')
-    config = body.model_dump()
-    config['outPath'] = out_path
-    if config.get('signatureBase64'):
-        config['signedAt'] = datetime.now().strftime('%d.%m.%Y %H:%M')
-
-    _run_pdf_generator(ANGEBOT_SCRIPT, config)
-
-    filename = _safe_pdf_filename('Angebot', body.kunde.name)
-    send_pdf_to_chat(user['id'], out_path, filename, f'Angebot für {body.kunde.name}')
-    return FileResponse(out_path, media_type='application/pdf', filename=filename)
+# Temporary direct-call compatibility while main.py is decomposed. These are
+# aliases only; all commercial-document implementation lives in the route module.
+require_angebot_access = _commercial_docs_handlers.require_angebot_access
+send_pdf_to_chat = _commercial_docs_handlers.send_pdf_to_chat
+_run_pdf_generator = _commercial_docs_handlers.run_pdf_generator
+_safe_pdf_filename = _commercial_docs_handlers.safe_pdf_filename
+create_angebot = _commercial_docs_handlers.create_angebot
+create_rechnung = _commercial_docs_handlers.create_rechnung
 
 
 # ---------- Aufgaben (tasks) ----------
@@ -2984,60 +2923,6 @@ create_object_info_item = _objects_handlers.create_object_info_item
 delete_object_info_item = _objects_handlers.delete_object_info_item
 create_object_endpoint = _objects_handlers.create_object_endpoint
 update_object_status = _objects_handlers.update_object_status
-
-
-# ---------- Rechnung generator ----------
-RECHNUNG_SCRIPT = os.path.join(BACKEND_DIR, 'rechnung.js')
-# moved to core/paths.py -- RECHNUNG_OUT_DIR
-os.makedirs(RECHNUNG_OUT_DIR, exist_ok=True)
-
-
-class RechnungKunde(BaseModel):
-    typ: str = 'privat'
-    anrede: str = ''
-    name: str
-    kontakt: str = ''
-    ustId: str = ''
-    adresse: str = ''
-    email: str = ''
-
-
-class RechnungPosition(BaseModel):
-    titel: str
-    beschreibung: str = ''
-    menge: float
-    einheit: str = 'Stk'
-    preis: float
-
-
-class RechnungBody(BaseModel):
-    nummer: str
-    kunde: RechnungKunde
-    projekt: str = ''
-    positionen: list[RechnungPosition]
-    zahlungsfristTage: int = 14
-    mwstSatz: float = 19
-    signatureBase64: str | None = None  # Фаза 7: canvas-подпись, PNG data без префикса data:...
-
-
-@app.post("/api/rechnung")
-def create_rechnung(body: RechnungBody, user: dict = Depends(get_current_user), _: None = Depends(require_angebot_access)):
-    if not body.nummer.strip():
-        raise HTTPException(400, "Rechnung-Nr. erforderlich")
-    if not body.positionen:
-        raise HTTPException(400, "mindestens eine Position erforderlich")
-
-    out_path = os.path.join(RECHNUNG_OUT_DIR, f'{uuid.uuid4().hex}.pdf')
-    config = body.model_dump()
-    config['outPath'] = out_path
-    if config.get('signatureBase64'):
-        config['signedAt'] = datetime.now().strftime('%d.%m.%Y %H:%M')
-
-    _run_pdf_generator(RECHNUNG_SCRIPT, config)
-
-    filename = _safe_pdf_filename('Rechnung', body.kunde.name)
-    send_pdf_to_chat(user['id'], out_path, filename, f'{body.nummer} — {body.kunde.name}')
-    return FileResponse(out_path, media_type='application/pdf', filename=filename)
 
 
 # ---------- Weather feed ----------
