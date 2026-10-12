@@ -2847,517 +2847,94 @@ create_object_endpoint = _objects_handlers.create_object_endpoint
 update_object_status = _objects_handlers.update_object_status
 
 
-# ---------- Weather feed ----------
+# ---------- Weather / News / Birthdays feed domain ----------
 WEATHER_FEED_FILE = os.path.join(AGENT_ROOT, '.weather_feed.json')
-
-
-# moved to core/paths.py -- WEATHER_REACTIONS_FILE
-# {entry_key: {user_id: true}} — entry_key = "{object}::{created}" (weather-записи не имеют своего id).
-
-
-def _weather_entry_key(entry: dict) -> str:
-    return f"{entry.get('object', '')}::{entry.get('created', '')}"
-
-
-def _load_weather_reactions() -> dict:
-    return _safe_load_json(WEATHER_REACTIONS_FILE, {})
-
-
-def _save_weather_reactions(data: dict):
-    _atomic_write_json(WEATHER_REACTIONS_FILE, data)
-
-
-FEED_SAVE_TYPES = {'photo', 'news', 'weather'}
-FEED_SAVE_TYPE_ALIASES = {'photos': 'photo', 'info': 'weather'}
-
-
-def _load_feed_saved() -> dict:
-    return _safe_load_json(FEED_SAVED_FILE, {})
-
-
-def _feed_saved_bucket(saved: dict, uid: str, item_type: str) -> dict:
-    user_saved = saved.get(str(uid), {})
-    if not isinstance(user_saved, dict):
-        return {}
-    bucket = user_saved.get(item_type, {})
-    return bucket if isinstance(bucket, dict) else {}
-
-
-def _is_feed_saved(saved: dict, uid: str, item_type: str, item_id: str) -> bool:
-    return str(item_id) in _feed_saved_bucket(saved, uid, item_type)
-
-
-def _feed_item_exists(item_type: str, item_id: str) -> bool:
-    if item_type == 'photo':
-        return any(str(p.get('id')) == item_id for p in _load_photo_meta())
-    if item_type == 'news':
-        if not os.path.exists(NEWS_FEED_FILE):
-            return False
-        try:
-            with open(NEWS_FEED_FILE, encoding='utf-8') as f:
-                return any(str(p.get('id')) == item_id for p in json.load(f))
-        except Exception:
-            return False
-    if item_type == 'weather':
-        if not os.path.exists(WEATHER_FEED_FILE):
-            return False
-        try:
-            with open(WEATHER_FEED_FILE, encoding='utf-8') as f:
-                return any(_weather_entry_key(e) == item_id for e in json.load(f))
-        except Exception:
-            return False
-    return False
-
-
-@app.get("/api/feed/weather")
-def get_weather_feed(user: dict = Depends(get_current_user)):
-    if not os.path.exists(WEATHER_FEED_FILE):
-        return {"feed": []}
-    with open(WEATHER_FEED_FILE, encoding='utf-8') as f:
-        feed = json.load(f)
-    reactions = _load_weather_reactions()
-    saved = _load_feed_saved()
-    uid = str(user['id'])
-    for entry in feed:
-        key = _weather_entry_key(entry)
-        entry_reactions = reactions.get(key, {})
-        entry['likes'] = len(entry_reactions)
-        entry['liked_by_me'] = uid in entry_reactions
-        entry['saved_by_me'] = _is_feed_saved(saved, uid, 'weather', key)
-    return {"feed": feed}
-
-
-@app.post("/api/feed/weather/react")
-def react_weather_entry(body: dict, user: dict = Depends(get_current_user)):
-    """21.07: реальные лайки на погодных карточках (были декоративные, localStorage-only).
-    Ключ записи — object+created, т.к. weather-записи не имеют своего id (генерируются cron-пайплайном)."""
-    key = f"{body.get('object', '')}::{body.get('created', '')}"
-    reactions = _load_weather_reactions()
-    entry_reactions = reactions.setdefault(key, {})
-    uid = str(user['id'])
-    liked = bool(body.get('liked'))
-    if liked:
-        entry_reactions[uid] = True
-    else:
-        entry_reactions.pop(uid, None)
-    _save_weather_reactions(reactions)
-    return {"likes": len(entry_reactions), "liked_by_me": liked}
-
-
-# ---------- News feed (Фаза 9, 10.32 — лайки + read-tracking для адаптивной фильтрации) ----------
-# Наполняется отдельным cron-пайплайном на VPS (WebSearch/RSS → AI-саммари), здесь чтение + реакции.
 NEWS_FEED_FILE = os.path.join(AGENT_ROOT, '.news_feed.json')
-# moved to core/paths.py -- NEWS_REACTIONS_FILE
-# {post_id: {user_id: "like"|"dislike"}} — по одной реакции на пост от юзера, апдейт при повторном клике.
-# moved to core/paths.py -- NEWS_READS_FILE
-# {user_id: {category: read_count}} — накопитель для будущей адаптивной фильтрации ленты под интересы.
 
-
-def _load_news_reactions() -> dict:
-    return _safe_load_json(NEWS_REACTIONS_FILE, {})
-
-
-def _save_news_reactions(data: dict):
-    _atomic_write_json(NEWS_REACTIONS_FILE, data)
-
-
-def _load_news_reads() -> dict:
-    return _safe_load_json(NEWS_READS_FILE, {})
-
-
-def _save_news_reads(data: dict):
-    _atomic_write_json(NEWS_READS_FILE, data)
-
-
-# moved to core/paths.py -- BIRTHDAY_ALERTS_FILE
-def _load_birthday_alerts() -> list:
-    return _safe_load_json(BIRTHDAY_ALERTS_FILE, [])
-
-
-def _save_birthday_alerts(items: list):
-    # 22.09: _check_upcoming_birthdays() itself no longer calls this directly
-    # (moved to update_json_transaction, see its own comment) -- kept as a
-    # plain write helper for tests/tooling that need to seed/reset the store
-    # directly (test_worker_calendar_birthday.py's setUp, for instance).
-    _atomic_write_json(BIRTHDAY_ALERTS_FILE, items)
-
-
-def _check_upcoming_birthdays():
-    """10.31 + Раунд 5 §14: два алерта на день рождения worker'а —
-    «За 3 дня» и «В день рождения» — с idempotency ключами
-    birthday:<uid>:<year>:3days / birthday:<uid>:<year>:today (проверка по
-    Europe/Berlin), чтобы один и тот же alert не создавался повторно при каждом
-    заходе. Ленивая проверка при GET /api/feed/birthdays (миниапп открывают каждый
-    день) — не отдельный systemd timer.
-
-    22.09 hotfix (owner live-device finding, 196 legacy duplicate critical-alert
-    records found in production): this used to be _load_birthday_alerts() (read
-    OUTSIDE any lock) -> mutate `alerts` in Python memory -> _save_birthday_alerts()
-    (lock only covers the write) -- the same read-modify-write race already fixed
-    elsewhere this session (ack_critical_alert/resolve_critical_alert). Because
-    this function is a LAZY check that runs on every GET /api/feed/birthdays
-    (every app open, from every device/tab, no single cron), concurrent calls
-    could all read the same "not yet in `already`" state before any of them
-    wrote -- each one then passed its own `idem not in already` check and called
-    _create_critical_alert(). That inner call's OWN dedup is now correctly keyed
-    (see the ref_id=idem fix below) and would still prevent a duplicate CRITICAL
-    ALERT record even under this race, but the birthday_alerts.json idempotency
-    file itself could still race and grow spurious duplicate entries. Moved the
-    whole read-modify-write under one update_json_transaction lock so concurrent
-    calls serialize instead of racing.
-
-    23.09 (owner finding, "призрак Ивана" -- a stale canonical alert surfaced
-    by the legacy-duplicate migration's post-apply check): only iterates
-    profiles whose CURRENT role in roles.json is 'worker'. A profile can
-    outlive its role (removed/former worker, or a uid that was never
-    onboarded past profile creation) -- this used to still generate birthday
-    alerts every year forever, since the loop only ever read
-    worker_profiles.json, never cross-checked roles.json."""
-    profiles = _load_worker_profiles()
-    today = business_today()
-    d3 = today + timedelta(days=3)
-    roles = _load_roles()
-    owner_id = next((o for o, r in roles.items() if r == 'owner'), None)
-
-    # _create_critical_alert() does its own file I/O (its own
-    # update_json_transaction on CRITICAL_ALERTS_FILE, a DIFFERENT file) --
-    # deliberately called OUTSIDE the mutator below, never nested inside
-    # another update_json_transaction call (would deadlock on the same
-    # non-reentrant lock if it were the same file, and is simply wrong
-    # layering even though it's a different file/lock here).
-    to_create = []  # [(target_user_id, title, ref_id)]
-
-    def _mutate(alerts):
-        already = {a.get('idem') for a in alerts if a.get('idem')}
-
-        def _emit(uid, name, occ_date, kind, idem, title):
-            alerts.append({
-                'user_id': uid, 'name': name, 'year': occ_date.year, 'kind': kind,
-                'idem': idem, 'date': occ_date.strftime('%Y-%m-%d'), 'created_at': int(time.time()),
-            })
-            to_create.append((owner_id or uid, title, idem))
-
-        for uid, profile in profiles.items():
-            # 23.09 (owner finding): a profile can exist in worker_profiles.json
-            # for a uid that no longer has an active 'worker' role in
-            # roles.json (removed/former worker, or a uid that was never
-            # properly onboarded past profile creation) -- that used to still
-            # generate birthday alerts forever, since this loop only ever
-            # read the profile, not the role. Confirmed live: 196 legacy
-            # duplicate alerts all pointed at a uid with role=None in
-            # roles.json. Only a uid whose CURRENT role is 'worker' is
-            # eligible -- owner's own birthday (if profiled) and any
-            # departed/roleless uid are both excluded.
-            if roles.get(str(uid)) != 'worker':
-                continue
-            bday = profile.get('birthday')
-            if not bday:
-                continue
-            try:
-                bd = datetime.strptime(bday, '%Y-%m-%d').date()
-            except ValueError:
-                continue
-            name = _sanitize_display_name(profile.get('name'), uid)
-
-            # За 3 дня
-            if (bd.month, bd.day) == (d3.month, d3.day):
-                idem = f'birthday:{uid}:{d3.year}:3days'
-                if idem not in already:
-                    _emit(uid, name, d3, '3days', idem,
-                          f'🎂 Через 3 дня день рождения у {name}. Не забудьте подготовить подарок и поздравление.')
-
-            # В день рождения
-            if (bd.month, bd.day) == (today.month, today.day):
-                idem = f'birthday:{uid}:{today.year}:today'
-                if idem not in already:
-                    _emit(uid, name, today, 'today', idem, f'🎂 Сегодня день рождения у {name}')
-
-    update_json_transaction(BIRTHDAY_ALERTS_FILE, [], _mutate)
-
-    for target_user_id, title, idem in to_create:
-        try:
-            # 22.09 hotfix (owner live-device finding): ref_id was `uid` -- the
-            # SAME value for both the "3 days before" and "the day of" alert for
-            # one worker, so _create_critical_alert()'s dedup key
-            # (kind, target_user_id, ref_id) could not tell the two genuinely
-            # different events apart and would collapse one into the other.
-            # `idem` (already unique per event type AND year --
-            # birthday:<uid>:<year>:3days / :today) is the correct dedup key.
-            _create_critical_alert(target_user_id=target_user_id, kind='birthday', title=title, ref_id=idem)
-        except Exception:
-            pass
-
-
-@app.get("/api/feed/birthdays")
-def get_birthday_feed(user: dict = Depends(get_current_user)):
-    _check_upcoming_birthdays()
-    today = business_today_str()
-    upcoming = [a for a in _load_birthday_alerts() if a['date'] >= today]
-    return {"birthdays": upcoming}
-
-
-@app.get("/api/feed/news")
-def get_news_feed(user: dict = Depends(get_current_user)):
-    if not os.path.exists(NEWS_FEED_FILE):
-        return {"feed": []}
-    with open(NEWS_FEED_FILE, encoding='utf-8') as f:
-        feed = json.load(f)
-    reactions = _load_news_reactions()
-    comments = _load_news_comments()
-    saved = _load_feed_saved()
-    uid = str(user['id'])
-    for post in feed:
-        post['my_reaction'] = reactions.get(post['id'], {}).get(uid)
-        post['saved_by_me'] = _is_feed_saved(saved, uid, 'news', post['id'])
-        pc = comments.get(post['id'], [])
-        post['comment_count'] = len(pc)
-        post['last_comment_at'] = max((c.get('ts', 0) for c in pc), default=0)
-
-    reads = _load_news_reads()
-    user_reads = reads.setdefault(uid, {})
-    for post in feed:
-        cat = post.get('category') or 'Другое'
-        user_reads[cat] = user_reads.get(cat, 0) + 1
-    _save_news_reads(reads)
-
-    return {"feed": feed}
-
-
-class NewsReactionIn(BaseModel):
-    reaction: str  # "like" | "dislike" | "none" (снять реакцию)
-
-
-@app.post("/api/feed/news/{post_id}/react")
-def react_news_post(post_id: str, body: NewsReactionIn, user: dict = Depends(get_current_user)):
-    if body.reaction not in ('like', 'dislike', 'none'):
-        raise HTTPException(400, "reaction должна быть like/dislike/none")
-    if not os.path.exists(NEWS_FEED_FILE):
-        raise HTTPException(404, "лента новостей пуста")
-    with open(NEWS_FEED_FILE, encoding='utf-8') as f:
-        feed = json.load(f)
-    post = next((p for p in feed if p['id'] == post_id), None)
-    if not post:
-        raise HTTPException(404, "пост не найден")
-
-    reactions = _load_news_reactions()
-    post_reactions = reactions.setdefault(post_id, {})
-    uid = str(user['id'])
-    prev = post_reactions.get(uid)
-
-    if prev == 'like':
-        post['likes'] = max(0, post.get('likes', 0) - 1)
-    elif prev == 'dislike':
-        post['dislikes'] = max(0, post.get('dislikes', 0) - 1)
-
-    if body.reaction == 'none':
-        post_reactions.pop(uid, None)
-    else:
-        post_reactions[uid] = body.reaction
-        if body.reaction == 'like':
-            post['likes'] = post.get('likes', 0) + 1
-        else:
-            post['dislikes'] = post.get('dislikes', 0) + 1
-
-    _save_news_reactions(reactions)
-    _atomic_write_json(NEWS_FEED_FILE, feed)
-    return {"ok": True, "likes": post['likes'], "dislikes": post['dislikes'], "my_reaction": body.reaction if body.reaction != 'none' else None}
-
-
-# ---------- News comments + per-user feed read markers (Раунд 5 §8) ----------
-# Комментарии к новостям хранятся ОТДЕЛЬНО от .news_feed.json (его перезаписывает
-# cron-пайплайн) — {post_id: [ {id,user_id,name,text,ts,reply_to} ]}. Тот же lifecycle,
-# что у фото-комментариев. Read-markers — {user_id: {last_news_read_at, last_photos_read_at,
-# last_info_read_at}} (epoch); unread = публикации/активность новее отметки.
-# moved to core/paths.py -- NEWS_COMMENTS_FILE
-# moved to core/paths.py -- FEED_READS_FILE
-
-
-def _load_news_comments() -> dict:
-    return _safe_load_json(NEWS_COMMENTS_FILE, {})
-
-
-def _save_news_comments(data: dict):
-    _atomic_write_json(NEWS_COMMENTS_FILE, data)
-
-
-def _load_feed_reads() -> dict:
-    return _safe_load_json(FEED_READS_FILE, {})
-
-
-def _save_feed_reads(data: dict):
-    _atomic_write_json(FEED_READS_FILE, data)
-
-
-class NewsCommentBody(BaseModel):
-    text: str
-    reply_to: str = None
-
-
-@app.post("/api/feed/news/{post_id}/comments")
-def add_news_comment(post_id: str, body: NewsCommentBody, user: dict = Depends(get_current_user)):
-    text = (body.text or '').strip()[:500]
-    if not text:
-        raise HTTPException(400, "Комментарий не может быть пустым")
-    comments = _load_news_comments()
-    plist = comments.setdefault(post_id, [])
-    prior_ids = {c.get('user_id') for c in plist}  # комментаторы ДО нового — до append
-    actor_name = _sanitize_display_name(user.get('first_name'), str(user['id']))
-    new_id = uuid.uuid4().hex
-    plist.append({
-        'id': new_id,
-        'user_id': str(user['id']),
-        'name': actor_name,
-        'text': text,
-        'reply_to': (body.reply_to or None),
-        'ts': int(time.time()),
-    })
-    _save_news_comments(comments)
-    # Раунд 6 §5.2: activity alerts релевантным (owner + прежние комментаторы); новости из
-    # пайплайна не имеют user_id-автора → author_id=None.
-    try:
-        _emit_comment_activity_alerts(
-            'news_comment', post_id, new_id, str(user['id']), actor_name,
-            f"{actor_name} прокомментировал новость", _news_post_title(post_id),
-            _comment_alert_recipients(user['id'], prior_ids))
-    except Exception:
-        pass
-    return {"comments": plist}
-
-
-@app.get("/api/feed/news/{post_id}/comments")
-def get_news_comments(post_id: str, user: dict = Depends(get_current_user)):
-    # 22.09 (iPhone screenshot audit, Item I): comments stored `name` at write
-    # time (add_news_comment) was never re-resolved on read -- a worker who
-    # changed/set their profile name later kept showing the old/raw one in
-    # every past comment. Same read-side resolver as feed/chat/abwesenheit.
-    comments = _load_news_comments().get(post_id, [])
-    for c in comments:
-        c['name'] = _resolve_current_display_name(c.get('user_id'), c.get('name'))
-    return {"comments": comments}
-
-
-@app.delete("/api/feed/news/{post_id}/comments/{comment_id}")
-def delete_news_comment(post_id: str, comment_id: str, user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    comments = _load_news_comments()
-    plist = comments.get(post_id, [])
-    comment = next((c for c in plist if c.get('id') == comment_id), None)
-    if not comment:
-        raise HTTPException(404, "Комментарий не найден")
-    if str(comment.get('user_id')) != str(user['id']) and role != 'owner':
-        raise HTTPException(403, "Можно удалить только свой комментарий")
-    comments[post_id] = [c for c in plist if c.get('id') != comment_id]
-    _save_news_comments(comments)
-    return {"comments": comments[post_id]}
-
-
-class FeedReadBody(BaseModel):
-    tab: str  # "news" | "photos" | "info"
-
-
-class FeedSavedBody(BaseModel):
-    item_type: str  # "photo" | "news" | "weather"
-    item_id: str
-    saved: bool
-
-
-@app.post("/api/feed/read")
-def mark_feed_read(body: FeedReadBody, user: dict = Depends(get_current_user)):
-    if body.tab not in ('news', 'photos', 'info'):
-        raise HTTPException(400, "tab должен быть news/photos/info")
-    reads = _load_feed_reads()
-    urec = reads.setdefault(str(user['id']), {})
-    urec[f'last_{body.tab}_read_at'] = int(time.time())
-    _save_feed_reads(reads)
-    return {"ok": True, "tab": body.tab, "read_at": urec[f'last_{body.tab}_read_at']}
-
-
-@app.post("/api/feed/saved")
-def set_feed_saved(body: FeedSavedBody, user: dict = Depends(get_current_user)):
-    raw_item_type = (body.item_type or '').strip()
-    item_type = FEED_SAVE_TYPE_ALIASES.get(raw_item_type, raw_item_type)
-    item_id = (body.item_id or '').strip()
-    if item_type not in FEED_SAVE_TYPES:
-        raise HTTPException(400, "item_type должен быть photo/news/weather")
-    if not item_id:
-        raise HTTPException(400, "item_id обязателен")
-    if not _feed_item_exists(item_type, item_id):
-        raise HTTPException(404, "Пост не найден")
-
-    uid = str(user['id'])
-
-    def _mutate(saved: dict):
-        user_saved = saved.setdefault(uid, {})
-        if not isinstance(user_saved, dict):
-            user_saved = {}
-            saved[uid] = user_saved
-        bucket = user_saved.setdefault(item_type, {})
-        if not isinstance(bucket, dict):
-            bucket = {}
-            user_saved[item_type] = bucket
-        if body.saved:
-            bucket[item_id] = int(time.time())
-        else:
-            bucket.pop(item_id, None)
-        return {"ok": True, "item_type": item_type, "item_id": item_id, "saved_by_me": item_id in bucket}
-
-    return update_json_transaction(FEED_SAVED_FILE, {}, _mutate)
-
-
-@app.get("/api/feed/unread")
-def get_feed_unread(user: dict = Depends(get_current_user)):
-    """Счётчики НЕПРОЧИТАННОГО (не общее число). Новость непрочитана, если она
-    опубликована позже отметки ИЛИ получила новый комментарий позже отметки. Фото —
-    по ts. Погода — по created погодной записи. >99 фронт покажет как «99+»."""
-    uid = str(user['id'])
-    urec = _load_feed_reads().get(uid, {})
-    news_read = urec.get('last_news_read_at', 0)
-    photos_read = urec.get('last_photos_read_at', 0)
-    info_read = urec.get('last_info_read_at', 0)
-
-    news_unread = 0
-    if os.path.exists(NEWS_FEED_FILE):
-        try:
-            with open(NEWS_FEED_FILE, encoding='utf-8') as f:
-                feed = json.load(f)
-        except Exception:
-            feed = []
-        comments = _load_news_comments()
-        for post in feed:
-            created = post.get('created', 0) or 0
-            pc = comments.get(post['id'], [])
-            last_c = max((c.get('ts', 0) for c in pc), default=0)
-            if created > news_read or last_c > news_read:
-                news_unread += 1
-
-    photos_unread = 0
-    try:
-        for p in _load_photo_meta():
-            if (p.get('ts', 0) or 0) > photos_read:
-                photos_unread += 1
-    except Exception:
-        pass
-
-    info_unread = 0
-    if os.path.exists(WEATHER_FEED_FILE):
-        try:
-            with open(WEATHER_FEED_FILE, encoding='utf-8') as f:
-                weather_feed = json.load(f)
-            for entry in weather_feed:
-                created = entry.get('created', 0)
-                if isinstance(created, (int, float)):
-                    created_ts = int(created)
-                else:
-                    raw = str(created or '').strip()
-                    if raw.isdigit():
-                        created_ts = int(raw)
-                    else:
-                        created_ts = int(datetime.fromisoformat(raw.replace('Z', '+00:00')).timestamp()) if raw else 0
-                if created_ts > info_read:
-                    info_unread += 1
-        except Exception:
-            info_unread = 0
-
-    return {"news": news_unread, "photos": photos_unread, "info": info_unread}
+if __package__:
+    from .routes.feed_news import (
+        FEED_SAVE_TYPE_ALIASES,
+        FEED_SAVE_TYPES,
+        FeedNewsRouteDeps,
+        FeedReadBody,
+        FeedSavedBody,
+        NewsCommentBody,
+        NewsReactionIn,
+        create_feed_news_router,
+    )
+else:
+    from routes.feed_news import (  # noqa: E402
+        FEED_SAVE_TYPE_ALIASES,
+        FEED_SAVE_TYPES,
+        FeedNewsRouteDeps,
+        FeedReadBody,
+        FeedSavedBody,
+        NewsCommentBody,
+        NewsReactionIn,
+        create_feed_news_router,
+    )
+
+_feed_news_router, _feed_news_handlers = create_feed_news_router(
+    FeedNewsRouteDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        safe_load_json=lambda path, default: _safe_load_json(path, default),
+        atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+        update_json_transaction=lambda path, default, mutator: update_json_transaction(path, default, mutator),
+        weather_feed_file=lambda: WEATHER_FEED_FILE,
+        news_feed_file=lambda: NEWS_FEED_FILE,
+        weather_reactions_file=lambda: WEATHER_REACTIONS_FILE,
+        news_reactions_file=lambda: NEWS_REACTIONS_FILE,
+        news_reads_file=lambda: NEWS_READS_FILE,
+        news_comments_file=lambda: NEWS_COMMENTS_FILE,
+        feed_reads_file=lambda: FEED_READS_FILE,
+        feed_saved_file=lambda: FEED_SAVED_FILE,
+        birthday_alerts_file=lambda: BIRTHDAY_ALERTS_FILE,
+        load_photo_meta=lambda: _load_photo_meta(),
+        load_worker_profiles=lambda: _load_worker_profiles(),
+        load_roles=lambda: _load_roles(),
+        sanitize_display_name=lambda raw, fallback: _sanitize_display_name(raw, fallback),
+        resolve_current_display_name=lambda uid, fallback: _resolve_current_display_name(uid, fallback),
+        business_today=lambda: business_today(),
+        business_today_str=lambda: business_today_str(),
+        create_critical_alert=lambda *args, **kwargs: _create_critical_alert(*args, **kwargs),
+        emit_comment_activity_alerts=lambda *args, **kwargs: _emit_comment_activity_alerts(*args, **kwargs),
+        comment_alert_recipients=lambda *args, **kwargs: _comment_alert_recipients(*args, **kwargs),
+    )
+)
+app.include_router(_feed_news_router)
+
+# Temporary compatibility aliases for legacy callers/tests and the remaining
+# photo/activity code. Implementations live in routes/feed_news.py.
+_weather_entry_key = _feed_news_handlers.weather_entry_key
+_load_weather_reactions = _feed_news_handlers.load_weather_reactions
+_save_weather_reactions = _feed_news_handlers.save_weather_reactions
+_load_feed_saved = _feed_news_handlers.load_feed_saved
+_feed_saved_bucket = _feed_news_handlers.feed_saved_bucket
+_is_feed_saved = _feed_news_handlers.is_feed_saved
+_feed_item_exists = _feed_news_handlers.feed_item_exists
+_load_news_reactions = _feed_news_handlers.load_news_reactions
+_save_news_reactions = _feed_news_handlers.save_news_reactions
+_load_news_reads = _feed_news_handlers.load_news_reads
+_save_news_reads = _feed_news_handlers.save_news_reads
+_load_birthday_alerts = _feed_news_handlers.load_birthday_alerts
+_save_birthday_alerts = _feed_news_handlers.save_birthday_alerts
+_check_upcoming_birthdays = _feed_news_handlers.check_upcoming_birthdays
+_load_news_comments = _feed_news_handlers.load_news_comments
+_save_news_comments = _feed_news_handlers.save_news_comments
+_load_feed_reads = _feed_news_handlers.load_feed_reads
+_save_feed_reads = _feed_news_handlers.save_feed_reads
+get_weather_feed = _feed_news_handlers.get_weather_feed
+react_weather_entry = _feed_news_handlers.react_weather_entry
+get_birthday_feed = _feed_news_handlers.get_birthday_feed
+get_news_feed = _feed_news_handlers.get_news_feed
+react_news_post = _feed_news_handlers.react_news_post
+add_news_comment = _feed_news_handlers.add_news_comment
+get_news_comments = _feed_news_handlers.get_news_comments
+delete_news_comment = _feed_news_handlers.delete_news_comment
+mark_feed_read = _feed_news_handlers.mark_feed_read
+set_feed_saved = _feed_news_handlers.set_feed_saved
+get_feed_unread = _feed_news_handlers.get_feed_unread
 
 
 # ---------- Photo feed ----------
