@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 from pathlib import Path
 
+
+def replace_between(source: str, start_marker: str, end_marker: str, replacement: str, label: str) -> str:
+    start = source.find(start_marker)
+    end = source.find(end_marker, start)
+    if start < 0 or end < 0:
+        raise SystemExit(f'{label}: markers not found')
+    return source[:start] + replacement + source[end:]
+
+
+# 1) Extract the remaining Chat write/action implementation from main.py.
 path = Path('backend/main.py')
 text = path.read_text(encoding='utf-8')
 start_marker = '@app.get("/api/chat/attachments/{fname}")\n'
@@ -18,3 +28,61 @@ if len(new_text) >= len(text):
     raise SystemExit('expected main.py to shrink')
 path.write_text(new_text, encoding='utf-8')
 print(f'main.py: {text.count(chr(10)) + 1} -> {new_text.count(chr(10)) + 1} lines')
+
+# 2) Migrate two security tests in the large access-control suite from
+# monkey-patching main.py internals to the extracted domain harness.
+access_path = Path('tests/test_access_control.py')
+access = access_path.read_text(encoding='utf-8')
+if "sys.path.insert(0, os.path.dirname(__file__))" not in access:
+    access = access.replace(
+        "sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))\n",
+        "sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))\n"
+        "sys.path.insert(0, os.path.dirname(__file__))\n",
+        1,
+    )
+if 'from chat_domain_testkit import ChatDomainHarness' not in access:
+    access = access.replace(
+        'import main as backend  # noqa: E402\n',
+        'import main as backend  # noqa: E402\nfrom chat_domain_testkit import ChatDomainHarness  # noqa: E402\n',
+        1,
+    )
+access = replace_between(
+    access,
+    '    def test_worker_cannot_delete_another_workers_chat_message(self):\n',
+    '    def test_worker_cannot_ack_another_workers_critical_alert(self):\n',
+    '''    def test_worker_cannot_delete_another_workers_chat_message(self):\n        h = ChatDomainHarness(roles={'111': 'worker', '222': 'worker'})\n        try:\n            h.messages = [{'id': 'm1', 'user_id': 222, 'text': 'hi', 'to_user_id': None}]\n            with self.assertRaises(HTTPException) as ctx:\n                h.actions.delete_chat_message(msg_id='m1', user={'id': 111}, role='worker')\n            self.assertEqual(ctx.exception.status_code, 403)\n        finally:\n            h.close()\n\n''',
+    'cross-worker chat delete test',
+)
+access = replace_between(
+    access,
+    '    def test_worker_cannot_fetch_other_threads_chat_attachment(self):\n',
+    '    def test_worker_cannot_fetch_another_users_transcribe_audio_by_guessing_id(self):\n',
+    '''    def test_worker_cannot_fetch_other_threads_chat_attachment(self):\n        h = ChatDomainHarness(roles={'111': 'worker', '222': 'worker', '333': 'worker'})\n        try:\n            h.create_attachment('secret.jpg')\n            h.messages = [{\n                'id': 'm1', 'user_id': 222, 'to_user_id': '333',\n                'attachment': {'file': 'secret.jpg'},\n            }]\n            with self.assertRaises(HTTPException) as ctx:\n                h.actions.get_chat_attachment(fname='secret.jpg', user={'id': 111}, role='worker')\n            self.assertEqual(ctx.exception.status_code, 403)\n        finally:\n            h.close()\n\n''',
+    'direct chat attachment ACL test',
+)
+access_path.write_text(access, encoding='utf-8')
+
+# 3) Preserve archived-attachment IDOR coverage at the new domain boundary.
+release_path = Path('tests/test_release_audit2.py')
+release = release_path.read_text(encoding='utf-8')
+if "sys.path.insert(0, os.path.dirname(__file__))" not in release:
+    release = release.replace(
+        "sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))\n",
+        "sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))\n"
+        "sys.path.insert(0, os.path.dirname(__file__))\n",
+        1,
+    )
+if 'from chat_domain_testkit import ChatDomainHarness' not in release:
+    release = release.replace(
+        'import main as backend  # noqa: E402\n',
+        'import main as backend  # noqa: E402\nfrom chat_domain_testkit import ChatDomainHarness  # noqa: E402\n',
+        1,
+    )
+release = replace_between(
+    release,
+    'class ArchivedAttachmentAccessTests(unittest.TestCase):\n',
+    "\n\nif __name__ == '__main__':\n",
+    '''class ArchivedAttachmentAccessTests(unittest.TestCase):\n    def test_participant_opens_attachment_from_archived_message(self):\n        h = ChatDomainHarness()\n        try:\n            h.grant_object('OBJ-1', '10')\n            h.create_attachment('archived1.jpg')\n            h.archive = [{\n                'id': 'old1', 'ts': 1000, 'user_id': 10, 'name': 'Ivan', 'text': '',\n                'to_user_id': None, 'thread_key': 'obj:OBJ-1',\n                'attachment': {'file': 'archived1.jpg', 'name': 'photo.jpg', 'content_type': 'image/jpeg'},\n            }]\n            response = h.actions.get_chat_attachment('archived1.jpg', user=WORKER_A, role='worker')\n            self.assertTrue(response.path.endswith('archived1.jpg'))\n        finally:\n            h.close()\n\n    def test_outsider_denied_for_archived_attachment(self):\n        h = ChatDomainHarness()\n        try:\n            h.grant_object('OBJ-1', '10')\n            h.create_attachment('archived2.jpg')\n            h.archive = [{\n                'id': 'old2', 'ts': 1000, 'user_id': 10, 'name': 'Ivan', 'text': '',\n                'to_user_id': None, 'thread_key': 'obj:OBJ-1',\n                'attachment': {'file': 'archived2.jpg', 'name': 'photo.jpg', 'content_type': 'image/jpeg'},\n            }]\n            with self.assertRaises(HTTPException) as ctx:\n                h.actions.get_chat_attachment('archived2.jpg', user=WORKER_B, role='worker')\n            self.assertEqual(ctx.exception.status_code, 403)\n        finally:\n            h.close()\n''',
+    'archived attachment tests',
+)
+release_path.write_text(release, encoding='utf-8')
