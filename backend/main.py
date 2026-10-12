@@ -3825,573 +3825,81 @@ def get_feed_photo_file(photo_id: str, index: int = 0, user: dict = Depends(get_
     return FileResponse(path)
 
 
-# ---------- Team Chat ----------
-# Хранение: JSON-файл, последние 200 сообщений. Polling с фронта каждые 8 сек.
-# Инстанс один, файл достаточен — без WebSocket и БД для простоты.
-# moved to core/paths.py -- CHAT_FILE
-# moved to core/paths.py -- CHAT_ARCHIVE_FILE
-# moved to core/limits.py -- CHAT_MAX
-_chat_lock = __import__('threading').Lock()
-
-
-def _archive_chat_messages(messages: list):
-    # 28.07: owner request -- удаление треда/сообщения не должно стирать историю
-    # безвозвратно. Append-only архив на диске, отдельный от рабочего chat_messages.json
-    # (тот же принцип, что закрытые Потребности архивируются в Google Sheets вместо
-    # физического удаления).
-    if not messages:
-        return
-    archive = _safe_load_json(CHAT_ARCHIVE_FILE, [])
-    archive.extend(messages)
-    # 30.07 (Release-аудит P1): plain open(w)+json.dump -> atomic. Вызывается изнутри
-    # _save_chat, которая уже держит _chat_lock -- RMW-race закрыт, тут только crash-safety.
-    _atomic_write_json(CHAT_ARCHIVE_FILE, archive)
-
-
-def _load_chat() -> list:
-    return _safe_load_json(CHAT_FILE, [])
-
-
-def _save_chat(messages: list):
-    # 28.07: owner request -- история чата должна сохраняться на сервере, не теряться
-    # молча. Раньше messages[-CHAT_MAX:] отбрасывал всё, что не влезло в последние 200,
-    # без следа. Теперь то, что вылетает за пределы CHAT_MAX, архивируется тем же
-    # append-only архивом, что уже используется для явного удаления треда/сообщения.
-    if len(messages) > CHAT_MAX:
-        _archive_chat_messages(messages[:-CHAT_MAX])
-        messages = messages[-CHAT_MAX:]
-    # 30.07 (Release-аудит P1): plain open(w)+json.dump -> atomic. RMW-race уже
-    # закрыт _chat_lock на всех call sites, тут только crash-safety записи.
-    _atomic_write_json(CHAT_FILE, messages)
-
-
-# moved to core/limits.py -- CHAT_RETENTION_SECONDS
-
-
-def _purge_old_chat(messages: list) -> list:
-    # 28.07: то же самое -- сообщения старше 7 дней архивируются, не стираются молча.
-    cutoff = time.time() - CHAT_RETENTION_SECONDS
-    keep = [m for m in messages if m.get('ts', 0) >= cutoff]
-    expired = [m for m in messages if m.get('ts', 0) < cutoff]
-    if expired:
-        _archive_chat_messages(expired)
-    return keep
-
-
-# moved to core/paths.py -- CHAT_READS_FILE
-def _load_reads() -> dict:
-    return _safe_load_json(CHAT_READS_FILE, {})
-
-
-def _save_reads(reads: dict):
-    _atomic_write_json(CHAT_READS_FILE, reads)
-
-
-# moved to core/paths.py -- CHAT_THREAD_META_FILE
-def _load_chat_thread_meta() -> dict:
-    return _safe_load_json(CHAT_THREAD_META_FILE, {})
-
-
-def _save_chat_thread_meta(meta: dict):
-    _atomic_write_json(CHAT_THREAD_META_FILE, meta)
-
-
-# moved to core/paths.py -- CHAT_REACTIONS_FILE
-# moved to core/constants.py -- CHAT_REACTION_OPTIONS
-
-
-def _load_chat_reactions() -> list:
-    """Phase 06: список {message_id,user_id,reaction,created_at}, а не словарь --
-    один пользователь может оставить НЕСКОЛЬКО разных reaction на одно сообщение
-    (👍 и 👀 одновременно), но не два одинаковых -- уникальность по (message_id,
-    user_id, reaction), toggle снимает при повторном POST того же типа."""
-    return _safe_load_json(CHAT_REACTIONS_FILE, [])
-
-
-def _save_chat_reactions(reactions: list):
-    _atomic_write_json(CHAT_REACTIONS_FILE, reactions)
-
-
-def _reactions_summary_for_message(reactions: list, message_id: str, my_id: str) -> list:
-    by_type = {}
-    for r in reactions:
-        if r['message_id'] != message_id:
-            continue
-        entry = by_type.setdefault(r['reaction'], {'reaction': r['reaction'], 'count': 0, 'mine': False})
-        entry['count'] += 1
-        if str(r['user_id']) == my_id:
-            entry['mine'] = True
-    return [by_type[e] for e in CHAT_REACTION_OPTIONS if e in by_type]
-
-
-def _chat_thread_id(user_id: str, to_user_id: str | None) -> str:
-    if not to_user_id:
-        return 'group'
-    return '-'.join(sorted([str(user_id), str(to_user_id)]))
-
-
-def _reject_self_chat(user_id, to_user_id: str | None):
-    """Phase 06 audit: self-DM was never explicitly blocked -- a buggy/replayed
-    client sending to_user_id == own id would silently create a degenerate
-    'uid-uid' thread. Group (to_user_id falsy) and obj:/mangel:/task: threads
-    (thread_key path) are unaffected."""
-    if to_user_id and str(to_user_id) == str(user_id):
-        raise HTTPException(400, "Нельзя написать самому себе")
-
-
-def _validate_dm_recipient(to_user_id: str | None):
-    """DM targets must be active authorized users. A profile-only/revoked user
-    must not become a new ghost thread target."""
-    if not to_user_id:
-        return
-    roles = _load_roles()
-    if str(to_user_id) not in roles:
-        raise HTTPException(404, "Пользователь не найден или доступ отозван")
-
-
-def _object_chat_participants(object_id: str) -> list:
-    """03.08 (доп.раунд П2, реальный найденный баг): раньше ЛЮБОЕ назначение (даже
-    pending/declined, даже вне периода) давало доступ к чату объекта -- полное
-    несоответствие с can_access_object, которое уже требовало accepted+период.
-    Теперь строго через has_active_object_access -- тот же критерий доступа
-    одинаково для этапов/файлов/чата, не отдельная более слабая проверка."""
-    roles = _load_roles()
-    owner_id = next((uid for uid, r in roles.items() if r == 'owner'), None)
-    assignments = _load_assignments().get(object_id, [])
-    candidate_ids = {str(a['user_id']) for a in assignments}
-    today = _today_berlin_str()
-    worker_ids = {uid for uid in candidate_ids if has_active_object_access(uid, object_id, today)}
-    if owner_id:
-        worker_ids.add(str(owner_id))
-    return list(worker_ids)
-
-
-def _mangel_chat_participants(ticket_id: str) -> list:
-    roles = _load_roles()
-    # 18.09: Mängel themselves are visible/commentable for every active worker
-    # (see require_mangel_access/get_mangel_list). The chat must follow that same
-    # product rule; otherwise owner can open a defect chat while worker sees the
-    # defect card but gets a 403 on the conversation.
-    participants = {str(uid) for uid, r in roles.items() if r in ('owner', 'worker')}
-    try:
-        ticket = ml.get_ticket(ticket_id)
-        if ticket.get('assigned_worker_id'):
-            participants.add(str(ticket['assigned_worker_id']))
-        if ticket.get('created_by'):
-            participants.add(str(ticket['created_by']))
-    except Exception:
-        pass
-    return list(participants)
-
-
-def _task_chat_participants(task_id: str) -> list:
-    roles = _load_roles()
-    owner_id = next((uid for uid, r in roles.items() if r == 'owner'), None)
-    participants = {str(owner_id)} if owner_id else set()
-    task = next((t for t in _load_tasks() if t['id'] == task_id), None)
-    if task and task.get('from_user_id'):
-        participants.add(str(task['from_user_id']))
-    # 18.09: object-scoped needs are team-visible for workers assigned to that
-    # object (/api/tasks?object_id=...). Give the same workers access to the
-    # need's chat so the chat entry works like it does for owner.
-    object_id = task.get('object_id') if task else ''
-    if object_id:
-        today = _today_berlin_str()
-        for a in _load_assignments().get(str(object_id), []):
-            if _assignment_status(a) != 'accepted':
-                continue
-            d_from, d_to = a.get('date_from', ''), a.get('date_to', '')
-            if (not (d_from and d_to)) or (d_from <= today <= d_to):
-                participants.add(str(a.get('user_id')))
-    return list(participants)
-
-
-def _check_thread_access(thread_id: str, uid: str, role: str):
-    """obj:/mangel:/task: треды — доступ только участникам (не любой worker может
-    писать в чужой чат). DM/group треды не проходят через эту проверку — там
-    доступ регулируется самим thread_id (пара user_id) или ролью."""
-    if thread_id.startswith('obj:'):
-        object_id = thread_id[len('obj:'):]
-        if uid not in _object_chat_participants(object_id) and role != 'owner':
-            raise HTTPException(403, "Нет доступа к чату этого объекта")
-    elif thread_id.startswith('mangel:'):
-        ticket_id = thread_id[len('mangel:'):]
-        if uid not in _mangel_chat_participants(ticket_id) and role != 'owner':
-            raise HTTPException(403, "Нет доступа к чату этого тикета")
-    elif thread_id.startswith('task:'):
-        task_id = thread_id[len('task:'):]
-        if uid not in _task_chat_participants(task_id) and role != 'owner':
-            raise HTTPException(403, "Нет доступа к чату этой потребности")
-
-
-def _thread_title(thread_key: str) -> str:
-    if thread_key.startswith('obj:'):
-        object_id = thread_key[len('obj:'):]
-        try:
-            rows = _cached_get_used_range('Объекты')
-            if rows:
-                hdr, data = rows[0], rows[1:]
-                for r in data:
-                    row = dict(zip(hdr, r))
-                    if str(row.get('ID объекта', '')) == object_id:
-                        return f"Объект: {row.get('Объект', object_id)}"
-        except Exception:
-            pass
-        return f"Объект: {object_id}"
-    if thread_key.startswith('mangel:'):
-        ticket_id = thread_key[len('mangel:'):]
-        try:
-            ticket = ml.get_ticket(ticket_id)
-            return f"Тикет: {ticket.get('object_id', ticket_id)}"
-        except Exception:
-            return f"Тикет: {ticket_id}"
-    if thread_key.startswith('task:'):
-        task_id = thread_key[len('task:'):]
-        task = next((t for t in _load_tasks() if t['id'] == task_id), None)
-        return f"Потребность: {task['title']}" if task else f"Потребность: {task_id}"
-    return thread_key
-
-
-@app.get("/api/chat/my_threads")
-def get_my_chat_threads(user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    uid = str(user['id'])
-    messages = _load_chat()
-    keys = {m['thread_key'] for m in messages if m.get('thread_key')}
-    result = []
-    for key in keys:
-        try:
-            _check_thread_access(key, uid, role)
-        except HTTPException:
-            continue
-        thread_msgs = [m for m in messages if m.get('thread_key') == key]
-        last = max(thread_msgs, key=lambda m: m['ts']) if thread_msgs else None
-        result.append({
-            "thread_key": key,
-            "title": _thread_title(key),
-            "last_ts": last['ts'] if last else 0,
-            "last_preview": _message_preview(last),
-        })
-    result.sort(key=lambda t: t['last_ts'], reverse=True)
-    return {"threads": result}
-
-
-def _message_preview(msg: dict | None) -> str:
-    if not msg:
-        return ''
-    if msg.get('text'):
-        return msg['text']
-    if msg.get('location'):
-        return '📍 Геолокация'
-    att = msg.get('attachment') or {}
-    if (att.get('content_type') or '').startswith('audio'):
-        return '🎤 Голосовое'
-    if att:
-        return '📎 Файл'
-    return ''
-
-
-# moved to core/constants.py -- THREAD_TYPE_BY_PREFIX
-
-
-@app.get("/api/chat/threads")
-def get_normalized_chat_threads(type: str = '', user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """Phase 06: normalized shape (id/type/title/avatar_url/subtitle/last_message/
-    unread_count/muted/pinned/version) per docs/plan-phases/06-chat-hub-rebuild.md.
-    Kept ALONGSIDE the legacy /api/chat/my_threads (not replacing it) -- no frontend
-    UI reads this yet, the live Chat Hub still runs on the old endpoints, this is
-    additive groundwork for the eventual frontend rebuild.
-    `type` filter: GENERAL/DIRECT/OBJECT/DEFECT/TASK (spec's ChatThread.type enum,
-    extended with TASK per the 5-tabs decision in docs/DECISIONS.md, 2026-07-28).
-    Also fixes two real gaps found while building this: the old /api/chat/my_threads
-    never included GENERAL or DIRECT threads at all (only obj:/mangel:/task:), so
-    the frontend's "Общий чат"/DM previews in the thread list were always the
-    static fallback text, never the actual last message -- see chat.js
-    renderChatThreadList()'s _threadByKey('group') / _threadByKey(worker.user_id)
-    calls, which could never match anything this endpoint's predecessor returned.
-    No cursor/pagination -- CHAT_MAX caps total stored messages at 200 across ALL
-    threads, so pagination has no real workload to justify yet; revisit if that
-    cap is ever raised.
-    """
-    uid = str(user['id'])
-    with _chat_lock:
-        messages = _purge_old_chat(_load_chat())
-        _save_chat(messages)
-    reads = _load_reads()
-    meta = _load_chat_thread_meta()
-    profiles = _load_worker_profiles()
-    roles = _load_roles()
-
-    def _last_message_field(last):
-        return {"text": _message_preview(last), "ts": last['ts'], "sender_id": str(last['user_id'])} if last else None
-
-    threads = []
-
-    if not type or type == 'GENERAL':
-        group_msgs = [m for m in messages if not m.get('to_user_id') and not m.get('thread_key')]
-        last = max(group_msgs, key=lambda m: m['ts']) if group_msgs else None
-        unread = sum(1 for m in group_msgs if str(m.get('user_id')) != uid and m['ts'] > _thread_last_read(reads, uid, 'group'))
-        prefs = _thread_user_prefs(meta, 'group', uid)
-        threads.append({
-            "id": "group", "type": "GENERAL", "title": "Общий чат", "avatar_url": None,
-            "subtitle": _message_preview(last), "last_message": _last_message_field(last),
-            "unread_count": unread, **prefs, "version": last['ts'] if last else 0,
-        })
-
-    if not type or type == 'DIRECT':
-        for wuid in (set(roles.keys()) | set(profiles.keys())):
-            if wuid == uid:
-                continue
-            dm_msgs = [m for m in messages if not m.get('thread_key') and (
-                (str(m.get('user_id')) == uid and str(m.get('to_user_id')) == wuid) or
-                (str(m.get('user_id')) == wuid and str(m.get('to_user_id')) == uid))]
-            last = max(dm_msgs, key=lambda m: m['ts']) if dm_msgs else None
-            thread_id = _chat_thread_id(uid, wuid)
-            unread = sum(1 for m in dm_msgs if str(m.get('user_id')) != uid and m['ts'] > _thread_last_read(reads, uid, wuid))
-            prefs = _thread_user_prefs(meta, thread_id, uid)
-            p = profiles.get(wuid, {})
-            last_seen = _last_seen.get(wuid)
-            threads.append({
-                "id": wuid, "type": "DIRECT",
-                "title": _sanitize_display_name(p.get('name'), wuid),
-                "avatar_url": f"/api/profile/{wuid}/avatar" if p.get('avatar') else None,
-                "subtitle": _message_preview(last) or ('Владелец' if roles.get(wuid) == 'owner' else 'Работник'),
-                "online": bool(last_seen and (time.time() - last_seen) < ONLINE_THRESHOLD_SECONDS),
-                "last_message": _last_message_field(last),
-                "unread_count": unread, **prefs, "version": last['ts'] if last else 0,
-            })
-
-    if not type or type in ('OBJECT', 'DEFECT', 'TASK'):
-        keys = {m['thread_key'] for m in messages if m.get('thread_key')}
-        for key in keys:
-            ttype = next((v for p, v in THREAD_TYPE_BY_PREFIX.items() if key.startswith(p)), None)
-            if not ttype or (type and type != ttype):
-                continue
-            try:
-                _check_thread_access(key, uid, role)
-            except HTTPException:
-                continue
-            thread_msgs = [m for m in messages if m.get('thread_key') == key]
-            last = max(thread_msgs, key=lambda m: m['ts']) if thread_msgs else None
-            unread = sum(1 for m in thread_msgs if str(m.get('user_id')) != uid and m['ts'] > _thread_last_read(reads, uid, key))
-            prefs = _thread_user_prefs(meta, key, uid)
-            threads.append({
-                "id": key, "type": ttype, "title": _thread_title(key), "avatar_url": None,
-                "subtitle": _message_preview(last), "last_message": _last_message_field(last),
-                "unread_count": unread, **prefs, "version": last['ts'] if last else 0,
-            })
-
-    threads.sort(key=lambda t: t['last_message']['ts'] if t['last_message'] else 0, reverse=True)
-    return {"threads": threads}
-
-
-@app.get("/api/chat/messages")
-def get_chat_messages(with_: str = '', thread_key: str = '', user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    with _chat_lock:
-        messages = _purge_old_chat(_load_chat())
-        _save_chat(messages)
-    if thread_key:
-        # 10.36: чат объекта (obj:OBJ-001) или дефекта (mangel:ticket_id) — сообщения
-        # хранятся с явным полем thread_key, доступ только участникам.
-        _check_thread_access(thread_key, str(user['id']), role)
-        messages = [m for m in messages if m.get('thread_key') == thread_key]
-    elif with_:
-        # DM-тред: сообщения между мной и with_ в обе стороны
-        me = str(user['id'])
-        messages = [m for m in messages if
-                    (str(m.get('user_id')) == me and str(m.get('to_user_id')) == with_) or
-                    (str(m.get('user_id')) == with_ and str(m.get('to_user_id')) == me)]
-    else:
-        # Групповой тред: только сообщения без to_user_id (старые записи без ключа — тоже групповые)
-        messages = [m for m in messages if not m.get('to_user_id') and not m.get('thread_key')]
-
-    reactions = _load_chat_reactions()
-    my_id = str(user['id'])
-    for m in messages:
-        m['reactions'] = _reactions_summary_for_message(reactions, m['id'], my_id)
-        # 22.09 (iPhone screenshot audit): resolve the CURRENT profile name
-        # read-side, not whatever was frozen in the message at send time --
-        # see _resolve_current_display_name()'s docstring for why the stored
-        # `name` field can be permanently wrong (raw user_id) otherwise.
-        # "system" (critical-alert auto-messages) is not a real user account.
-        if m.get('user_id') != 'system':
-            m['name'] = _resolve_current_display_name(m.get('user_id'), m.get('name'))
-
-    # 28.07: owner request -- статус прочтения в личном чате (DM). Собеседник уже
-    # отмечает прочтение через существующий POST /api/chat/read (reads.json), просто
-    # никогда не отдавался обратно отправителю. Только для DM (with_) -- групповой/
-    # obj:/mangel: треды имеют много читателей, "прочитано" там неоднозначно, вне
-    # скоупа этого запроса ("в личный чат").
-    if with_:
-        other_reads = _load_reads().get(with_, {})
-        other_last_read = other_reads.get(my_id, 0) if isinstance(other_reads, dict) else int(other_reads or 0)
-        for m in messages:
-            if str(m.get('user_id')) == my_id:
-                m['read_by_recipient'] = m.get('ts', 0) <= other_last_read
-
-    return {"messages": messages}
-
-
-def _thread_last_read(reads: dict, my_id: str, thread_key: str) -> int:
-    """10.29 (Fable-аудит): reads.json теперь {user_id: {thread_id: ts}} вместо плоского
-    {user_id: ts} — открытие одного треда больше не сбрасывает badge у остальных."""
-    user_reads = reads.get(my_id, {})
-    if isinstance(user_reads, (int, float)):
-        # миграция со старого плоского формата — считаем это last_read для всех тредов сразу
-        return int(user_reads)
-    return int(user_reads.get(thread_key, 0))
-
-
-@app.get("/api/chat/unread_count")
-def get_unread_count(user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """30.07 (Release-аудит Этап 5): раньше цикл вообще не учитывал thread_key
-    (obj:/mangel:/task: треды) -- фильтровал только по to_user_id, поэтому любое
-    сообщение с thread_key (thread_key истинный, to_user_id всегда None у таких
-    сообщений) попадало в ветку "group" и считалось непрочитанным ДЛЯ ЛЮБОГО
-    пользователя против его group-last-read, независимо от того, участник ли он
-    вообще этого конкретного object/mangel/task-треда -- общий nav-badge был
-    завышен и не гас после прочтения конкретного треда. Логика приведена к тому
-    же паттерну, что уже верно работает в get_unread_by_thread ниже: явная
-    проверка _check_thread_access для thread_key-сообщений + собственный ключ
-    last-read на каждый thread_key (не смешивается с general group-веткой)."""
-    with _chat_lock:
-        messages = _load_chat()
-        reads = _load_reads()
-    meta = _load_chat_thread_meta()
-    me = str(user['id'])
-    count = 0
-    for m in messages:
-        if str(m.get('user_id')) == me:
-            continue
-        tkey = m.get('thread_key')
-        if tkey:
-            try:
-                _check_thread_access(tkey, me, role)
-            except HTTPException:
-                continue
-            thread_key = tkey
-            prefs_id = tkey
-        else:
-            to_uid = m.get('to_user_id')
-            if to_uid and str(to_uid) != me:
-                continue  # чужой DM
-            thread_key = 'group' if not to_uid else str(m['user_id'])
-            prefs_id = thread_key if not to_uid else _chat_thread_id(me, thread_key)
-        if m.get('ts', 0) <= _thread_last_read(reads, me, thread_key):
-            continue
-        if _thread_user_prefs(meta, prefs_id, me).get('muted'):
-            continue
-        count += 1
-    return {"unread": count}
-
-
-@app.get("/api/chat/unread_by_thread")
-def get_unread_by_thread(user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """10.14/10.29: разбивка непрочитанных по тредам для badge на каждой строке списка,
-    per-thread last_read — открытие одного треда не сбрасывает счётчик у остальных.
-    25.07: расширено на thread_key-треды (obj:/mangel:/task:) -- раньше badge считался
-    только для group/DM веток, вкладки Объекты/Дефекты/Потребности в списке чатов не
-    показывали unread вообще (не забыт badge в разметке -- сам подсчёт не доходил
-    до этих сообщений, т.к. цикл ниже фильтровал только по to_user_id).
-    28.07 (Phase 06): заглушённые (muted) треды исключены из счёта -- иначе mute-иконка
-    во frontend была бы декоративной, а не реальным подавлением уведомлений. prefs_id
-    для DM отличается от display-ключа thread_key (тот -- id собеседника, prefs хранятся
-    под отсортированной парой _chat_thread_id, см. set_chat_thread_prefs) -- не перепутать.
-    30.07 (Release-аудит Этап 5): та же thread_key/prefs/muted-логика теперь приведена
-    в соответствие и в /api/chat/unread_count (общий nav-badge) выше -- раньше тот
-    вообще не различал thread_key-треды (obj:/mangel:/task:) от group."""
-    with _chat_lock:
-        messages = _load_chat()
-        reads = _load_reads()
-    meta = _load_chat_thread_meta()
-    me = str(user['id'])
-    by_thread = {}
-    for m in messages:
-        if str(m.get('user_id')) == me:
-            continue
-        tkey = m.get('thread_key')
-        if tkey:
-            try:
-                _check_thread_access(tkey, me, role)
-            except HTTPException:
-                continue
-            thread_key = tkey
-            prefs_id = tkey
-        else:
-            to_uid = m.get('to_user_id')
-            if to_uid and str(to_uid) != me:
-                continue  # чужой DM
-            thread_key = 'group' if not to_uid else str(m['user_id'])
-            prefs_id = thread_key if not to_uid else _chat_thread_id(me, thread_key)
-        if m.get('ts', 0) <= _thread_last_read(reads, me, thread_key):
-            continue
-        if _thread_user_prefs(meta, prefs_id, me).get('muted'):
-            continue
-        by_thread[thread_key] = by_thread.get(thread_key, 0) + 1
-    return {"unread_by_thread": by_thread}
-
-
-@app.post("/api/chat/read")
-def mark_chat_read(with_: str = '', thread_key: str = '', user: dict = Depends(get_current_user)):
-    key = thread_key or ('group' if not with_ else with_)
-    with _chat_lock:
-        reads = _load_reads()
-        my_id = str(user['id'])
-        if not isinstance(reads.get(my_id), dict):
-            reads[my_id] = {}
-        reads[my_id][key] = int(time.time())
-        _save_reads(reads)
-    return {"ok": True}
-
-
-# moved to core/paths.py -- CHAT_ATTACH_DIR
-os.makedirs(CHAT_ATTACH_DIR, exist_ok=True)
-
-
-@app.post("/api/chat/messages/attachment")
-def post_chat_attachment(thread_key: str = Form(''), to_user_id: str = Form(''), file: UploadFile = File(...),
-                          user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """Фото/файл-вложение в чат (10.27) — отдельный multipart endpoint, т.к. текстовые
-    сообщения идут через простой JSON POST /api/chat/messages."""
-    if thread_key:
-        _check_thread_access(thread_key, str(user['id']), role)
-    else:
-        _reject_self_chat(user['id'], to_user_id or None)
-        _validate_dm_recipient(to_user_id or None)
-        thread_id = _chat_thread_id(user['id'], to_user_id or None)
-        thread_meta = _load_chat_thread_meta()
-        if thread_meta.get(thread_id, {}).get('closed') and role != 'owner':
-            raise HTTPException(403, "Чат закрыт руководством")
-
-    data = file.file.read()
-    if len(data) > 8 * 1024 * 1024:
-        raise HTTPException(400, "Файл слишком большой (макс. 8 МБ)")
-    # 30.07 (Release-аудит P0): раньше расширение бралось из имени файла от клиента
-    # без проверки содержимого -- любой файл (включая .html/.svg) сохранялся и позже
-    # отдавался через FileResponse без nosniff, что выполнялось инлайн в WebView
-    # (stored XSS). Теперь: magic-byte allowlist + расширение ТОЛЬКО из этой таблицы.
-    sniffed = sniff_chat_attachment(data)
-    if sniffed is None:
-        raise HTTPException(400, "Недопустимый тип файла")
-    _, ext = sniffed
-    fname = f'{uuid.uuid4().hex}.{ext}'
-    with open(os.path.join(CHAT_ATTACH_DIR, fname), 'wb') as f:
-        f.write(data)
-
-    msg = {
-        "id": uuid.uuid4().hex,
-        "ts": int(time.time()),
-        "user_id": user['id'],
-        "name": user.get('first_name', str(user['id'])),
-        "text": '',
-        "to_user_id": to_user_id or None,
-        "thread_key": thread_key or None,
-        "attachment": {"file": fname, "name": file.filename or fname, "content_type": file.content_type or ''},
-    }
-    with _chat_lock:
-        messages = _load_chat()
-        messages.append(msg)
-        _save_chat(messages)
-    return {"message": msg}
+# ---------- Chat core domain ----------
+# Storage, thread access, read state, reactions and attachment upload now live
+# in routes/chat.py. main.py only wires cross-domain collaborators and keeps
+# temporary aliases for later legacy functions/callers during migration.
+if __package__:
+    from .routes.chat import ChatRouteDeps, create_chat_router
+else:
+    from routes.chat import ChatRouteDeps, create_chat_router  # noqa: E402
+
+_chat_router, _chat_handlers = create_chat_router(
+    ChatRouteDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        safe_load_json=lambda path, default: _safe_load_json(path, default),
+        atomic_write_json=lambda path, value: _atomic_write_json(path, value),
+        chat_file=lambda: CHAT_FILE,
+        chat_archive_file=lambda: CHAT_ARCHIVE_FILE,
+        chat_reads_file=lambda: CHAT_READS_FILE,
+        chat_thread_meta_file=lambda: CHAT_THREAD_META_FILE,
+        chat_reactions_file=lambda: CHAT_REACTIONS_FILE,
+        chat_attach_dir=lambda: CHAT_ATTACH_DIR,
+        chat_max=CHAT_MAX,
+        chat_retention_seconds=CHAT_RETENTION_SECONDS,
+        chat_reaction_options=CHAT_REACTION_OPTIONS,
+        thread_type_by_prefix=THREAD_TYPE_BY_PREFIX,
+        default_thread_prefs=DEFAULT_THREAD_PREFS,
+        online_threshold_seconds=ONLINE_THRESHOLD_SECONDS,
+        load_roles=lambda: _load_roles(),
+        load_assignments=lambda: _load_assignments(),
+        today_berlin_str=lambda: _today_berlin_str(),
+        has_active_object_access=lambda uid, oid, today: has_active_object_access(uid, oid, today),
+        load_mangel_lib=lambda: ml,
+        load_tasks=lambda: _load_tasks(),
+        cached_get_used_range=lambda tab_name: _cached_get_used_range(tab_name),
+        load_worker_profiles=lambda: _load_worker_profiles(),
+        last_seen_for=lambda uid: _last_seen.get(str(uid)),
+        sanitize_display_name=lambda raw, fallback: _sanitize_display_name(raw, fallback),
+        resolve_current_display_name=lambda uid, fallback: _resolve_current_display_name(uid, fallback),
+        sniff_chat_attachment=lambda data: sniff_chat_attachment(data),
+    )
+)
+app.include_router(_chat_router)
+
+# Temporary compatibility surface for legacy functions later in main.py and
+# direct-call tests. Every name below points at routes/chat.py; no duplicate
+# implementation remains in main.py.
+_chat_lock = _chat_handlers.chat_lock
+_archive_chat_messages = _chat_handlers.archive_chat_messages
+_load_chat = _chat_handlers.load_chat
+_save_chat = _chat_handlers.save_chat
+_purge_old_chat = _chat_handlers.purge_old_chat
+_load_reads = _chat_handlers.load_reads
+_save_reads = _chat_handlers.save_reads
+_load_chat_thread_meta = _chat_handlers.load_chat_thread_meta
+_save_chat_thread_meta = _chat_handlers.save_chat_thread_meta
+_load_chat_reactions = _chat_handlers.load_chat_reactions
+_save_chat_reactions = _chat_handlers.save_chat_reactions
+_reactions_summary_for_message = _chat_handlers.reactions_summary_for_message
+_chat_thread_id = _chat_handlers.chat_thread_id
+_reject_self_chat = _chat_handlers.reject_self_chat
+_validate_dm_recipient = _chat_handlers.validate_dm_recipient
+_object_chat_participants = _chat_handlers.object_chat_participants
+_mangel_chat_participants = _chat_handlers.mangel_chat_participants
+_task_chat_participants = _chat_handlers.task_chat_participants
+_check_thread_access = _chat_handlers.check_thread_access
+_thread_title = _chat_handlers.thread_title
+_message_preview = _chat_handlers.message_preview
+_thread_last_read = _chat_handlers.thread_last_read
+get_my_chat_threads = _chat_handlers.get_my_chat_threads
+get_normalized_chat_threads = _chat_handlers.get_normalized_chat_threads
+get_chat_messages = _chat_handlers.get_chat_messages
+get_unread_count = _chat_handlers.get_unread_count
+get_unread_by_thread = _chat_handlers.get_unread_by_thread
+mark_chat_read = _chat_handlers.mark_chat_read
+post_chat_attachment = _chat_handlers.post_chat_attachment
 
 
 _whisper_model = None

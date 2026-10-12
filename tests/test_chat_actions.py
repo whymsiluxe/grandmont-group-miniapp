@@ -7,6 +7,7 @@
 Run:
     /home/promonta/agent/miniapp/.venv/bin/python3 -m unittest tests.test_chat_actions -v
 """
+import json
 import os
 import sys
 import unittest
@@ -295,27 +296,31 @@ class AttachmentThreadKeyTests(unittest.TestCase):
     в сообщении -- вложение, отправленное в obj:-тред, попадало в общий чат."""
 
     def test_attachment_sent_to_object_thread_gets_thread_key(self):
-        captured = {}
+        # Exercise the extracted handler against the real pytest-isolated stores.
+        # This deliberately avoids monkey-patching legacy main.py helper aliases.
+        for critical_path in (backend.ROLES_FILE, backend.OBJECT_ASSIGNMENTS_FILE, backend.CHAT_FILE):
+            marker = backend._corrupt_lock_path(critical_path)
+            if os.path.exists(marker):
+                os.remove(marker)
+        backend._atomic_write_json(backend.ROLES_FILE, {'10': 'worker'})
+        backend._atomic_write_json(backend.OBJECT_ASSIGNMENTS_FILE, {
+            'OBJ-1': [{'id': 'a1', 'user_id': '10', 'status': 'accepted'}],
+        })
+        backend._atomic_write_json(backend.CHAT_FILE, [])
 
-        def fake_save(messages):
-            captured['messages'] = messages
-
-        with patch.object(backend, '_load_chat', return_value=[]), \
-             patch.object(backend, '_save_chat', side_effect=fake_save), \
-             patch.object(backend, '_check_thread_access'), \
-             patch.object(backend, 'sniff_chat_attachment', return_value=('image/jpeg', 'jpg')), \
-             patch('builtins.open', unittest.mock.mock_open()):
-            fake_file = unittest.mock.MagicMock()
-            fake_file.file.read.return_value = b'fake-image-bytes'
-            fake_file.filename = 'photo.jpg'
-            fake_file.content_type = 'image/jpeg'
-            result = backend.post_chat_attachment(
-                thread_key='obj:OBJ-1', to_user_id='', file=fake_file,
-                user=WORKER_A, role='worker',
-            )
+        fake_file = unittest.mock.MagicMock()
+        # Minimal JPEG magic is enough for sniff_chat_attachment().
+        fake_file.file.read.return_value = b'\xff\xd8\xff\xe0' + b'chat-test'
+        fake_file.filename = 'photo.jpg'
+        fake_file.content_type = 'image/jpeg'
+        result = backend.post_chat_attachment(
+            thread_key='obj:OBJ-1', to_user_id='', file=fake_file,
+            user=WORKER_A, role='worker',
+        )
+        persisted = backend._safe_load_json(backend.CHAT_FILE, [])
         self.assertEqual(result['message']['thread_key'], 'obj:OBJ-1')
         self.assertIsNone(result['message']['to_user_id'])
-        self.assertEqual(captured['messages'][0]['thread_key'], 'obj:OBJ-1')
+        self.assertEqual(persisted[-1]['thread_key'], 'obj:OBJ-1')
 
 
 if __name__ == '__main__':
