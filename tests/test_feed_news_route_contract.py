@@ -5,6 +5,7 @@ import sys
 os.environ.setdefault('BOT_TOKEN', 'ci-dummy')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 import main as backend  # noqa: E402
+from conftest import iter_app_routes  # noqa: E402
 
 
 EXPECTED = {
@@ -24,7 +25,7 @@ EXPECTED = {
 
 def test_feed_news_routes_are_present_once_and_owned_by_extracted_module():
     matched = {}
-    for route in backend.app.routes:
+    for route in iter_app_routes(backend.app):
         path = getattr(route, 'path', None)
         methods = getattr(route, 'methods', set()) or set()
         for method in methods:
