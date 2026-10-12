@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable
 
 
@@ -23,7 +23,7 @@ def health_response(app_version_file: str) -> dict:
         "service": "grandmont-group-miniapp",
         "version": version_info["version"],
         "commit": version_info["commit"],
-        "time": datetime.utcnow().isoformat() + "Z",
+        "time": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
     }
 
 
