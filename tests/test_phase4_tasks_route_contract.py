@@ -53,19 +53,25 @@ AUTH_HEADERS = [
     ("authorization", "header", False, None, None),
     ("x-telegram-init-data", "header", False, None, None),
 ]
+# The legacy object-task POST function was named create_task, but a later
+# /api/tasks handler reused that same module-level name. So only GET and PATCH
+# had stable main.py symbols; POST is guarded by its registered endpoint/module
+# identity instead of inventing a compatibility alias that never existed.
 ROUTES = [
-    ("GET", "/api/objects/{object_id}/tasks", "get_tasks", "get_tasks_api_objects__object_id__tasks_get", [("user","user"),("_","object_access")], [("object_id","path",True,"string","<required>")], None),
-    ("POST", "/api/objects/{object_id}/tasks", "create_task", "create_task_api_objects__object_id__tasks_post", [("user","user"),("_","owner")], [("object_id","path",True,"string","<required>")], "TaskBody"),
-    ("PATCH", "/api/tasks/{task_id}/complete", "complete_task", "complete_task_api_tasks__task_id__complete_patch", [("user","user"),("_","owner")], [("task_id","path",True,"string","<required>")], None),
+    ("GET", "/api/objects/{object_id}/tasks", "get_tasks", True, "get_tasks_api_objects__object_id__tasks_get", [("user","user"),("_","object_access")], [("object_id","path",True,"string","<required>")], None),
+    ("POST", "/api/objects/{object_id}/tasks", "create_task", False, "create_task_api_objects__object_id__tasks_post", [("user","user"),("_","owner")], [("object_id","path",True,"string","<required>")], "TaskBody"),
+    ("PATCH", "/api/tasks/{task_id}/complete", "complete_task", True, "complete_task_api_tasks__task_id__complete_patch", [("user","user"),("_","owner")], [("task_id","path",True,"string","<required>")], None),
 ]
 
-for method, path, handler_name, operation_id, deps, local_params, body_model in ROUTES:
+for method, path, handler_name, stable_main_alias, operation_id, deps, local_params, body_model in ROUTES:
     matches = [r for r in routes if getattr(r, "path", None) == path and method in getattr(r, "methods", set())]
     assert len(matches) == 1, (method, path, len(matches))
     route = matches[0]
-    handler = getattr(backend, handler_name)
-    assert route.endpoint is handler, (method, path, "endpoint identity")
     assert route.name == handler_name, (method, path, route.name)
+    assert route.endpoint.__name__ == handler_name, (method, path, route.endpoint.__name__)
+    assert route.endpoint.__module__ in {"routes.tasks", "miniapp.routes.tasks"}, (method, path, route.endpoint.__module__)
+    if stable_main_alias:
+        assert route.endpoint is getattr(backend, handler_name), (method, path, "endpoint identity")
     assert route.methods == {method}, (method, path, route.methods)
     assert route.unique_id == operation_id, (method, path, route.unique_id)
     assert route.status_code is None and route.response_model is None and route.responses == {}, (method, path)
@@ -113,7 +119,7 @@ for node in ast.walk(tree):
             offenders.append(name)
 assert not offenders, offenders
 
-# No direct task endpoint implementation may creep back into main.py.
+# No direct object-task endpoint implementation may creep back into main.py.
 main_tree = ast.parse(inspect.getsource(backend))
 for node in ast.walk(main_tree):
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -131,9 +137,19 @@ for node in ast.walk(main_tree):
                 "/api/tasks/{task_id}/complete",
             }, (node.name, first.value)
 
-for method, path, handler_name, *_ in ROUTES:
-    route = next(r for r in routes if getattr(r, "path", None) == path and method in getattr(r, "methods", set()))
-    assert getattr(backend, handler_name) is route.endpoint, (path, handler_name)
+# Preserve the pre-existing name collision instead of changing public module
+# behavior: backend.create_task must still be the later /api/tasks handler, not
+# the extracted object-task POST handler.
+object_create_route = next(
+    r for r in routes
+    if getattr(r, "path", None) == "/api/objects/{object_id}/tasks" and "POST" in getattr(r, "methods", set())
+)
+global_create_route = next(
+    r for r in routes
+    if getattr(r, "path", None) == "/api/tasks" and "POST" in getattr(r, "methods", set())
+)
+assert backend.create_task is global_create_route.endpoint
+assert backend.create_task is not object_create_route.endpoint
 
 print("phase4-tasks-contract-ok", len(ROUTES))
 '''
