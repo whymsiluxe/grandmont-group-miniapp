@@ -1056,254 +1056,36 @@ def _write_zeiterfassung_row(session: dict, object_id: str, user_id: str):
         print(f'WARNING: Zeiterfassung sheet write failed: {e}')
 
 
-@app.get("/api/profile/stats")
-def profile_stats(user_id: str = '', period: str = 'week', user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    """Агрегированная статистика для экрана профиля (Фаза 8 + 21.07 period-pills).
-    Часы/история вычисляются на чтении из checkin_meta + assignments — не дублируются в хранении.
-    Работник видит только себя; owner может запросить любого через ?user_id=.
-    period: week (7 колец, дефолт, обратная совместимость) | month (heatmap 30 дней) |
-    3months | year (агрегация по неделям/месяцам — 3 разных визуальных режима, не один рендер с другим диапазоном)."""
-    from datetime import timedelta
-    target = user_id if (role == 'owner' and user_id) else str(user['id'])
-    sessions = [s for s in _load_checkin_meta() if str(s.get('user_id')) == target]
+# ---------- Workforce statistics domain ----------
+try:
+    from .routes.workforce_stats import WorkforceStatsDeps, create_workforce_stats_router
+except ImportError:
+    from routes.workforce_stats import WorkforceStatsDeps, create_workforce_stats_router  # noqa: E402
 
-    # 21.07: owner смотрит СВОЙ профиль (без ?user_id=) — не отмечает check-in физически,
-    # личные часы всегда пусты. Вместо этого — агрегат "часы по каждому работнику за неделю".
-    team_hours = None
-    if role == 'owner' and not user_id:
-        roles = _load_roles()
-        worker_ids = [uid for uid, r in roles.items() if r == 'worker']
-        profiles_map = _load_worker_profiles()
-        today0 = business_today()  # 03.08 (ТЗ Задача 5): было date.today() (UTC) -- вечером Berlin это уже "завтра" UTC
-        week_start = today0 - timedelta(days=6)
-        team_hours = []
-        for wid in worker_ids:
-            w_sessions = [s for s in _load_checkin_meta() if str(s.get('user_id')) == wid
-                         and week_start.isoformat() <= s.get('date', '') <= today0.isoformat()]
-            hours = round(sum(_hours_from_session(s) for s in w_sessions), 1)
-            team_hours.append({
-                'user_id': wid,
-                'name': _sanitize_display_name(profiles_map.get(wid, {}).get('name'), wid),
-                'hours': hours,
-            })
-        team_hours.sort(key=lambda t: t['hours'], reverse=True)
-
-    # period-агрегаты (batch 1 Kalo референс): month = heatmap по дням, 3months/year = bar по неделям/месяцам
-    period_data = None
-    if period == 'month':
-        today0 = business_today()  # 03.08 (ТЗ Задача 5): было date.today() (UTC)
-        days = []
-        for i in range(29, -1, -1):
-            d = today0 - timedelta(days=i)
-            iso = d.isoformat()
-            hours = sum(_hours_from_session(s) for s in sessions if s.get('date') == iso)
-            days.append({'date': iso, 'hours': round(hours, 2)})
-        period_data = {'kind': 'heatmap', 'days': days, 'total_hours': round(sum(d['hours'] for d in days), 1)}
-    elif period in ('3months', 'year'):
-        weeks_back = 13 if period == '3months' else 52
-        today0 = business_today()  # 03.08 (ТЗ Задача 5): было date.today() (UTC)
-        buckets = []
-        for i in range(weeks_back - 1, -1, -1):
-            week_end = today0 - timedelta(days=i * 7)
-            week_start = week_end - timedelta(days=6)
-            hours = sum(_hours_from_session(s) for s in sessions
-                        if week_start.isoformat() <= s.get('date', '') <= week_end.isoformat())
-            buckets.append({'label': week_start.isoformat(), 'hours': round(hours, 2)})
-        period_data = {'kind': 'bar', 'buckets': buckets, 'total_hours': round(sum(b['hours'] for b in buckets), 1)}
-
-    # 7 кругов дней недели: последние 7 дней, часы на день
-    today = business_today()  # 03.08 (ТЗ Задача 5): было date.today() (UTC)
-    week = []
-    for i in range(6, -1, -1):
-        d = today - timedelta(days=i)
-        iso = d.isoformat()
-        hours = sum(_hours_from_session(s) for s in sessions if s.get('date') == iso)
-        week.append({'date': iso, 'weekday': d.weekday(), 'hours': round(hours, 2)})
-
-    # История объектов: check-in сессии + назначения (bubble-assign)
-    by_obj = {}
-    for s in sessions:
-        oid = str(s.get('object_id', ''))
-        rec = by_obj.setdefault(oid, {'object_id': oid, 'sessions': 0, 'total_hours': 0.0, 'last_date': '', 'assigned_stages': []})
-        rec['sessions'] += 1
-        rec['total_hours'] += _hours_from_session(s)
-        rec['last_date'] = max(rec['last_date'], s.get('date', ''))
-    for oid, lst in _load_assignments().items():
-        for a in lst:
-            if a.get('user_id') == target:
-                rec = by_obj.setdefault(str(oid), {'object_id': str(oid), 'sessions': 0, 'total_hours': 0.0, 'last_date': '', 'assigned_stages': []})
-                if a.get('stage_id'):
-                    rec['assigned_stages'].append(a['stage_id'])
-    objects_hist = sorted(by_obj.values(), key=lambda r: r['last_date'], reverse=True)
-    for rec in objects_hist:
-        rec['total_hours'] = round(rec['total_hours'], 1)
-    try:
-        rows = _cached_get_used_range('Объекты')
-        names = {}
-        if rows:
-            hdr = rows[0]
-            for r in rows[1:]:
-                row = dict(zip(hdr, r))
-                names[str(row.get('ID объекта', ''))] = row.get('Объект', '')
-        for rec in objects_hist:
-            rec['object_name'] = names.get(rec['object_id']) or rec['object_id']
-    except Exception:
-        for rec in objects_hist:
-            rec['object_name'] = rec['object_id']
-
-    # Work-speed: из AI-анализов прогресса (Фаза 4b); аккуратно опускается, если анализов не было
-    finished = [s for s in sessions if not s.get('manual_entry') and s.get('finish_at')]
-    avg_session_hours = round(sum(_hours_from_session(s) for s in finished) / len(finished), 2) if finished else None
-    analyzed = [s for s in sessions if (s.get('analysis') or {}).get('progress')]
-    work_speed = None
-    if analyzed:
-        last = max(analyzed, key=lambda s: s.get('finish_at') or 0)
-        work_speed = {
-            'analyzed_sessions': len(analyzed),
-            'last_summary': (last['analysis']['progress'] or '')[:400],
-        }
-
-    # Урлауб-баланс: 24 рабочих дня в год (немецкий минимум) минус одобренные Urlaub-заявки (10.31)
-    URLAUB_YEARLY_DAYS = 24
-    this_year = str(today.year)
-    urlaub_used = 0
-    krankheit_used = 0
-    for e in _load_abwesenheit():
-        if str(e.get('user_id')) != target or e.get('status') != 'approved':
-            continue
-        if not e.get('date_from', '').startswith(this_year):
-            continue
-        d1 = datetime.strptime(e['date_from'], '%Y-%m-%d').date()
-        d2 = datetime.strptime(e['date_to'], '%Y-%m-%d').date()
-        days = (d2 - d1).days + 1
-        if e.get('reason') == 'Urlaub':
-            urlaub_used += days
-        elif e.get('reason') == 'Krankheit':
-            krankheit_used += days
-
-    profile = _get_worker_profile(target)
-    # 01.08 (доп.раунд П2): frontend (profile.js _loadProfileStats) читает stats.skills_v2
-    # для уровня/verified -- backend отдавал только сырой legacy 'skills' (список
-    # названий), skills_v2 отсутствовал вообще, owner никогда не видел уровень/verified
-    # чужого работника на этом экране.
-    stats_skills_v2 = _get_worker_skills_v2(target)
-    return {
-        'user_id': target,
-        'name': _sanitize_display_name(
-            profile.get('name') or (user.get('first_name') if target == str(user['id']) else None),
-            target,
-        ),
-        'role': _load_roles().get(target, 'worker'),
-        'skills': pskills.legacy_skill_names_from_v2(stats_skills_v2),
-        'skills_v2': stats_skills_v2,
-        'sizes': {
-            'pants': profile.get('pants_size', ''),
-            'shirt': profile.get('shirt_size', ''),
-            'shoe': profile.get('shoe_size', ''),
-        },
-        'has_avatar': bool(profile.get('avatar')),
-        # Раунд 6 §3.3: полную дату рождения видит только Owner или сам работник —
-        # этот endpoint и так отдаёт чужой профиль исключительно owner'у (target-гейт выше).
-        'birthday': profile.get('birthday'),
-        'urlaub': {'used': urlaub_used, 'total': URLAUB_YEARLY_DAYS, 'remaining': max(0, URLAUB_YEARLY_DAYS - urlaub_used)},
-        'krankheit_days_this_year': krankheit_used,
-        'week': week,
-        'week_total_hours': round(sum(d['hours'] for d in week), 1),
-        'period': period,
-        'period_data': period_data,
-        'team_hours': team_hours,
-        'avg_session_hours': avg_session_hours,
-        'work_speed': work_speed,
-        'objects': objects_hist,
-    }
-
-
-@app.get("/api/dashboard/team-hours")
-def get_dashboard_team_hours(date_from: str = '', date_to: str = '',
-                             user: dict = Depends(get_current_user),
-                             _: None = Depends(require_owner)):
-    """Раунд1 Задача 1.6: часы ВСЕЙ команды за неделю для экрана Команда → Сводка.
-    owner-only (Worker -> 403, та же чувствительность что shifts-today -- агрегирует
-    личные часы всех работников). Период по умолчанию -- текущая календарная неделя
-    Пн-Вс Europe/Berlin; date_from/date_to опциональны (прошлая неделя).
-
-    profile_stats.team_hours отдаёт только {user_id,name,hours} без today/is_working_now/
-    current_object -- недостаточно для этого блока, поэтому отдельный endpoint. Часы:
-    завершённые смены -- finish-start-pause; идущая смена -- elapsed до текущего момента
-    (считается один раз, не дублируется); manual -- end-start-pause."""
-    from datetime import timedelta, date as _date
-
-    def _parse(s):
-        try:
-            return _date.fromisoformat(s)
-        except Exception:
-            return None
-
-    today = business_today()
-    d_from, d_to = _parse(date_from), _parse(date_to)
-    if not (d_from and d_to):
-        d_from = today - timedelta(days=today.weekday())   # понедельник этой недели
-        d_to = d_from + timedelta(days=6)                  # воскресенье
-    if d_from > d_to:
-        d_from, d_to = d_to, d_from
-    if (d_to - d_from).days > 62:                          # разумный предел окна
-        d_to = d_from + timedelta(days=62)
-    from_iso, to_iso, today_iso = d_from.isoformat(), d_to.isoformat(), today.isoformat()
-    today_in_range = from_iso <= today_iso <= to_iso
-
-    roles = _load_roles()
-    worker_ids = [uid for uid, r in roles.items() if r == 'worker']
-    profiles_map = _load_worker_profiles()
-    all_sessions = _load_checkin_meta()
-
-    object_names = {}
-    try:
-        rows = _cached_get_used_range('Объекты')
-        if rows:
-            hdr = rows[0]
-            for r in rows[1:]:
-                row = dict(zip(hdr, r))
-                object_names[str(row.get('ID объекта', ''))] = row.get('Объект', '')
-    except Exception:
-        object_names = {}
-
-    def _safe_team_name(wid):
-        # _sanitize_display_name fallback -- сам wid (числовой Telegram ID); ТЗ 1.2 явно
-        # запрещает показывать ID вместо имени -> fallback "Сотрудник", плюс страховка
-        # если сохранённое имя само оказалось чисто числовым.
-        nm = _sanitize_display_name(profiles_map.get(wid, {}).get('name'), 'Сотрудник')
-        return 'Сотрудник' if (nm.strip() == str(wid) or nm.strip().isdigit()) else nm
-
-    workers = []
-    for wid in worker_ids:
-        w_sessions = [s for s in all_sessions if str(s.get('user_id')) == wid]
-        in_range = [s for s in w_sessions if from_iso <= s.get('date', '') <= to_iso]
-        hours_week = round(sum(_session_hours_live(s) for s in in_range), 1)
-        today_sess = [s for s in w_sessions if s.get('date', '') == today_iso] if today_in_range else []
-        hours_today = round(sum(_session_hours_live(s) for s in today_sess), 1)
-        open_s = next((s for s in today_sess if _is_active_photo_checkin_session(s)), None)
-        is_working_now = open_s is not None
-        cur_oid = str(open_s.get('object_id', '')) if open_s else ''
-        workers.append({
-            'user_id': wid,
-            'name': _safe_team_name(wid),
-            'has_avatar': bool(profiles_map.get(wid, {}).get('avatar')),
-            'hours_today': hours_today,
-            'hours_week': hours_week,
-            'is_working_now': is_working_now,
-            'current_object_id': cur_oid,
-            'current_object_name': (object_names.get(cur_oid, cur_oid) if cur_oid else ''),
-        })
-    # сортировка (ТЗ 1.2): 1) кто сейчас работает, 2) часы недели убыв., 3) с 0 часами в конце
-    workers.sort(key=lambda w: (not w['is_working_now'], -w['hours_week'], w['name'].lower()))
-    return {
-        'date_from': from_iso,
-        'date_to': to_iso,
-        'total_hours': round(sum(w['hours_week'] for w in workers), 1),
-        'today_hours': round(sum(w['hours_today'] for w in workers), 1),
-        'workers_with_hours': sum(1 for w in workers if w['hours_week'] > 0),
-        'workers': workers,
-    }
+_workforce_stats_router, _workforce_stats_handlers = create_workforce_stats_router(
+    WorkforceStatsDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        require_owner=require_owner,
+        load_checkin_meta=lambda: _load_checkin_meta(),
+        load_roles=lambda: _load_roles(),
+        load_worker_profiles=lambda: _load_worker_profiles(),
+        sanitize_display_name=lambda raw, fallback: _sanitize_display_name(raw, fallback),
+        hours_from_session=lambda session: _hours_from_session(session),
+        session_hours_live=lambda session: _session_hours_live(session),
+        is_active_photo_checkin_session=lambda session: _is_active_photo_checkin_session(session),
+        business_today=lambda: business_today(),
+        load_assignments=lambda: _load_assignments(),
+        cached_get_used_range=lambda tab: _cached_get_used_range(tab),
+        load_abwesenheit=lambda: _load_abwesenheit(),
+        get_worker_profile=lambda uid: _get_worker_profile(uid),
+        get_worker_skills_v2=lambda uid: _get_worker_skills_v2(uid),
+        legacy_skill_names_from_v2=pskills.legacy_skill_names_from_v2,
+    )
+)
+app.include_router(_workforce_stats_router)
+profile_stats = _workforce_stats_handlers.profile_stats
+get_dashboard_team_hours = _workforce_stats_handlers.get_dashboard_team_hours
 
 
 # ---------- Назначения работников на объекты (Фаза 2c, восстановлено после инцидента Фазы 3) ----------
