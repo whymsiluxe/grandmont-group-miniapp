@@ -1546,21 +1546,13 @@ _commercial_docs_router, _commercial_docs_handlers = create_commercial_docs_rout
         rechnung_script=lambda: RECHNUNG_SCRIPT,
         angebot_out_dir=lambda: ANGEBOT_OUT_DIR,
         rechnung_out_dir=lambda: RECHNUNG_OUT_DIR,
-        # Late-bound compatibility: callers/tests that temporarily replace the
-        # legacy main.py helper names still affect the extracted endpoints.
-        send_pdf=lambda *args, **kwargs: send_pdf_to_chat(*args, **kwargs),
-        generate_pdf=lambda *args, **kwargs: _run_pdf_generator(*args, **kwargs),
-        make_pdf_filename=lambda prefix, customer: _safe_pdf_filename(prefix, customer),
     )
 )
 app.include_router(_commercial_docs_router)
 
-# Temporary direct-call compatibility while main.py is decomposed. These are
-# aliases only; all commercial-document implementation lives in the route module.
+# Direct-call compatibility for the public endpoint/auth handlers. All helper
+# implementation stays private to routes.commercial_docs.
 require_angebot_access = _commercial_docs_handlers.require_angebot_access
-send_pdf_to_chat = _commercial_docs_handlers.send_pdf_to_chat
-_run_pdf_generator = _commercial_docs_handlers.run_pdf_generator
-_safe_pdf_filename = _commercial_docs_handlers.safe_pdf_filename
 create_angebot = _commercial_docs_handlers.create_angebot
 create_rechnung = _commercial_docs_handlers.create_rechnung
 
