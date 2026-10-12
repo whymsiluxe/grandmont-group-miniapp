@@ -65,6 +65,39 @@ class CheckinSupportRuntime:
             except OSError:
                 pass
 
+    @staticmethod
+    def photo_pause_seconds(session: dict) -> int:
+        if session.get('pause_accumulated_seconds') is not None:
+            return max(0, int(session.get('pause_accumulated_seconds') or 0))
+        return max(0, int(session.get('pause_minutes') or 0)) * 60
+
+    def photo_pause_minutes(self, session: dict) -> int:
+        return round(self.photo_pause_seconds(session) / 60)
+
+    @staticmethod
+    def is_active_photo_checkin_session(session: dict) -> bool:
+        return bool(session) and not session.get('manual_entry') and session.get('finish_at') is None
+
+    def hours_from_session(self, session: dict) -> float:
+        if session.get('manual_entry'):
+            try:
+                h1, m1 = map(int, session['start_time'].split(':'))
+                h2, m2 = map(int, session['end_time'].split(':'))
+                minutes = (
+                    (h2 * 60 + m2) - (h1 * 60 + m1)
+                    - int(session.get('pause_minutes') or 0)
+                )
+                return max(0, minutes) / 60.0
+            except Exception:
+                return 0.0
+        if session.get('start_at') and session.get('finish_at'):
+            pause_seconds = self.photo_pause_seconds(session)
+            return max(
+                0,
+                (session['finish_at'] - session['start_at']) - pause_seconds,
+            ) / 3600.0
+        return 0.0
+
     def get_active_assignment(self, user_id: str, object_id: str, today: str) -> str:
         candidates = [
             assignment
