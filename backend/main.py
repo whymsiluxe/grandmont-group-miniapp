@@ -1352,13 +1352,6 @@ def _assignment_periods_overlap(a: dict, b: dict) -> bool:
 
 
 
-def _assignment_status(a: dict) -> str:
-    """Compatibility rule (ТЗ п.9): назначения, созданные до введения поля status,
-    трактуются как уже принятые -- иначе Worker Home у всех существующих объектов
-    внезапно показал бы "ожидает подтверждения" для того, что реально уже идёт."""
-    return a.get('status') or 'accepted'
-
-
 ASSIGNMENT_CONFIRM_WARNING_SECONDS = 2 * 60 * 60
 ASSIGNMENT_CONFIRM_DANGER_SECONDS = 4 * 60 * 60
 
@@ -1367,379 +1360,44 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 
-def _parse_assignment_timestamp(value) -> int | None:
-    if value in (None, ''):
-        return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    raw = str(value).strip()
-    if not raw:
-        return None
-    try:
-        if raw.endswith('Z'):
-            raw = raw[:-1] + '+00:00'
-        dt = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp())
+# ---------- Owner dashboard domain ----------
+try:
+    from .routes.owner_dashboard import OwnerDashboardDeps, create_owner_dashboard_router
+except ImportError:
+    from routes.owner_dashboard import OwnerDashboardDeps, create_owner_dashboard_router  # noqa: E402
 
-
-def _assignment_pending_escalation(a: dict, now_ts: int | None = None) -> dict:
-    if _assignment_status(a) != 'pending':
-        return {"level": "", "type": "", "age_seconds": 0}
-    now_ts = int(time.time()) if now_ts is None else int(now_ts)
-    start_ts = (
-        _parse_assignment_timestamp(a.get('pending_since')) or
-        _parse_assignment_timestamp(a.get('updated_at')) or
-        _parse_assignment_timestamp(a.get('assigned_at'))
+_owner_dashboard_router, _owner_dashboard_handlers = create_owner_dashboard_router(
+    OwnerDashboardDeps(
+        get_current_user=get_current_user,
+        require_owner=require_owner,
+        business_today_str=lambda: business_today_str(),
+        business_today=lambda: business_today(),
+        load_checkin_meta=lambda: _load_checkin_meta(),
+        load_worker_profiles=lambda: _load_worker_profiles(),
+        sanitize_display_name=lambda raw, fallback: _sanitize_display_name(raw, fallback),
+        cached_get_used_range=lambda tab: _cached_get_used_range(tab),
+        is_active_photo_checkin_session=lambda session: _is_active_photo_checkin_session(session),
+        hours_from_session=lambda session: _hours_from_session(session),
+        load_assignments=lambda: _load_assignments(),
+        load_abwesenheit=lambda: _load_abwesenheit(),
+        load_roles=lambda: _load_roles(),
+        load_repo_objekte_lib=lambda: _load_repo_objekte_lib(),
+        load_roadmap_store=lambda: _safe_load_json(rl.ROADMAP_FILE, rl._default_store()),
+        skill_display_name=pskills.skill_display_name,
+        confirm_warning_seconds=ASSIGNMENT_CONFIRM_WARNING_SECONDS,
+        confirm_danger_seconds=ASSIGNMENT_CONFIRM_DANGER_SECONDS,
     )
-    if not start_ts:
-        return {"level": "", "type": "", "age_seconds": 0}
-    age = max(0, now_ts - start_ts)
-    if age >= ASSIGNMENT_CONFIRM_DANGER_SECONDS:
-        return {"level": "danger", "type": "red", "age_seconds": age}
-    if age >= ASSIGNMENT_CONFIRM_WARNING_SECONDS:
-        return {"level": "warning", "type": "yellow", "age_seconds": age}
-    return {"level": "", "type": "", "age_seconds": age}
+)
+app.include_router(_owner_dashboard_router)
 
-
-# ---------- Owner dashboard: смены сегодня (B5, 27.07) ----------
-@app.get("/api/dashboard/shifts-today")
-def get_dashboard_shifts_today(user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    """Кто сейчас работает / кто назначен но не начал / все смены за сегодня --
-    для owner dashboard. owner-only: агрегирует GPS/личные данные всех работников,
-    та же чувствительность что у GET /api/checkin (уже owner-gated для чужих сессий)."""
-    today = business_today_str()
-    sessions = _load_checkin_meta()
-    today_sessions = [s for s in sessions if s.get('date') == today]
-
-    profiles = _load_worker_profiles()
-    rows = _cached_get_used_range('Объекты')
-    object_names = {}
-    if rows:
-        header, data = rows[0], rows[1:]
-        for r in data:
-            obj = dict(zip(header, r))
-            object_names[str(obj.get('ID объекта', ''))] = obj.get('Объект', '')
-
-    def _worker_name(uid):
-        return _sanitize_display_name(profiles.get(str(uid), {}).get('name'), str(uid))
-
-    def _worker_specialty(uid):
-        skills = profiles.get(str(uid), {}).get('skills') or []
-        return skills[0] if skills else ''
-
-    working_now = []
-    finished_today = []
-    for s in today_sessions:
-        entry = {
-            "user_id": str(s['user_id']),
-            "worker_name": _worker_name(s['user_id']),
-            "specialty": _worker_specialty(s['user_id']),
-            "object_id": s['object_id'],
-            "object_name": object_names.get(s['object_id'], s['object_id']),
-            "start_at": s.get('start_at'),
-        }
-        if _is_active_photo_checkin_session(s):
-            working_now.append(entry)
-        else:
-            entry['finish_at'] = s.get('finish_at')
-            finished_today.append(entry)
-
-    working_uids = {e['user_id'] for e in working_now}
-    finished_uids = {e['user_id'] for e in finished_today}
-
-    # 30.07 v2 (аудит): собираем ВСЕ назначения на сегодня по user_id СНАЧАЛА, потом
-    # одна итоговая группа на worker по строгому приоритету -- чинит реальный баг,
-    # где worker с accepted на одном объекте И pending на другом мог одновременно
-    # попасть и в "не вышел", и в "ожидает подтверждения" (прошлая версия группировала
-    # per-(object, assignment) в одном проходе, не per-worker).
-    assignments = _load_assignments()
-    by_uid = {}  # uid -> list of (oid, assignment) на сегодня
-    for oid, lst in assignments.items():
-        for a in lst:
-            uid = str(a.get('user_id', ''))
-            date_from, date_to = a.get('date_from', ''), a.get('date_to', '')
-            if not uid or not (date_from and date_to and date_from <= today <= date_to):
-                continue
-            by_uid.setdefault(uid, []).append((oid, a))
-
-    now_ts = int(time.time())
-
-    def _entry(uid, oid, a):
-        escalation = _assignment_pending_escalation(a, now_ts)
-        return {
-            "user_id": uid, "worker_name": _worker_name(uid), "specialty": _worker_specialty(uid),
-            "object_id": oid, "object_name": object_names.get(oid, oid),
-            "stage_id": a.get('stage_id', ''), "date_from": a.get('date_from', ''),
-            "date_to": a.get('date_to', ''), "task_note": a.get('task_note', ''),
-            "assignment_status": _assignment_status(a),
-            "assignment_id": a.get('id', ''),
-            "assigned_at": a.get('assigned_at', ''),
-            "pending_since": a.get('pending_since') or a.get('updated_at') or a.get('assigned_at', ''),
-            "response_wait_seconds": escalation["age_seconds"],
-            "response_escalation": escalation["level"],
-            "response_alert_type": escalation["type"],
-        }
-
-    not_started = []
-    awaiting_response = []
-    for uid, pairs in by_uid.items():
-        if uid in working_uids or uid in finished_uids:
-            continue  # приоритет 1/готово сегодня -- уже показан там, здесь не дублируем
-        accepted_pair = next((p for p in pairs if _assignment_status(p[1]) == 'accepted'), None)
-        if accepted_pair:
-            not_started.append(_entry(uid, *accepted_pair))
-            continue
-        pending_pair = next((p for p in pairs if _assignment_status(p[1]) == 'pending'), None)
-        if pending_pair:
-            awaiting_response.append(_entry(uid, *pending_pair))
-
-    # "Доступны сегодня" -- все остальные работники, не занятые ни в одной из групп
-    # выше (включая тех, у кого только declined-назначения -- declined не занимает)
-    # и без approved-отсутствия на сегодня.
-    busy_uids = working_uids | finished_uids | {e['user_id'] for e in not_started} | {e['user_id'] for e in awaiting_response}
-    absent_uids = {
-        str(e.get('user_id')) for e in _load_abwesenheit()
-        if e.get('status') == 'approved' and e.get('date_from', '') <= today <= e.get('date_to', '')
-    }
-    roles = _load_roles()
-    available_today = [
-        {"user_id": uid, "worker_name": _worker_name(uid), "specialty": _worker_specialty(uid)}
-        for uid in profiles
-        if roles.get(uid, 'worker') != 'owner' and uid not in busy_uids and uid not in absent_uids
-    ]
-
-    # 30.07 v2: "Работают сейчас" тоже несёт stage_name (если известен из checkin) --
-    # аудит просит этот контекст для группы 1 наравне с 2/3.
-    for e in working_now:
-        s = next((s for s in today_sessions if str(s.get('user_id')) == e['user_id'] and _is_active_photo_checkin_session(s)), None)
-        e['stage_name'] = (s or {}).get('stage_name') or ''
-
-    # 30.07 v3 (спек: "Часы команды" на экране Команда) -- сумма часов за СЕГОДНЯ по
-    # всем today_sessions (включая ещё идущие -- _hours_from_session на open-сессии
-    # без finish_at даёт 0, отдельно досчитываем текущим временем как условный "конец").
-    hours_today_total = 0.0
-    for s in today_sessions:
-        if s.get('finish_at') is not None or s.get('manual_entry'):
-            hours_today_total += _hours_from_session(s)
-        elif s.get('start_at'):
-            elapsed = (time.time() - s['start_at'] - (s.get('pause_accumulated_seconds') or 0)) / 3600.0
-            hours_today_total += max(0.0, elapsed)
-
-    sparkline_days = []
-    today_date = business_today()
-    for i in range(6, -1, -1):
-        d = (today_date - timedelta(days=i)).isoformat()
-        day_sessions = [s for s in sessions if s.get('date') == d]
-        day_hours = 0.0
-        for s in day_sessions:
-            if s.get('finish_at') is not None or s.get('manual_entry'):
-                day_hours += _hours_from_session(s)
-            elif d == today and s.get('start_at'):
-                elapsed = (time.time() - s['start_at'] - (s.get('pause_accumulated_seconds') or 0)) / 3600.0
-                day_hours += max(0.0, elapsed)
-        sparkline_days.append({
-            "date": d,
-            "hours": round(day_hours, 1),
-            "shifts": len(day_sessions),
-            "finished": sum(1 for s in day_sessions if s.get('finish_at') is not None or s.get('manual_entry')),
-        })
-
-    return {
-        "date": today,
-        "working_now": working_now,
-        "hours_today_total": round(hours_today_total, 1),
-        "sparkline": {
-            "days": sparkline_days,
-        },
-        "not_started": not_started,
-        "finished_today": finished_today,
-        "awaiting_response": awaiting_response,
-        "available_today": available_today,
-    }
-
-
-@app.get("/api/dashboard/active-blockers")
-def get_active_blockers(user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    """30.07 (спек: "Команда"→"Требует внимания", тип 3 -- "Сообщил о проблеме").
-    stage_blocks в roadmap.json хранится по stage_key (='ID строки этапа' в Sheets),
-    без object_id/stage_name -- матчим через all_stages_grouped() (один batch-запрос,
-    не N+1 по каждому объекту). owner-only, та же чувствительность что shifts-today."""
-    o = _load_repo_objekte_lib()
-    store = _safe_load_json(rl.ROADMAP_FILE, rl._default_store())
-    stage_blocks = store.get('stage_blocks', {})
-    if not stage_blocks:
-        return {"blockers": []}
-    rows = _cached_get_used_range('Объекты')
-    object_names = {}
-    if rows:
-        header, data = rows[0], rows[1:]
-        for r in data:
-            obj = dict(zip(header, r))
-            object_names[str(obj.get('ID объекта', ''))] = obj.get('Объект', '')
-    profiles = _load_worker_profiles()
-    grouped = o.all_stages_grouped()
-    result = []
-    for oid, stages in grouped.items():
-        for s in stages:
-            stage_key = s.get('ID строки этапа')
-            meta = stage_blocks.get(stage_key)
-            if not meta:
-                continue
-            blocked_by = str(meta.get('blocked_by', ''))
-            result.append({
-                "object_id": oid, "object_name": object_names.get(oid, oid),
-                "stage_name": s.get('Название этапа', ''), "row_num": s.get('_row'),
-                "reason": meta.get('quick_reason') or meta.get('comment') or '',
-                "reported_by_name": _sanitize_display_name(profiles.get(blocked_by, {}).get('name'), blocked_by),
-                "blocked_at": meta.get('blocked_at'),
-            })
-    result.sort(key=lambda b: b.get('blocked_at') or 0, reverse=True)
-    return {"blockers": result}
-
-
-@app.get("/api/dashboard/team-plan")
-def get_team_plan(date: str = '', user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    """30.07 (спек: экран "Команда" → вкладка "План"). Отвечает только "кто запланирован
-    на дату и на каком объекте" -- читает существующие assignments, ничего не хранит
-    отдельно. Для date == сегодня дополнительно отдаёт фактический статус смены
-    (идёт/не начата/завершена) из checkin_meta; для будущих дат факт не считается --
-    его физически ещё не может быть."""
-    target_date = date or business_today_str()  # 03.08 (ТЗ Задача 5): было date.today() (UTC)
-
-    rows = _cached_get_used_range('Объекты')
-    object_names = {}
-    if rows:
-        header, data = rows[0], rows[1:]
-        for r in data:
-            obj = dict(zip(header, r))
-            object_names[str(obj.get('ID объекта', ''))] = obj.get('Объект', '')
-
-    profiles = _load_worker_profiles()
-
-    def _worker_name(uid):
-        return _sanitize_display_name(profiles.get(str(uid), {}).get('name'), str(uid))
-
-    # Cleanup-commit (спек п.4): stage_id в assignments -- уже человекочитаемый текст
-    # (вид работ из BUBBLE_STAGE_OPTIONS либо "Текущий этап" объекта на момент назначения),
-    # но не всегда совпадает с актуальным названием строки этапа в Sheets. Один batch-запрос
-    # (не N+1 по каждому назначению) -- матчим по названию этапа того же объекта, при
-    # совпадении отдаём каноничное имя, иначе используем stage_id как есть (fallback).
-    o = _load_repo_objekte_lib()
-    stage_names_by_object = {}
-    for oid, stages in o.all_stages_grouped().items():
-        stage_names_by_object[oid] = {s.get('Название этапа', '').strip().lower(): s.get('Название этапа', '') for s in stages}
-
-    def _resolve_stage_name(oid, stage_id):
-        names = stage_names_by_object.get(oid, {})
-        return names.get((stage_id or '').strip().lower(), '')
-
-    is_today = target_date == business_today_str()  # 03.08 (ТЗ Задача 5): было date.today() (UTC)
-    sessions_by_uid = {}
-    if is_today:
-        for s in _load_checkin_meta():
-            if s.get('date') == target_date:
-                sessions_by_uid.setdefault(str(s.get('user_id')), []).append(s)
-
-    assignments = _load_assignments()
-    by_object = {}
-    for oid, lst in assignments.items():
-        for a in lst:
-            date_from, date_to = a.get('date_from', ''), a.get('date_to', '')
-            if not (date_from and date_to and date_from <= target_date <= date_to):
-                continue
-            status = _assignment_status(a)
-            # Cleanup-commit (спек п.5): declined больше НЕ пропускается -- owner должен
-            # видеть, что запланированный сотрудник отклонил назначение.
-            uid = str(a.get('user_id', ''))
-            stage_id = a.get('stage_id', '')
-            entry = {
-                "user_id": uid,
-                "worker_name": _worker_name(uid),
-                "stage_id": stage_id,
-                "stage_name": _resolve_stage_name(oid, stage_id),
-                "task_note": a.get('task_note', ''),
-                "date_from": date_from,
-                "date_to": date_to,
-                "assignment_status": status,
-            }
-            # shift_state имеет смысл только для уже принятого назначения на сегодня --
-            # pending ещё ничего не подтвердил, declined отклонил, для них факта смены
-            # физически быть не может.
-            if is_today and status == 'accepted':
-                uid_sessions = sessions_by_uid.get(uid, [])
-                active = next((s for s in uid_sessions if s.get('object_id') == oid and _is_active_photo_checkin_session(s)), None)
-                finished = next((s for s in uid_sessions if s.get('object_id') == oid and s.get('finish_at') is not None), None)
-                if active:
-                    entry['shift_state'] = 'active'
-                elif finished:
-                    entry['shift_state'] = 'finished'
-                else:
-                    entry['shift_state'] = 'not_started'
-            by_object.setdefault(oid, {"object_id": oid, "object_name": object_names.get(oid, oid), "assignments": []})
-            by_object[oid]["assignments"].append(entry)
-
-    objects_plan = sorted(by_object.values(), key=lambda o: o['object_name'] or o['object_id'])
-    return {"date": target_date, "objects": objects_plan}
-
-
-def _format_assignment_wait(age_seconds: int) -> str:
-    minutes = max(0, int(age_seconds) // 60)
-    hours, mins = divmod(minutes, 60)
-    if hours:
-        return f"{hours} ч {mins} мин"
-    return f"{mins} мин"
-
-
-def _assignment_confirmation_alerts(now_ts: int | None = None) -> list:
-    now_ts = int(time.time()) if now_ts is None else int(now_ts)
-    profiles = _load_worker_profiles()
-    object_names = {}
-    try:
-        rows = _cached_get_used_range('Объекты')
-    except Exception:
-        rows = None
-    if rows:
-        header, data = rows[0], rows[1:]
-        for r in data:
-            obj = dict(zip(header, r))
-            oid = str(obj.get('ID объекта', '')).strip()
-            if oid:
-                object_names[oid] = obj.get('Объект') or obj.get('Название') or obj.get('Адрес') or oid
-
-    result = []
-    for oid, assigned_list in _load_assignments().items():
-        for a in assigned_list:
-            if _assignment_status(a) != 'pending':
-                continue
-            escalation = _assignment_pending_escalation(a, now_ts)
-            if not escalation["level"]:
-                continue
-            uid = str(a.get('user_id', ''))
-            worker_name = _sanitize_display_name(profiles.get(uid, {}).get('name'), uid)
-            object_name = object_names.get(str(oid), str(oid))
-            work_label = pskills.skill_display_name(a.get('work_type_id', '')) if a.get('work_type_id') else a.get('stage_id', '')
-            wait_label = _format_assignment_wait(escalation["age_seconds"])
-            parts = [p for p in (object_name, work_label, f"ждёт {wait_label}") if p]
-            alert_id = a.get('id') or f"{uid}-{a.get('stage_id', '')}"
-            result.append({
-                'id': f'assignment-confirm-{escalation["level"]}-{oid}-{alert_id}',
-                'type': escalation["type"],
-                'role_filter': 'owner',
-                'title': ('Не подтверждена задача' if escalation["level"] == 'danger' else 'Ждёт подтверждения') + f': {worker_name}',
-                'subtitle': ' · '.join(parts),
-                'at': a.get('pending_since') or a.get('updated_at') or a.get('assigned_at'),
-                'assignment_confirmation': True,
-                'assignment_id': a.get('id', ''),
-                'assignment_object_id': str(oid),
-                'assignment_worker_id': uid,
-                'response_wait_seconds': escalation["age_seconds"],
-                'response_escalation': escalation["level"],
-            })
-    return result
+_assignment_status = _owner_dashboard_handlers.assignment_status
+_parse_assignment_timestamp = _owner_dashboard_handlers.parse_assignment_timestamp
+_assignment_pending_escalation = _owner_dashboard_handlers.assignment_pending_escalation
+get_dashboard_shifts_today = _owner_dashboard_handlers.get_dashboard_shifts_today
+get_active_blockers = _owner_dashboard_handlers.get_active_blockers
+get_team_plan = _owner_dashboard_handlers.get_team_plan
+_format_assignment_wait = _owner_dashboard_handlers.format_assignment_wait
+_assignment_confirmation_alerts = _owner_dashboard_handlers.assignment_confirmation_alerts
 
 
 # ---------- Alerts inbox — role-aware агрегация (Фаза 2g, восстановлено после инцидента Фазы 3) ----------
