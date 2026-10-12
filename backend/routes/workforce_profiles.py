@@ -10,7 +10,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Collection, Mapping
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -325,7 +325,7 @@ def create_workforce_profiles_router(
                     level = skill.get('level') if isinstance(skill, dict) else None
                     if level not in deps.skill_levels:
                         raise HTTPException(400, 'Укажите уровень для каждого выбранного навыка')
-                updates['onboarding_completed_at'] = datetime.utcnow().isoformat() + 'Z'
+                updates['onboarding_completed_at'] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + 'Z'
                 updates['onboarding_version'] = 2
                 updates['quiz_completed'] = True
             profile.update(updates)

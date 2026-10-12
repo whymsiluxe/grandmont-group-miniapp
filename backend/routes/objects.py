@@ -405,7 +405,7 @@ def create_objects_router(deps: ObjectsRouteDeps):
     def update_assignment(object_id: str, assignment_id: str, body: AssignmentUpdateBody,
                           user: dict = Depends(deps.get_current_user), _: None = Depends(deps.require_owner)):
         key = str(object_id)
-        updates = body.dict(exclude_unset=True)
+        updates = body.model_dump(exclude_unset=True)
         if 'task_note' in updates and updates['task_note'] is not None:
             updates['task_note'] = updates['task_note'].strip()[:500]
 
