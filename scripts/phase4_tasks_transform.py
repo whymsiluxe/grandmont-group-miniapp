@@ -50,10 +50,11 @@ _tasks_router, _tasks_handlers = create_tasks_router(
 )
 app.include_router(_tasks_router)
 
-# Temporary direct-call compatibility while main.py is decomposed. These are
-# aliases only; all task implementation lives in routes/tasks.py.
+# Temporary direct-call compatibility only for names that were actually stable
+# in legacy main.py. The object-task POST handler was also named create_task, but
+# a later /api/tasks handler historically overwrites that module name; exporting
+# it here would invent a compatibility contract that never existed.
 get_tasks = _tasks_handlers.get_tasks
-create_task = _tasks_handlers.create_task
 complete_task = _tasks_handlers.complete_task
 
 
