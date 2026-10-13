@@ -1,0 +1,38 @@
+name: Phase 9 layout test updater
+
+on:
+  push:
+    branches:
+      - refactor/main-monolith-phase-9-stages-service
+
+permissions:
+  contents: write
+
+jobs:
+  update-layout-tests:
+    if: github.event.head_commit.message != 'Update production layout tests for services [phase9]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refactor/main-monolith-phase-9-stages-service
+          fetch-depth: 0
+      - name: Update exact production package fixtures and remove this workflow
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('tests/test_assignment_lifecycle.py')
+          text = path.read_text()
+          old = "fname in ('core', 'routes')"
+          new = "fname in ('core', 'routes', 'services')"
+          count = text.count(old)
+          if count != 2:
+              raise SystemExit(f'expected exactly 2 production-layout tuples, found {count}')
+          path.write_text(text.replace(old, new))
+          PY
+          rm .github/workflows/phase9-layout-test-update.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/test_assignment_lifecycle.py .github/workflows/phase9-layout-test-update.yml
+          git commit -m 'Update production layout tests for services [phase9]'
+          git push origin HEAD:refactor/main-monolith-phase-9-stages-service
