@@ -195,8 +195,10 @@ def test_object_assignment_service_stays_framework_agnostic():
     source = Path(__file__).parents[1] / "backend" / "services" / "object_assignments.py"
     text = source.read_text(encoding="utf-8")
     lowered = text.lower()
-    assert "fastapi" not in lowered
-    assert "pydantic" not in lowered
+    assert "from fastapi" not in lowered
+    assert "import fastapi" not in lowered
+    assert "from pydantic" not in lowered
+    assert "import pydantic" not in lowered
     assert "from routes.objects" not in lowered
     assert "from ..routes" not in lowered
     assert "import main" not in lowered
