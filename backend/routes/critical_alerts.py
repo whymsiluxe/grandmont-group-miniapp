@@ -1,6 +1,7 @@
 """Persisted critical-alert workflow: create, acknowledge, resolve and photos."""
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
@@ -10,6 +11,8 @@ from typing import Any, Callable, Mapping
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class CriticalAlertAckBody(BaseModel):
@@ -99,9 +102,40 @@ def create_critical_alerts_router(
             superseded += 1
         return superseded
 
+    def _append_chat_message_once(message: dict):
+        """Append a secondary chat notification idempotently.
+
+        The deterministic id makes retry after an ambiguous/partial failure safe:
+        if the chat write actually committed, a later retry observes the message
+        and does not append a duplicate.
+        """
+        with deps.chat_lock:
+            messages = deps.load_chat()
+            if any(
+                isinstance(existing, dict)
+                and existing.get('id') == message['id']
+                for existing in messages
+            ):
+                return
+            messages.append(message)
+            deps.save_chat(messages)
+
+    def _remove_photo_paths(paths: list[str]):
+        for path in paths:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.exception('Failed to clean critical-alert photo %s', path)
+
     def ensure_critical_alert_chat(alert: dict, thread_id: str, owner_ids: list):
+        del owner_ids  # compatibility argument retained for existing callers/tests
         msg = {
-            'id': uuid.uuid4().hex,
+            'id': uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"critical-alert:create:{alert['id']}",
+            ).hex,
             'ts': int(time.time()),
             'user_id': 'system',
             'name': 'Система',
@@ -109,10 +143,7 @@ def create_critical_alerts_router(
             'to_user_id': None if thread_id == 'group' else thread_id,
             'critical_alert_id': alert['id'],
         }
-        with deps.chat_lock:
-            messages = deps.load_chat()
-            messages.append(msg)
-            deps.save_chat(messages)
+        _append_chat_message_once(msg)
 
     def create_critical_alert(
         target_user_id: str,
@@ -150,6 +181,7 @@ def create_critical_alerts_router(
                 'resolution': None,
                 'resolution_note': None,
                 'resolution_photos': [],
+                '_chat_create_pending': True,
             }
             items.append(alert)
             return alert, True
@@ -157,21 +189,56 @@ def create_critical_alerts_router(
         alert, was_created = deps.update_json_transaction(
             deps.critical_alerts_file(), [], _mutate
         )
-        if not was_created:
-            return alert
+        needs_chat_repair = was_created or bool(alert.get('_chat_create_pending'))
+        if needs_chat_repair:
+            try:
+                roles = deps.load_roles()
+                owner_ids = [uid for uid, role in roles.items() if role == 'owner']
+                thread_id = (
+                    deps.chat_thread_id(
+                        target_user_id,
+                        owner_ids[0] if owner_ids else None,
+                    )
+                    if owner_ids else 'group'
+                )
+                ensure_critical_alert_chat(alert, thread_id, owner_ids)
+            except Exception:
+                # Alert JSON is the primary durable operation. A secondary chat
+                # notification must never turn it into a false 500/retry loop.
+                logger.exception(
+                    'Critical-alert chat delivery failed after alert persisted: %s',
+                    alert['id'],
+                )
+            else:
+                def _clear_pending(items):
+                    current = next(
+                        (item for item in items if item['id'] == alert['id']),
+                        None,
+                    )
+                    if current is not None:
+                        current.pop('_chat_create_pending', None)
 
-        roles = deps.load_roles()
-        owner_ids = [uid for uid, role in roles.items() if role == 'owner']
-        thread_id = (
-            deps.chat_thread_id(target_user_id, owner_ids[0] if owner_ids else None)
-            if owner_ids else 'group'
-        )
-        ensure_critical_alert_chat(alert, thread_id, owner_ids)
-        try:
-            deps.send_telegram_message(int(target_user_id), f'🔴 {title}')
-        except Exception:
-            pass
-        return alert
+                try:
+                    deps.update_json_transaction(
+                        deps.critical_alerts_file(), [], _clear_pending
+                    )
+                except Exception:
+                    # The chat append itself is idempotent, so leaving the repair
+                    # marker behind is safe: a later dedup call can retry it.
+                    logger.exception(
+                        'Failed to clear critical-alert chat repair marker: %s',
+                        alert['id'],
+                    )
+
+        if was_created:
+            try:
+                deps.send_telegram_message(int(target_user_id), f'🔴 {title}')
+            except Exception:
+                pass
+
+        public_alert = dict(alert)
+        public_alert.pop('_chat_create_pending', None)
+        return public_alert
 
     @router.post('/api/critical-alerts/{alert_id}/ack')
     def ack_critical_alert(
@@ -185,32 +252,43 @@ def create_critical_alerts_router(
                 raise HTTPException(404, 'Алерт не найден')
             if alert['target_user_id'] != str(user['id']):
                 raise HTTPException(403, 'Не ваш алерт')
-            alert['acknowledged_at'] = int(time.time())
+            if not alert.get('acknowledged_at'):
+                alert['acknowledged_at'] = int(time.time())
             alert['comment'] = body.comment.strip()[:500] or None
             supersede_legacy_siblings(items, alert)
             return alert
 
         alert = deps.update_json_transaction(deps.critical_alerts_file(), [], _mutate)
         if alert['comment']:
-            roles = deps.load_roles()
-            owner_ids = [uid for uid, role in roles.items() if role == 'owner']
-            thread_id = (
-                deps.chat_thread_id(alert['target_user_id'], owner_ids[0] if owner_ids else None)
-                if owner_ids else 'group'
-            )
-            msg = {
-                'id': uuid.uuid4().hex,
-                'ts': int(time.time()),
-                'user_id': user['id'],
-                'name': user.get('first_name', str(user['id'])),
-                'text': alert['comment'],
-                'to_user_id': None if thread_id == 'group' else thread_id,
-                'critical_alert_id': alert['id'],
-            }
-            with deps.chat_lock:
-                messages = deps.load_chat()
-                messages.append(msg)
-                deps.save_chat(messages)
+            try:
+                roles = deps.load_roles()
+                owner_ids = [uid for uid, role in roles.items() if role == 'owner']
+                thread_id = (
+                    deps.chat_thread_id(
+                        alert['target_user_id'],
+                        owner_ids[0] if owner_ids else None,
+                    )
+                    if owner_ids else 'group'
+                )
+                comment = alert['comment']
+                msg = {
+                    'id': uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"critical-alert:ack:{alert['id']}:{comment}",
+                    ).hex,
+                    'ts': int(time.time()),
+                    'user_id': user['id'],
+                    'name': user.get('first_name', str(user['id'])),
+                    'text': comment,
+                    'to_user_id': None if thread_id == 'group' else thread_id,
+                    'critical_alert_id': alert['id'],
+                }
+                _append_chat_message_once(msg)
+            except Exception:
+                logger.exception(
+                    'Critical-alert ack chat delivery failed after ack persisted: %s',
+                    alert['id'],
+                )
         return alert
 
     @router.post('/api/critical-alerts/{alert_id}/resolve')
@@ -231,12 +309,11 @@ def create_critical_alerts_router(
         if existing['target_user_id'] != str(user['id']):
             raise HTTPException(403, 'Не ваш алерт')
 
-        saved_photos = []
+        normalized_note = note.strip()[:500]
+        validated_photos: list[tuple[bytes, str]] = []
         if resolution == 'yes' and files:
-            alert_dir = os.path.join(
-                deps.critical_alert_photo_dir(), os.path.basename(alert_id)
-            )
-            os.makedirs(alert_dir, exist_ok=True)
+            # Validate the entire batch before writing the first file. Otherwise a
+            # valid first upload + invalid second upload leaves an orphan binary.
             for upload in files:
                 data = upload.file.read()
                 if len(data) > 8 * 1024 * 1024:
@@ -244,11 +321,28 @@ def create_critical_alerts_router(
                 detected = deps.sniff_image(data)
                 if not detected:
                     raise HTTPException(400, 'Файл должен быть изображением')
-                ext = '.' + deps.allowed_image_mime_ext[detected]
-                filename = f'{uuid.uuid4().hex}{ext}'
-                with open(os.path.join(alert_dir, filename), 'wb') as output:
-                    output.write(data)
-                saved_photos.append(filename)
+                validated_photos.append(
+                    (data, '.' + deps.allowed_image_mime_ext[detected])
+                )
+
+        alert_dir = os.path.join(
+            deps.critical_alert_photo_dir(), os.path.basename(alert_id)
+        )
+        saved_photos: list[str] = []
+        saved_paths: list[str] = []
+        if validated_photos:
+            os.makedirs(alert_dir, exist_ok=True)
+            try:
+                for data, ext in validated_photos:
+                    filename = f'{uuid.uuid4().hex}{ext}'
+                    path = os.path.join(alert_dir, filename)
+                    with open(path, 'wb') as output:
+                        output.write(data)
+                    saved_photos.append(filename)
+                    saved_paths.append(path)
+            except Exception:
+                _remove_photo_paths(saved_paths)
+                raise
 
         def _mutate(items):
             alert = next((item for item in items if item['id'] == alert_id), None)
@@ -256,36 +350,75 @@ def create_critical_alerts_router(
                 raise HTTPException(404, 'Алерт не найден')
             if alert['target_user_id'] != str(user['id']):
                 raise HTTPException(403, 'Не ваш алерт')
+            previous_photos = list(alert.get('resolution_photos') or [])
             alert['resolution'] = resolution
-            alert['resolution_note'] = note.strip()[:500] or None
+            alert['resolution_note'] = normalized_note or None
             alert['resolution_photos'] = saved_photos
-            return alert
+            return alert, previous_photos
 
-        alert = deps.update_json_transaction(deps.critical_alerts_file(), [], _mutate)
-        roles = deps.load_roles()
-        owner_ids = [uid for uid, role in roles.items() if role == 'owner']
-        thread_id = (
-            deps.chat_thread_id(alert['target_user_id'], owner_ids[0] if owner_ids else None)
-            if owner_ids else 'group'
-        )
-        text = f"Вопрос решён: {'да' if resolution == 'yes' else 'нет'}"
-        if note:
-            text += f'\n{note}'
-        if saved_photos:
-            text += f'\n📷 {len(saved_photos)} фото'
-        msg = {
-            'id': uuid.uuid4().hex,
-            'ts': int(time.time()),
-            'user_id': user['id'],
-            'name': user.get('first_name', str(user['id'])),
-            'text': text,
-            'to_user_id': None if thread_id == 'group' else thread_id,
-            'critical_alert_id': alert['id'],
-        }
-        with deps.chat_lock:
-            messages = deps.load_chat()
-            messages.append(msg)
-            deps.save_chat(messages)
+        try:
+            alert, previous_photos = deps.update_json_transaction(
+                deps.critical_alerts_file(), [], _mutate
+            )
+        except Exception:
+            # Metadata did not commit; new binaries belong to no durable record.
+            _remove_photo_paths(saved_paths)
+            raise
+
+        # Metadata now points at the new set. Only after that durable commit may
+        # files from the previous resolution be removed.
+        for filename in previous_photos:
+            if not isinstance(filename, str) or os.path.basename(filename) != filename:
+                continue
+            if filename in saved_photos:
+                continue
+            try:
+                os.remove(os.path.join(alert_dir, filename))
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.exception(
+                    'Failed to remove superseded critical-alert photo %s/%s',
+                    alert_id,
+                    filename,
+                )
+
+        try:
+            roles = deps.load_roles()
+            owner_ids = [uid for uid, role in roles.items() if role == 'owner']
+            thread_id = (
+                deps.chat_thread_id(
+                    alert['target_user_id'],
+                    owner_ids[0] if owner_ids else None,
+                )
+                if owner_ids else 'group'
+            )
+            text = f"Вопрос решён: {'да' if resolution == 'yes' else 'нет'}"
+            if normalized_note:
+                text += f'\n{normalized_note}'
+            if saved_photos:
+                text += f'\n📷 {len(saved_photos)} фото'
+            msg = {
+                'id': uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    (
+                        f"critical-alert:resolve:{alert['id']}:"
+                        f'{resolution}:{normalized_note}'
+                    ),
+                ).hex,
+                'ts': int(time.time()),
+                'user_id': user['id'],
+                'name': user.get('first_name', str(user['id'])),
+                'text': text,
+                'to_user_id': None if thread_id == 'group' else thread_id,
+                'critical_alert_id': alert['id'],
+            }
+            _append_chat_message_once(msg)
+        except Exception:
+            logger.exception(
+                'Critical-alert resolve chat delivery failed after resolution persisted: %s',
+                alert['id'],
+            )
         return alert
 
     @router.get('/api/critical-alerts/{alert_id}/photo/{filename}')
