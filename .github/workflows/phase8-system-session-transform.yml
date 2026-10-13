@@ -2,7 +2,8 @@ name: Phase 8 system-session transform
 
 on:
   push:
-    branches: [refactor/main-monolith-phase-8-system-session]
+    branches:
+      - refactor/main-monolith-phase-8-system-session
   workflow_dispatch:
 
 permissions:
@@ -10,7 +11,6 @@ permissions:
 
 jobs:
   transform-and-test:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,100 +41,8 @@ jobs:
           if missing:
               raise SystemExit(f'Phase 8 guard failed; missing direct routes: {missing}')
 
-          new = '''# System status and identity/session routes live outside the composition root.\n# main.py only wires runtime collaborators and preserves legacy direct-call aliases.\ntry:\n    from .routes.system import SystemDeps, create_system_router\n    from .routes.session_identity import SessionIdentityDeps, create_session_identity_router\nexcept ImportError:\n    from routes.system import SystemDeps, create_system_router  # noqa: E402\n    from routes.session_identity import SessionIdentityDeps, create_session_identity_router  # noqa: E402\n\n\ndef _read_app_version() -> dict:\n    return system_status.read_app_version(APP_VERSION_FILE)\n\n\n_system_router, _system_handlers = create_system_router(SystemDeps(\n    get_current_user=get_current_user,\n    require_owner=require_owner,\n    health_response=system_status.health_response,\n    readiness_response=system_status.readiness_response,\n    diagnostics_response=system_status.diagnostics_response,\n    app_version_file=APP_VERSION_FILE,\n    object_photo_dir=OBJECT_PHOTO_DIR,\n    chat_attach_dir=CHAT_ATTACH_DIR,\n    tools_lib_path=TOOLS_LIB_PATH,\n    mangel_lib_path=MANGEL_LIB_PATH,\n    backend_dir=BACKEND_DIR,\n    roles_file=ROLES_FILE,\n    data_root=DATA_ROOT,\n    sheets_cache=_sheets_cache,\n    sheets_cache_ttl=SHEETS_CACHE_TTL,\n    activity_alerts_file=ACTIVITY_ALERTS_FILE,\n    news_feed_file=NEWS_FEED_FILE,\n    chat_file=CHAT_FILE,\n    plan_sync_state_file=PLAN_SYNC_STATE_FILE,\n    contract_ingest_state_file=CONTRACT_INGEST_STATE_FILE,\n    contracts_drive_folder_id=CONTRACTS_DRIVE_FOLDER_ID,\n    safe_load_json=_safe_load_json,\n    outbox_dead_letter_count=_outbox_dead_letter_count,\n))\napp.include_router(_system_router)\nhealth = _system_handlers.health\nhealth_ready = _system_handlers.health_ready\ndiagnostics = _system_handlers.diagnostics\n\n\n_session_identity_router, _session_identity_handlers = create_session_identity_router(\n    SessionIdentityDeps(\n        get_current_user=get_current_user,\n        get_role=get_role,\n        create_session_token=create_session_token,\n        session_token_max_age=SESSION_TOKEN_MAX_AGE,\n    )\n)\napp.include_router(_session_identity_router)\nme = _session_identity_handlers.me\ncreate_session = _session_identity_handlers.create_session\n\n\n'''
+          new = '''# System status and identity/session routes live outside the composition root.\n# main.py only wires runtime collaborators and preserves legacy direct-call aliases.\ntry:\n    from .routes.system import SystemDeps, create_system_router\n    from .routes.session_identity import SessionIdentityDeps, create_session_identity_router\nexcept ImportError:\n    from routes.system import SystemDeps, create_system_router  # noqa: E402\n    from routes.session_identity import SessionIdentityDeps, create_session_identity_router  # noqa: E402\n\n\ndef _read_app_version() -> dict:\n    return system_status.read_app_version(APP_VERSION_FILE)\n\n\n_system_router, _system_handlers = create_system_router(SystemDeps(\n    get_current_user=get_current_user,\n    require_owner=require_owner,\n    health_response=system_status.health_response,\n    readiness_response=system_status.readiness_response,\n    diagnostics_response=system_status.diagnostics_response,\n    app_version_file=APP_VERSION_FILE,\n    object_photo_dir=OBJECT_PHOTO_DIR,\n    chat_attach_dir=CHAT_ATTACH_DIR,\n    tools_lib_path=TOOLS_LIB_PATH,\n    mangel_lib_path=MANGEL_LIB_PATH,\n    backend_dir=BACKEND_DIR,\n    roles_file=ROLES_FILE,\n    data_root=DATA_ROOT,\n    sheets_cache=_sheets_cache,\n    sheets_cache_ttl=SHEETS_CACHE_TTL,\n    activity_alerts_file=ACTIVITY_ALERTS_FILE,\n    news_feed_file=NEWS_FEED_FILE,\n    chat_file=CHAT_FILE,\n    plan_sync_state_file=PLAN_SYNC_STATE_FILE,\n    contract_ingest_state_file=CONTRACT_INGEST_STATE_FILE,\n    contracts_drive_folder_id=CONTRACTS_DRIVE_FOLDER_ID,\n    app_version_file=APP_VERSION_FILE,\n    safe_load_json=_safe_load_json,\n    outbox_dead_letter_count=_outbox_dead_letter_count,\n))\napp.include_router(_system_router)\nhealth = _system_handlers.health\nhealth_ready = _system_handlers.health_ready\ndiagnostics = _system_handlers.diagnostics\n\n\n_session_identity_router, _session_identity_handlers = create_session_identity_router(\n    SessionIdentityDeps(\n        get_current_user=get_current_user,\n        get_role=get_role,\n        create_session_token=create_session_token,\n        session_token_max_age=SESSION_TOKEN_MAX_AGE,\n    )\n)\napp.include_router(_session_identity_router)\nme = _session_identity_handlers.me\ncreate_session = _session_identity_handlers.create_session\n\n\n'''
           path.write_text(text[:start] + new + text[end:])
-
-          test = Path('tests/test_phase8_system_session_contract.py')
-          test.write_text(r'''from __future__ import annotations
-
-import ast
-from pathlib import Path
-
-import main as backend
-
-
-TARGETS = {
-    ("GET", "/api/health"): "routes.system",
-    ("GET", "/api/health/ready"): "routes.system",
-    ("GET", "/api/diagnostics"): "routes.system",
-    ("GET", "/api/me"): "routes.session_identity",
-    ("POST", "/api/session"): "routes.session_identity",
-}
-
-
-def _routes():
-    out = {}
-    for route in backend.app.routes:
-        path = getattr(route, "path", None)
-        endpoint = getattr(route, "endpoint", None)
-        methods = getattr(route, "methods", set()) or set()
-        if path and endpoint:
-            for method in methods:
-                out[(method, path)] = route
-    return out
-
-
-def test_phase8_routes_are_owned_by_extracted_modules():
-    routes = _routes()
-    for key, suffix in TARGETS.items():
-        route = routes[key]
-        assert route.endpoint.__module__.endswith(suffix)
-
-
-def test_phase8_operation_ids_preserve_handler_names():
-    routes = _routes()
-    expected = {
-        ("GET", "/api/health"): "health",
-        ("GET", "/api/health/ready"): "health_ready",
-        ("GET", "/api/diagnostics"): "diagnostics",
-        ("GET", "/api/me"): "me",
-        ("POST", "/api/session"): "create_session",
-    }
-    for key, name in expected.items():
-        assert routes[key].name == name
-
-
-def test_main_has_no_direct_phase8_route_decorators():
-    tree = ast.parse(Path(backend.__file__).read_text())
-    target_paths = {path for _, path in TARGETS}
-    found = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for decorator in node.decorator_list:
-            if not isinstance(decorator, ast.Call) or not isinstance(decorator.func, ast.Attribute):
-                continue
-            if not isinstance(decorator.func.value, ast.Name) or decorator.func.value.id != "app":
-                continue
-            if decorator.args and isinstance(decorator.args[0], ast.Constant):
-                if decorator.args[0].value in target_paths:
-                    found.append(decorator.args[0].value)
-    assert found == []
-
-
-def test_extracted_modules_do_not_import_main():
-    for rel in ("backend/routes/system.py", "backend/routes/session_identity.py"):
-        source = Path(rel).read_text()
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                assert all(alias.name not in {"main", "backend.main"} for alias in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                assert node.module not in {"main", "backend.main"}
-
-
-def test_legacy_aliases_point_to_registered_handlers():
-    routes = _routes()
-    aliases = {
-        ("GET", "/api/health"): backend.health,
-        ("GET", "/api/health/ready"): backend.health_ready,
-        ("GET", "/api/diagnostics"): backend.diagnostics,
-        ("GET", "/api/me"): backend.me,
-        ("POST", "/api/session"): backend.create_session,
-    }
-    for key, alias in aliases.items():
-        assert routes[key].endpoint is alias
-''')
           PY
       - name: Install production requirements
         run: python -m pip install -r backend/requirements.txt
@@ -157,6 +65,6 @@ def test_legacy_aliases_point_to_registered_handlers():
           rm .github/workflows/phase8-system-session-transform.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add backend/main.py backend/routes/system.py backend/routes/session_identity.py tests/test_phase8_system_session_contract.py .github/workflows/phase8-system-session-transform.yml
+          git add backend/main.py tests/test_phase8_system_session_contract.py .github/workflows/phase8-system-session-transform.yml
           git commit -m "Extract system and session routes from main.py [phase8]"
           git push origin HEAD:refactor/main-monolith-phase-8-system-session
