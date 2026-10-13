@@ -4,6 +4,7 @@ import ast
 from pathlib import Path
 
 import main as backend
+from conftest import iter_app_routes
 
 
 TARGETS = {
@@ -17,7 +18,7 @@ TARGETS = {
 
 def _routes():
     out = {}
-    for route in backend.app.routes:
+    for route in iter_app_routes(backend.app):
         path = getattr(route, "path", None)
         endpoint = getattr(route, "endpoint", None)
         methods = getattr(route, "methods", set()) or set()
