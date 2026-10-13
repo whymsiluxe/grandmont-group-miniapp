@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import os
 import sys
@@ -9,7 +10,9 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+sys.path.insert(0, os.path.dirname(__file__))
 
+from chat_domain_testkit import ChatDomainHarness  # noqa: E402
 from services.chat_storage import ChatStorageDeps, ChatStorageService  # noqa: E402
 
 
@@ -145,3 +148,50 @@ def test_chat_storage_service_has_no_framework_or_route_back_edge():
             assert module.split(".")[0] not in forbidden_roots
             assert "routes" not in module.split(".")
             assert module not in {"main", "backend.main"}
+
+
+def test_legacy_storage_handlers_remain_route_local_service_adapters():
+    harness = ChatDomainHarness()
+    try:
+        for name in (
+            "archive_chat_messages",
+            "load_chat",
+            "save_chat",
+            "purge_old_chat",
+        ):
+            module = inspect.getmodule(getattr(harness.core, name))
+            assert module is not None
+            assert module.__name__.endswith("routes.chat")
+    finally:
+        harness.close()
+
+
+def test_close_and_reopen_thread_meta_rmw_are_serialized_by_chat_lock():
+    path = Path(__file__).resolve().parents[1] / "backend" / "routes" / "chat_actions.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    factory = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "create_chat_actions_router"
+    )
+    functions = {
+        node.name: node
+        for node in factory.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for name in ("close_chat_thread", "reopen_chat_thread"):
+        handler = functions[name]
+        lock_with = [
+            node
+            for node in ast.walk(handler)
+            if isinstance(node, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Attribute)
+                and isinstance(item.context_expr.value, ast.Name)
+                and item.context_expr.value.id == "core"
+                and item.context_expr.attr == "chat_lock"
+                for item in node.items
+            )
+        ]
+        assert lock_with, f"{name} must serialize thread-meta read-modify-write"
