@@ -36,6 +36,15 @@ class ObjectMediaHandlers:
     get_blocker_photo: Callable[..., Any]
 
 
+def _safe_stored_filename(value: Any) -> str | None:
+    """Return a basename-only stored filename, rejecting corrupt path metadata."""
+    name = str(value)
+    safe_name = os.path.basename(name)
+    if not safe_name or safe_name != name or safe_name in (".", ".."):
+        return None
+    return safe_name
+
+
 def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, ObjectMediaHandlers]:
     router = APIRouter()
 
@@ -72,9 +81,14 @@ def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, Object
 
         try:
             photos = deps.update_json_transaction(deps.object_images_file(), {}, _mutator)
-        except HTTPException:
-            if os.path.exists(fpath):
-                os.remove(fpath)
+        except Exception:
+            # Binary is created before metadata commit. Any failed metadata/storage
+            # transaction must roll it back, not only HTTPException failures.
+            try:
+                if os.path.exists(fpath):
+                    os.remove(fpath)
+            except OSError as cleanup_exc:
+                print(f"[object-media] failed to remove orphan {fpath}: {cleanup_exc}")
             raise
         return {"status": "ok", "photos": photos}
 
@@ -112,8 +126,11 @@ def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, Object
         photos = images.get(object_id) or []
         if not photos or index < 0 or index >= len(photos):
             raise HTTPException(404, "Фото не загружено")
-        path = os.path.join(deps.object_photo_dir(), photos[index])
-        if not os.path.exists(path):
+        safe_name = _safe_stored_filename(photos[index])
+        if not safe_name:
+            raise HTTPException(404, "Файл отсутствует")
+        path = os.path.join(deps.object_photo_dir(), safe_name)
+        if not os.path.isfile(path):
             raise HTTPException(404, "Файл отсутствует")
         return FileResponse(path)
 
