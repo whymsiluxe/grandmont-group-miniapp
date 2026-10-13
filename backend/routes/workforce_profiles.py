@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Collection, Mapping
@@ -373,27 +374,96 @@ def create_workforce_profiles_router(
         uid = str(user['id'])
         avatar_dir = deps.avatar_dir()
         os.makedirs(avatar_dir, exist_ok=True)
-        for filename in os.listdir(avatar_dir):
-            if filename.startswith(uid + '.'):
-                os.remove(os.path.join(avatar_dir, filename))
-        with open(os.path.join(avatar_dir, f'{uid}.{ext}'), 'wb') as handle:
-            handle.write(raw)
+
+        allowed_exts = sorted(set(deps.allowed_image_mime_ext.values()))
+        target_path = os.path.join(avatar_dir, f'{uid}.{ext}')
+        temp_path = os.path.join(avatar_dir, f'.{uid}.{uuid.uuid4().hex}.tmp')
+        backup_path = os.path.join(avatar_dir, f'.{uid}.{uuid.uuid4().hex}.bak')
+        target_had_old = os.path.exists(target_path)
+
+        try:
+            with open(temp_path, 'wb') as handle:
+                handle.write(raw)
+            if target_had_old:
+                os.replace(target_path, backup_path)
+            os.replace(temp_path, target_path)
+        except Exception:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                logging.getLogger('grandmont.avatar').exception(
+                    'Failed to clean staged avatar temp file for uid=%s', uid
+                )
+            if target_had_old and os.path.exists(backup_path):
+                try:
+                    os.replace(backup_path, target_path)
+                except OSError:
+                    logging.getLogger('grandmont.avatar').exception(
+                        'Failed to restore previous avatar after binary write failure for uid=%s', uid
+                    )
+            raise
 
         def _mutator(profiles):
             profile = profiles.get(uid, {"skills": [], "quiz_completed": False})
             profile['avatar'] = True
+            profile['avatar_ext'] = ext
             if not profile.get('name'):
                 profile['name'] = user.get('first_name', uid)
             profiles[uid] = profile
 
-        deps.update_json_transaction(deps.worker_profiles_file(), {}, _mutator)
+        try:
+            deps.update_json_transaction(deps.worker_profiles_file(), {}, _mutator)
+        except Exception:
+            try:
+                os.remove(target_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logging.getLogger('grandmont.avatar').exception(
+                    'Failed to remove uncommitted avatar for uid=%s', uid
+                )
+            if target_had_old and os.path.exists(backup_path):
+                try:
+                    os.replace(backup_path, target_path)
+                except OSError:
+                    logging.getLogger('grandmont.avatar').exception(
+                        'Failed to restore previous avatar after profile write failure for uid=%s', uid
+                    )
+            raise
+
+        # Metadata now points to the committed extension. Removing stale formats is
+        # secondary cleanup: failure must not turn a successful upload into false 500.
+        stale_paths = [
+            os.path.join(avatar_dir, f'{uid}.{candidate_ext}')
+            for candidate_ext in allowed_exts
+            if candidate_ext != ext
+        ]
+        if target_had_old:
+            stale_paths.append(backup_path)
+        for stale_path in stale_paths:
+            try:
+                os.remove(stale_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logging.getLogger('grandmont.avatar').exception(
+                    'Failed to clean stale avatar file %s for uid=%s', stale_path, uid
+                )
         return {'status': 'ok'}
 
     @router.get('/api/profile/{user_id}/avatar')
     def get_avatar(user_id: str, user: dict = Depends(deps.get_current_user)):
         if not user_id.isdigit():
             raise HTTPException(400, 'user_id должен быть числовым Telegram ID')
-        for ext in ('jpg', 'png', 'webp'):
+        profile = deps.load_worker_profiles().get(str(user_id), {})
+        preferred_ext = profile.get('avatar_ext') if isinstance(profile, dict) else None
+        allowed_exts = list(dict.fromkeys(deps.allowed_image_mime_ext.values()))
+        candidate_exts = []
+        if preferred_ext in allowed_exts:
+            candidate_exts.append(preferred_ext)
+        candidate_exts.extend(ext for ext in allowed_exts if ext not in candidate_exts)
+        for ext in candidate_exts:
             path = os.path.join(deps.avatar_dir(), f'{user_id}.{ext}')
             if os.path.exists(path):
                 return FileResponse(path)
