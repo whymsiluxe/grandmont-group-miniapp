@@ -208,6 +208,8 @@ def create_critical_alerts_router(
                 )
                 ensure_critical_alert_chat(alert, thread_id, owner_ids)
             except Exception:
+                # Alert JSON is the primary durable operation. A secondary chat
+                # notification must never turn it into a false 500/retry loop.
                 logger.exception(
                     'Critical-alert chat delivery failed after alert persisted: %s',
                     alert['id'],
@@ -226,6 +228,8 @@ def create_critical_alerts_router(
                         deps.critical_alerts_file(), [], _clear_pending
                     )
                 except Exception:
+                    # The chat append itself is idempotent, so leaving the repair
+                    # marker behind is safe: a later dedup call can retry it.
                     logger.exception(
                         'Failed to clear critical-alert chat repair marker: %s',
                         alert['id'],
@@ -313,6 +317,8 @@ def create_critical_alerts_router(
         normalized_note = note.strip()[:500]
         validated_photos: list[tuple[bytes, str]] = []
         if resolution == 'yes' and files:
+            # Validate the entire batch before writing the first file. Otherwise a
+            # valid first upload + invalid second upload leaves an orphan binary.
             for upload in files:
                 data = upload.file.read()
                 if len(data) > 8 * 1024 * 1024:
@@ -360,9 +366,12 @@ def create_critical_alerts_router(
                 deps.critical_alerts_file(), [], _mutate
             )
         except Exception:
+            # Metadata did not commit; new binaries belong to no durable record.
             _remove_photo_paths(saved_paths)
             raise
 
+        # Metadata now points at the new set. Only after that durable commit may
+        # files from the previous resolution be removed.
         for filename in previous_photos:
             if not isinstance(filename, str) or os.path.basename(filename) != filename:
                 continue
