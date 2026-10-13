@@ -14,13 +14,8 @@ class SystemDeps:
     health_response: Callable[[str], dict]
     readiness_response: Callable[..., dict]
     diagnostics_response: Callable[..., dict]
-    app_version_file: str
-    object_photo_dir: str
-    chat_attach_dir: str
-    tools_lib_path: str
-    mangel_lib_path: str
-    backend_dir: str
-    roles_file: str
+    get_app_version_file: Callable[[], str]
+    get_readiness_kwargs: Callable[[], dict[str, Any]]
     get_diagnostics_kwargs: Callable[[], dict[str, Any]]
 
 
@@ -37,7 +32,7 @@ def create_system_router(deps: SystemDeps) -> tuple[APIRouter, SystemHandlers]:
     @router.get("/api/health")
     def health():
         """Cheap liveness check; intentionally performs no network I/O."""
-        return deps.health_response(deps.app_version_file)
+        return deps.health_response(deps.get_app_version_file())
 
     @router.get("/api/health/ready")
     def health_ready(
@@ -45,14 +40,7 @@ def create_system_router(deps: SystemDeps) -> tuple[APIRouter, SystemHandlers]:
         _: None = Depends(deps.require_owner),
     ):
         """Owner-only readiness check using cheap local-state probes."""
-        return deps.readiness_response(
-            object_photo_dir=deps.object_photo_dir,
-            chat_attach_dir=deps.chat_attach_dir,
-            tools_lib_path=deps.tools_lib_path,
-            mangel_lib_path=deps.mangel_lib_path,
-            backend_dir=deps.backend_dir,
-            roles_file=deps.roles_file,
-        )
+        return deps.readiness_response(**deps.get_readiness_kwargs())
 
     @router.get("/api/diagnostics")
     def diagnostics(_: None = Depends(deps.require_owner)):
