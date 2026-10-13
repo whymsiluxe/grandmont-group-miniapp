@@ -14,6 +14,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 from routes.checkin import CheckinRouteDeps, create_checkin_router  # noqa: E402
 
 
+# These tests intentionally fail only the secondary replay store; primary shift
+# persistence and pre-commit idempotency claim semantics stay strict.
 def _build_handlers(initial_sessions=None):
     sessions = deepcopy(initial_sessions or [])
     idempotency_save_calls = []
