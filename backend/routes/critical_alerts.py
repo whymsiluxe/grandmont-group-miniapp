@@ -12,6 +12,11 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+try:
+    from ..core.media_paths import resolve_owned_media_path
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 
@@ -203,8 +208,6 @@ def create_critical_alerts_router(
                 )
                 ensure_critical_alert_chat(alert, thread_id, owner_ids)
             except Exception:
-                # Alert JSON is the primary durable operation. A secondary chat
-                # notification must never turn it into a false 500/retry loop.
                 logger.exception(
                     'Critical-alert chat delivery failed after alert persisted: %s',
                     alert['id'],
@@ -223,8 +226,6 @@ def create_critical_alerts_router(
                         deps.critical_alerts_file(), [], _clear_pending
                     )
                 except Exception:
-                    # The chat append itself is idempotent, so leaving the repair
-                    # marker behind is safe: a later dedup call can retry it.
                     logger.exception(
                         'Failed to clear critical-alert chat repair marker: %s',
                         alert['id'],
@@ -312,8 +313,6 @@ def create_critical_alerts_router(
         normalized_note = note.strip()[:500]
         validated_photos: list[tuple[bytes, str]] = []
         if resolution == 'yes' and files:
-            # Validate the entire batch before writing the first file. Otherwise a
-            # valid first upload + invalid second upload leaves an orphan binary.
             for upload in files:
                 data = upload.file.read()
                 if len(data) > 8 * 1024 * 1024:
@@ -361,12 +360,9 @@ def create_critical_alerts_router(
                 deps.critical_alerts_file(), [], _mutate
             )
         except Exception:
-            # Metadata did not commit; new binaries belong to no durable record.
             _remove_photo_paths(saved_paths)
             raise
 
-        # Metadata now points at the new set. Only after that durable commit may
-        # files from the previous resolution be removed.
         for filename in previous_photos:
             if not isinstance(filename, str) or os.path.basename(filename) != filename:
                 continue
@@ -432,17 +428,23 @@ def create_critical_alerts_router(
         safe_filename = os.path.basename(filename)
         if safe_alert_id != alert_id or safe_filename != filename:
             raise HTTPException(404, 'Фото не найдено')
-        path = os.path.join(
-            deps.critical_alert_photo_dir(), safe_alert_id, safe_filename
+
+        alert = next(
+            (item for item in load_critical_alerts() if item['id'] == alert_id), None
         )
-        if not os.path.exists(path):
+        if not alert:
             raise HTTPException(404, 'Фото не найдено')
-        if role != 'owner':
-            alert = next(
-                (item for item in load_critical_alerts() if item['id'] == alert_id), None
-            )
-            if not alert or alert['target_user_id'] != str(user['id']):
-                raise HTTPException(403, 'Нет доступа к этому фото')
+        if filename not in (alert.get('resolution_photos') or []):
+            raise HTTPException(404, 'Фото не найдено')
+        if role != 'owner' and alert['target_user_id'] != str(user['id']):
+            raise HTTPException(403, 'Нет доступа к этому фото')
+
+        path = resolve_owned_media_path(
+            deps.critical_alert_photo_dir(),
+            os.path.join(safe_alert_id, safe_filename),
+        )
+        if not path or not os.path.isfile(path):
+            raise HTTPException(404, 'Фото не найдено')
         return FileResponse(path)
 
     @router.get('/api/critical-alerts/pending')
