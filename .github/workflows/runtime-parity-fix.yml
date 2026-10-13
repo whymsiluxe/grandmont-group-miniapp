@@ -1,0 +1,111 @@
+name: Runtime Path and Venv Parity Transform
+
+on:
+  push:
+    branches:
+      - fix/deep-audit-hardening-2026-10-13
+
+permissions:
+  contents: write
+
+jobs:
+  transform:
+    if: ${{ !contains(github.event.head_commit.message, '[runtime-parity-final]') }}
+    runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: ci-dummy-token-not-a-real-secret
+      MINIAPP_DATA_ROOT: /tmp/ci-runtime-parity-data
+      GRANDMONT_GROUP_ENV: test
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Apply guarded canonical path transforms
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          files = [
+              Path('backend/mangel_lib.py'),
+              Path('backend/roadmap_lib.py'),
+              Path('backend/daily_plan_cutoff_check.py'),
+              Path('backend/cleanup_legacy_critical_alert_duplicates.py'),
+          ]
+          legacy = '/home/promonta/agent/miniapp'
+          canonical = '/home/grandmont/agent/miniapp'
+          changed = 0
+          for path in files:
+              text = path.read_text(encoding='utf-8')
+              count = text.count(legacy)
+              if count == 0:
+                  raise SystemExit(f'{path}: expected at least one active legacy miniapp path')
+              path.write_text(text.replace(legacy, canonical), encoding='utf-8')
+              changed += count
+          print(f'replaced {changed} active legacy miniapp path occurrence(s)')
+          PY
+
+      - name: Add exact production-venv parity gate to deploy
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('scripts/deploy.sh')
+          text = path.read_text(encoding='utf-8')
+          marker = '''if [[ ! -x "$TEST_PYTHON" ]]; then\n  echo "ОШИБКА: $TEST_PYTHON не найден -- venv сервиса недоступен" >&2\n  exit 1\nfi\n'''
+          addition = marker + '''echo "== 6a/14 Проверка production venv против backend/requirements.txt =="\n"$TEST_PYTHON" - "$REPO_DIR/backend/requirements.txt" <<'PYREQ'\nfrom importlib.metadata import PackageNotFoundError, version\nfrom pathlib import Path\nimport sys\n\nrequirements = Path(sys.argv[1])\nproblems = []\nfor raw in requirements.read_text(encoding='utf-8').splitlines():\n    line = raw.strip()\n    if not line or line.startswith('#'):\n        continue\n    if '==' not in line:\n        problems.append(f'unpinned requirement: {line}')\n        continue\n    name, expected = line.split('==', 1)\n    name = name.strip()\n    expected = expected.strip()\n    try:\n        actual = version(name)\n    except PackageNotFoundError:\n        problems.append(f'{name}: missing (expected {expected})')\n        continue\n    if actual != expected:\n        problems.append(f'{name}: installed {actual}, expected {expected}')\n\nif problems:\n    print('ОШИБКА: production venv не соответствует backend/requirements.txt:', file=sys.stderr)\n    for problem in problems:\n        print(f'  - {problem}', file=sys.stderr)\n    raise SystemExit(1)\nprint('OK: production venv exactly matches backend/requirements.txt')\nPYREQ\n'''
+          if text.count(marker) != 1:
+              raise SystemExit(f'deploy parity marker mismatch: {text.count(marker)}')
+          path.write_text(text.replace(marker, addition, 1), encoding='utf-8')
+          PY
+
+      - name: Add regression guard
+        run: |
+          cat > tests/test_runtime_path_parity.py <<'PY'
+          from pathlib import Path
+
+
+          RUNTIME_FILES = [
+              'backend/mangel_lib.py',
+              'backend/roadmap_lib.py',
+              'backend/daily_plan_cutoff_check.py',
+              'backend/cleanup_legacy_critical_alert_duplicates.py',
+              'backend/cleanup_old_attachments.py',
+          ]
+
+
+          def test_active_runtime_data_roots_do_not_default_to_retired_promonta_path():
+              retired = '/home/promonta/agent/miniapp'
+              for filename in RUNTIME_FILES:
+                  text = Path('../' + filename).read_text(encoding='utf-8')
+                  assert retired not in text, filename
+
+
+          def test_deploy_contains_exact_requirements_parity_gate():
+              text = Path('../scripts/deploy.sh').read_text(encoding='utf-8')
+              assert 'production venv exactly matches backend/requirements.txt' in text
+              assert "from importlib.metadata import PackageNotFoundError, version" in text
+          PY
+
+      - name: Validate
+        run: |
+          pip install -r requirements-test.txt
+          python -m py_compile backend/mangel_lib.py backend/roadmap_lib.py backend/daily_plan_cutoff_check.py backend/cleanup_legacy_critical_alert_duplicates.py
+          bash -n scripts/deploy.sh
+          cd tests
+          python -m pytest test_runtime_path_parity.py -q
+          python -m pytest . -q -rs
+
+      - name: Remove one-shot workflow and commit
+        run: |
+          rm .github/workflows/runtime-parity-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/mangel_lib.py backend/roadmap_lib.py backend/daily_plan_cutoff_check.py backend/cleanup_legacy_critical_alert_duplicates.py scripts/deploy.sh tests/test_runtime_path_parity.py
+          git add -u .github/workflows/runtime-parity-fix.yml
+          git diff --cached --check
+          git commit -m "Align runtime paths and enforce production venv parity [runtime-parity-final]"
+          git push origin HEAD:fix/deep-audit-hardening-2026-10-13
