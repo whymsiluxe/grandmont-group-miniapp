@@ -172,16 +172,18 @@ def create_feed_news_router(deps: FeedNewsRouteDeps) -> tuple[APIRouter, FeedNew
     @router.post('/api/feed/weather/react')
     def react_weather_entry(body: dict, user: dict = Depends(deps.get_current_user)):
         key = f"{body.get('object', '')}::{body.get('created', '')}"
-        reactions = load_weather_reactions()
-        entry_reactions = reactions.setdefault(key, {})
         uid = str(user['id'])
         liked = bool(body.get('liked'))
-        if liked:
-            entry_reactions[uid] = True
-        else:
-            entry_reactions.pop(uid, None)
-        save_weather_reactions(reactions)
-        return {'likes': len(entry_reactions), 'liked_by_me': liked}
+
+        def mutate(reactions: dict):
+            entry_reactions = reactions.setdefault(key, {})
+            if liked:
+                entry_reactions[uid] = True
+            else:
+                entry_reactions.pop(uid, None)
+            return {'likes': len(entry_reactions), 'liked_by_me': liked}
+
+        return deps.update_json_transaction(deps.weather_reactions_file(), {}, mutate)
 
     def load_news_reactions() -> dict:
         return deps.safe_load_json(deps.news_reactions_file(), {})
@@ -307,12 +309,14 @@ def create_feed_news_router(deps: FeedNewsRouteDeps) -> tuple[APIRouter, FeedNew
             post_comments = comments.get(post['id'], [])
             post['comment_count'] = len(post_comments)
             post['last_comment_at'] = max((c.get('ts', 0) for c in post_comments), default=0)
-        reads = load_news_reads()
-        user_reads = reads.setdefault(uid, {})
-        for post in feed:
-            category = post.get('category') or 'Другое'
-            user_reads[category] = user_reads.get(category, 0) + 1
-        save_news_reads(reads)
+
+        def mutate_reads(reads: dict):
+            user_reads = reads.setdefault(uid, {})
+            for post in feed:
+                category = post.get('category') or 'Другое'
+                user_reads[category] = user_reads.get(category, 0) + 1
+
+        deps.update_json_transaction(deps.news_reads_file(), {}, mutate_reads)
         return {'feed': feed}
 
     @router.post('/api/feed/news/{post_id}/react')
@@ -365,20 +369,26 @@ def create_feed_news_router(deps: FeedNewsRouteDeps) -> tuple[APIRouter, FeedNew
         text = (body.text or '').strip()[:500]
         if not text:
             raise HTTPException(400, 'Комментарий не может быть пустым')
-        comments = load_news_comments()
-        post_comments = comments.setdefault(post_id, [])
-        prior_ids = {comment.get('user_id') for comment in post_comments}
         actor_name = deps.sanitize_display_name(user.get('first_name'), str(user['id']))
         new_id = uuid.uuid4().hex
-        post_comments.append({
+        new_comment = {
             'id': new_id,
             'user_id': str(user['id']),
             'name': actor_name,
             'text': text,
             'reply_to': body.reply_to or None,
             'ts': int(time.time()),
-        })
-        save_news_comments(comments)
+        }
+
+        def mutate(comments: dict):
+            post_comments = comments.setdefault(post_id, [])
+            prior_ids = [comment.get('user_id') for comment in post_comments]
+            post_comments.append(new_comment)
+            return {'comments': list(post_comments), 'prior_ids': prior_ids}
+
+        mutation = deps.update_json_transaction(deps.news_comments_file(), {}, mutate)
+        post_comments = mutation['comments']
+        prior_ids = mutation['prior_ids']
         try:
             deps.emit_comment_activity_alerts(
                 'news_comment', post_id, new_id, str(user['id']), actor_name,
@@ -405,30 +415,33 @@ def create_feed_news_router(deps: FeedNewsRouteDeps) -> tuple[APIRouter, FeedNew
         user: dict = Depends(deps.get_current_user),
         role: str = Depends(deps.get_role),
     ):
-        comments = load_news_comments()
-        post_comments = comments.get(post_id, [])
-        comment = next((item for item in post_comments if item.get('id') == comment_id), None)
-        if not comment:
-            raise HTTPException(404, 'Комментарий не найден')
-        if str(comment.get('user_id')) != str(user['id']) and role != 'owner':
-            raise HTTPException(403, 'Можно удалить только свой комментарий')
-        comments[post_id] = [item for item in post_comments if item.get('id') != comment_id]
-        save_news_comments(comments)
-        return {'comments': comments[post_id]}
+        def mutate(comments: dict):
+            post_comments = comments.get(post_id, [])
+            comment = next((item for item in post_comments if item.get('id') == comment_id), None)
+            if not comment:
+                raise HTTPException(404, 'Комментарий не найден')
+            if str(comment.get('user_id')) != str(user['id']) and role != 'owner':
+                raise HTTPException(403, 'Можно удалить только свой комментарий')
+            remaining = [item for item in post_comments if item.get('id') != comment_id]
+            comments[post_id] = remaining
+            return {'comments': remaining}
+
+        return deps.update_json_transaction(deps.news_comments_file(), {}, mutate)
 
     @router.post('/api/feed/read')
     def mark_feed_read(body: FeedReadBody, user: dict = Depends(deps.get_current_user)):
         if body.tab not in ('news', 'photos', 'info'):
             raise HTTPException(400, 'tab должен быть news/photos/info')
-        reads = load_feed_reads()
-        user_record = reads.setdefault(str(user['id']), {})
-        user_record[f'last_{body.tab}_read_at'] = int(time.time())
-        save_feed_reads(reads)
-        return {
-            'ok': True,
-            'tab': body.tab,
-            'read_at': user_record[f'last_{body.tab}_read_at'],
-        }
+        uid = str(user['id'])
+        field = f'last_{body.tab}_read_at'
+
+        def mutate(reads: dict):
+            user_record = reads.setdefault(uid, {})
+            read_at = int(time.time())
+            user_record[field] = read_at
+            return {'ok': True, 'tab': body.tab, 'read_at': read_at}
+
+        return deps.update_json_transaction(deps.feed_reads_file(), {}, mutate)
 
     @router.post('/api/feed/saved')
     def set_feed_saved(body: FeedSavedBody, user: dict = Depends(deps.get_current_user)):
