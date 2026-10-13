@@ -1,0 +1,97 @@
+name: Audit Middleware Hardening Transform
+
+on:
+  push:
+    branches:
+      - fix/deep-audit-hardening-2026-10-13
+
+permissions:
+  contents: write
+
+jobs:
+  transform:
+    if: ${{ !contains(github.event.head_commit.message, '[audit-middleware-final]') }}
+    runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: ci-dummy-token-not-a-real-secret
+      MINIAPP_DATA_ROOT: /tmp/ci-audit-middleware-data
+      GRANDMONT_GROUP_ENV: test
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: Apply guarded main.py transform
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('backend/main.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''            with AUDIT_LOCK:\n                with open(AUDIT_FILE, "a", encoding="utf-8") as f:\n                    f.write(json.dumps(entry, ensure_ascii=False) + "\\n")\n'''
+          new = '''            try:\n                with AUDIT_LOCK:\n                    with open(AUDIT_FILE, "a", encoding="utf-8") as f:\n                        f.write(json.dumps(entry, ensure_ascii=False) + "\\n")\n            except OSError as exc:\n                # The business handler already produced its response. Audit persistence\n                # is observability, not a second transaction boundary: never turn an\n                # already-committed mutation into a client-visible 500.\n                print(f"[audit] failed to append {AUDIT_FILE}: {exc}")\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'audit middleware transform expected 1 match, got {text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
+      - name: Add regression test
+        run: |
+          cat > tests/test_audit_middleware_resilience.py <<'PY'
+          import builtins
+          import os
+          from unittest.mock import patch
+
+          from fastapi import FastAPI
+          from fastapi.testclient import TestClient
+
+          import main as backend
+
+
+          def test_audit_write_failure_does_not_change_committed_response():
+              app = FastAPI()
+              app.middleware("http")(backend.audit_log_middleware)
+
+              @app.post("/mutate")
+              def mutate():
+                  return {"status": "committed"}
+
+              real_open = builtins.open
+
+              def fail_audit_only(path, *args, **kwargs):
+                  mode = args[0] if args else kwargs.get("mode", "r")
+                  if os.fspath(path) == backend.AUDIT_FILE and "a" in mode:
+                      raise OSError("simulated audit storage failure")
+                  return real_open(path, *args, **kwargs)
+
+              with patch("builtins.open", side_effect=fail_audit_only):
+                  response = TestClient(app).post("/mutate", json={"x": 1})
+
+              assert response.status_code == 200
+              assert response.json() == {"status": "committed"}
+          PY
+
+      - name: Validate focused and full suite
+        run: |
+          python -m py_compile backend/main.py tests/test_audit_middleware_resilience.py
+          cd tests
+          python -m pytest test_audit_middleware_resilience.py -q
+          python -m pytest . -q -rs
+
+      - name: Remove one-shot workflow and commit
+        run: |
+          rm .github/workflows/audit-middleware-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/main.py tests/test_audit_middleware_resilience.py
+          git add -u .github/workflows/audit-middleware-fix.yml
+          git diff --cached --check
+          git commit -m "Make audit logging best-effort after mutations [audit-middleware-final]"
+          git push origin HEAD:fix/deep-audit-hardening-2026-10-13
