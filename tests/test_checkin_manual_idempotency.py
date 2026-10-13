@@ -209,10 +209,10 @@ class CheckinManualAndIdempotencyTests(unittest.TestCase):
         self.assertEqual(second['start_time'], '12:00')
 
     def test_start_survives_crash_between_business_write_and_idempotency_save(self):
-        # F03: same crash-window scenario as manual entry, but for checkin_start --
-        # the open session gets written to checkin_meta.json, then the process dies
-        # before _idempotency_save() runs. A retry with the same key must land on
-        # the SAME session (deterministic entity id), not open a second one.
+        # Phase 21 strengthens the old F03 crash-window contract: once the open
+        # session is durable in checkin_meta.json, failure of the secondary
+        # idempotency response store must NOT turn Start into a false 500. A retry
+        # with the same key must still land on the SAME deterministic session.
         event_ts = int(datetime(2026, 9, 22, 8, 0, tzinfo=backend.business_now().tzinfo).timestamp())
         first_received_at = event_ts + 60
         save_photos = AsyncMock(return_value=['OBJ-1/2026-09-22/start.jpg'])
@@ -221,18 +221,18 @@ class CheckinManualAndIdempotencyTests(unittest.TestCase):
              patch.object(backend, '_cached_get_used_range', return_value=self._object_rows()), \
              patch.object(backend, '_upsert_checkin_feed_post'), \
              patch.object(backend, '_idempotency_save', side_effect=RuntimeError('simulated crash')):
-            with self.assertRaises(RuntimeError):
-                asyncio.run(backend.checkin_start(
-                    object_id='OBJ-1', lat='52.5', lon='13.4', accuracy='', geo_timestamp='',
-                    occurred_at=str(event_ts * 1000), stage_name='', files=[MagicMock()],
-                    daily_plan_id='', daily_plan_version='', daily_plan_acceptance_id='',
-                    user=WORKER, role='worker', idempotency_key='start-crash',
-                ))
+            first = asyncio.run(backend.checkin_start(
+                object_id='OBJ-1', lat='52.5', lon='13.4', accuracy='', geo_timestamp='',
+                occurred_at=str(event_ts * 1000), stage_name='', files=[MagicMock()],
+                daily_plan_id='', daily_plan_version='', daily_plan_acceptance_id='',
+                user=WORKER, role='worker', idempotency_key='start-crash',
+            ))
 
         backend._idempotency_cache.clear()
         items_after_crash = backend._load_checkin_meta()
         self.assertEqual(len(items_after_crash), 1, "open session must have survived the simulated crash")
         crashed_session_id = items_after_crash[0]['id']
+        self.assertEqual(first['id'], crashed_session_id)
 
         # A retry (even immediately after) must not be blocked by the crashed
         # claim's still-'pending' state -- _idempotency_claim no longer 409s on
