@@ -22,7 +22,7 @@ class SystemDeps:
     backend_dir: str
     roles_file: str
     data_root: str
-    sheets_cache: Any
+    get_sheets_cache: Callable[[], Any]
     sheets_cache_ttl: int
     activity_alerts_file: str
     news_feed_file: str
@@ -70,7 +70,7 @@ def create_system_router(deps: SystemDeps) -> tuple[APIRouter, SystemHandlers]:
         return deps.diagnostics_response(
             data_root=deps.data_root,
             roles_file=deps.roles_file,
-            sheets_cache=deps.sheets_cache,
+            sheets_cache=deps.get_sheets_cache(),
             sheets_cache_ttl=deps.sheets_cache_ttl,
             activity_alerts_file=deps.activity_alerts_file,
             news_feed_file=deps.news_feed_file,
