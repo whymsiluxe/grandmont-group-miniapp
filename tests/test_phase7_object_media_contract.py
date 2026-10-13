@@ -181,6 +181,35 @@ def test_object_image_failed_metadata_transaction_rolls_back_binary():
         assert os.listdir(photo_dir) == []
 
 
+def test_object_image_any_metadata_failure_rolls_back_binary():
+    def fail_transaction(path, default, mutator):
+        raise OSError("disk full")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        handlers, photo_dir, _, _ = _handlers(tmp, transaction_override=fail_transaction)
+        with pytest.raises(OSError):
+            asyncio.run(handlers.upload_object_image(
+                "OBJ-1", UploadFile(filename="x.bin", file=io.BytesIO(b"png-data")), user={"id": 1}, _=None
+            ))
+        assert os.path.isdir(photo_dir)
+        assert os.listdir(photo_dir) == []
+
+
+def test_object_image_rejects_path_escape_from_corrupt_metadata():
+    with tempfile.TemporaryDirectory() as tmp:
+        handlers, photo_dir, _, images_file = _handlers(tmp)
+        os.makedirs(photo_dir, exist_ok=True)
+        secret = os.path.join(tmp, "secret.png")
+        with open(secret, "wb") as fh:
+            fh.write(b"secret")
+        with open(images_file, "w", encoding="utf-8") as fh:
+            json.dump({"OBJ-1": ["../secret.png"]}, fh)
+
+        with pytest.raises(HTTPException) as exc:
+            handlers.get_object_image_file("OBJ-1", index=0, user={"id": 10})
+        assert exc.value.status_code == 404
+
+
 def test_blocker_photo_upload_get_and_filename_guard():
     with tempfile.TemporaryDirectory() as tmp:
         handlers, _, blocker_dir, _ = _handlers(tmp)
