@@ -33,6 +33,11 @@ from typing import Callable
 from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
 
+try:
+    from ..core.media_paths import resolve_owned_media_path
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+
 
 MANUAL_TIME_ART_WHITELIST = {'Arbeitszeit', 'Fahrzeit'}
 
@@ -117,12 +122,12 @@ def create_execution_router(deps: ExecutionRouteDeps):
         return a_start < b_end and b_start < a_end
 
     def _assert_no_manual_time_overlap(target_user_id: str, date_str: str, start_minutes: int, end_minutes: int,
-                                        exclude_id: str | None = None) -> None:
+                                        exclude_id: str | None = None, items: list | None = None) -> None:
         """F02: та же дата+работник не может иметь два пересекающихся интервала времени --
         ни ручная-vs-ручная, ни ручная-vs-фото check-in (photo-сессия того же дня с известным
         finish_at также считается интервалом; ещё активная (finish_at is None) не пересекает
         по времени, т.к. её конец неизвестен -- не блокируем на этом основании)."""
-        for item in deps.load_checkin_meta():
+        for item in items if items is not None else deps.load_checkin_meta():
             if str(item.get('user_id')) != str(target_user_id) or item.get('date') != date_str:
                 continue
             if exclude_id and item.get('id') == exclude_id:
@@ -207,14 +212,6 @@ def create_execution_router(deps: ExecutionRouteDeps):
             return cached
 
         entity_id = deps.idempotent_entity_id(idempotency_key, idempotency_scope)
-        # F02/F03: overlap is checked here (not inside _validate_manual_time_body) and
-        # excludes entity_id -- a crash-recovered retry with the SAME Idempotency-Key
-        # must not be rejected as "overlapping" against the very entry it's replaying.
-        _assert_no_manual_time_overlap(
-            target_user_id, clean['date'],
-            _parse_manual_hhmm(clean['start_time'], 'start_time'), _parse_manual_hhmm(clean['end_time'], 'end_time'),
-            exclude_id=entity_id,
-        )
         entry = {
             "id": entity_id,
             "object_id": clean["object_id"],
@@ -231,6 +228,17 @@ def create_execution_router(deps: ExecutionRouteDeps):
         try:
             with deps.checkin_lock:
                 items = deps.load_checkin_meta()
+                # F02/F03: overlap validation and the append must share the same
+                # critical section. Otherwise two concurrent requests can both
+                # validate the same stale snapshot and persist overlapping time.
+                # exclude_id keeps crash-recovered retries for the same key valid.
+                _assert_no_manual_time_overlap(
+                    target_user_id, clean['date'],
+                    _parse_manual_hhmm(clean['start_time'], 'start_time'),
+                    _parse_manual_hhmm(clean['end_time'], 'end_time'),
+                    exclude_id=entity_id,
+                    items=items,
+                )
                 existing_entry = next((i for i in items if i.get('id') == entity_id), None)
                 if existing_entry is not None:
                     # F03: crash-recovered retry -- an earlier attempt with the SAME
@@ -261,7 +269,10 @@ def create_execution_router(deps: ExecutionRouteDeps):
     def _call_glm_vision(system_prompt: str, image_paths: list, text_prompt: str) -> str:
         content = []
         for p in image_paths:
-            block = _image_block_from_file(os.path.join(deps.checkin_photo_base(), p))
+            safe_path = resolve_owned_media_path(deps.checkin_photo_base(), p)
+            if not safe_path:
+                continue
+            block = _image_block_from_file(safe_path)
             if block:
                 content.append(block)
         content.append({"type": "text", "text": text_prompt})
