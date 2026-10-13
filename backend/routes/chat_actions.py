@@ -461,12 +461,13 @@ def create_chat_actions_router(
         core.reject_self_chat(user['id'], body.to_user_id)
         core.validate_dm_recipient(body.to_user_id)
         thread_id = core.chat_thread_id(user['id'], body.to_user_id)
-        meta = core.load_chat_thread_meta()
-        thread_meta = meta.setdefault(thread_id, {})
-        thread_meta['closed'] = True
-        thread_meta['closed_at'] = int(time.time())
-        thread_meta['closed_by'] = str(user['id'])
-        core.save_chat_thread_meta(meta)
+        with core.chat_lock:
+            meta = core.load_chat_thread_meta()
+            thread_meta = meta.setdefault(thread_id, {})
+            thread_meta['closed'] = True
+            thread_meta['closed_at'] = int(time.time())
+            thread_meta['closed_by'] = str(user['id'])
+            core.save_chat_thread_meta(meta)
         for uid in chat_thread_participants(thread_id):
             if uid == str(user['id']):
                 continue
@@ -485,10 +486,11 @@ def create_chat_actions_router(
         core.reject_self_chat(user['id'], body.to_user_id)
         core.validate_dm_recipient(body.to_user_id)
         thread_id = core.chat_thread_id(user['id'], body.to_user_id)
-        meta = core.load_chat_thread_meta()
-        if thread_id in meta:
-            meta[thread_id]['closed'] = False
-            core.save_chat_thread_meta(meta)
+        with core.chat_lock:
+            meta = core.load_chat_thread_meta()
+            if thread_id in meta:
+                meta[thread_id]['closed'] = False
+                core.save_chat_thread_meta(meta)
         return {'status': 'ok', 'thread_id': thread_id}
 
     @router.get('/api/chat/threads/status')
