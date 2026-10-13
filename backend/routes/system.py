@@ -21,17 +21,7 @@ class SystemDeps:
     mangel_lib_path: str
     backend_dir: str
     roles_file: str
-    data_root: str
-    get_sheets_cache: Callable[[], Any]
-    sheets_cache_ttl: int
-    activity_alerts_file: str
-    news_feed_file: str
-    chat_file: str
-    plan_sync_state_file: str
-    contract_ingest_state_file: str
-    contracts_drive_folder_id: str
-    safe_load_json: Callable[..., Any]
-    outbox_dead_letter_count: Callable[..., int]
+    get_diagnostics_kwargs: Callable[[], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -67,21 +57,7 @@ def create_system_router(deps: SystemDeps) -> tuple[APIRouter, SystemHandlers]:
     @router.get("/api/diagnostics")
     def diagnostics(_: None = Depends(deps.require_owner)):
         """Owner-only diagnostic snapshot without live external API calls."""
-        return deps.diagnostics_response(
-            data_root=deps.data_root,
-            roles_file=deps.roles_file,
-            sheets_cache=deps.get_sheets_cache(),
-            sheets_cache_ttl=deps.sheets_cache_ttl,
-            activity_alerts_file=deps.activity_alerts_file,
-            news_feed_file=deps.news_feed_file,
-            chat_file=deps.chat_file,
-            plan_sync_state_file=deps.plan_sync_state_file,
-            contract_ingest_state_file=deps.contract_ingest_state_file,
-            contracts_drive_folder_id=deps.contracts_drive_folder_id,
-            app_version_file=deps.app_version_file,
-            safe_load_json=deps.safe_load_json,
-            outbox_dead_letter_count=deps.outbox_dead_letter_count,
-        )
+        return deps.diagnostics_response(**deps.get_diagnostics_kwargs())
 
     return router, SystemHandlers(
         health=health,
