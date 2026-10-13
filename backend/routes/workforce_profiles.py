@@ -201,13 +201,29 @@ def create_workforce_profiles_router(
         if not healed_name and user.get('first_name'):
             candidate = deps.sanitize_display_name(user.get('first_name'), '')
             if candidate:
-                profiles = deps.load_worker_profiles()
                 key = str(user['id'])
-                profile = profiles.get(key, {"skills": [], "quiz_completed": False})
-                profile['name'] = candidate
-                profiles[key] = profile
-                save_worker_profiles(profiles)
-                healed_name = candidate
+
+                def _heal_name(profiles):
+                    current = profiles.get(
+                        key, {"skills": [], "quiz_completed": False}
+                    )
+                    current_name = deps.sanitize_display_name(
+                        current.get('name'), ''
+                    )
+                    # A PATCH may have committed after the initial read above.
+                    # Fresh transaction state wins; auto-healing must never replace
+                    # a user-supplied name or any concurrently updated profile data.
+                    if not current_name:
+                        current['name'] = candidate
+                        profiles[key] = current
+                    return current
+
+                profile = deps.update_json_transaction(
+                    deps.worker_profiles_file(), {}, _heal_name
+                )
+                healed_name = (
+                    deps.sanitize_display_name(profile.get('name'), '') or None
+                )
         if healed_name:
             profile = {**profile, 'name': healed_name}
         elif not deps.sanitize_display_name(profile.get('name'), ''):
