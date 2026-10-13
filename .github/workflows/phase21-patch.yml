@@ -1,0 +1,69 @@
+name: Phase 21 guarded patch
+on:
+  push:
+    branches:
+      - fix/checkin-idempotency-phase-21
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/checkin-idempotency-phase-21
+          fetch-depth: 0
+      - name: Apply exact guarded patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('backend/routes/checkin.py')
+          s = p.read_text()
+
+          old = 'import json\nimport os\nimport re\nimport time\n'
+          new = 'import json\nimport logging\nimport os\nimport re\nimport time\n'
+          assert s.count(old) == 1, s.count(old)
+          s = s.replace(old, new, 1)
+
+          marker = 'from fastapi.responses import FileResponse, Response\n\ntry:\n'
+          replacement = 'from fastapi.responses import FileResponse, Response\n\nlogger = logging.getLogger(__name__)\n\ntry:\n'
+          assert s.count(marker) == 1, s.count(marker)
+          s = s.replace(marker, replacement, 1)
+
+          marker = '''    def call_access(method, *args, **kwargs):\n        try:\n            return method(*args, **kwargs)\n        except CheckinAccessError as exc:\n            raise HTTPException(exc.status_code, exc.detail) from exc\n\n'''
+          helper = marker + '''    def _save_idempotency_response_after_commit(\n        key: str, response: dict, scope: dict, *, operation: str\n    ) -> None:\n        \"\"\"Persist replay metadata without undoing an already-durable shift.\n\n        checkin_meta (and finish outbox where applicable) is the primary business\n        state. A failure in the secondary idempotency response store after that\n        commit must not turn a successful Start/Finish into a false 500. Retries\n        remain safe because session ids are deterministic for an idempotency scope.\n        \"\"\"\n        try:\n            deps.idempotency_save(key, response, scope)\n        except Exception:\n            logger.exception(\n                'Check-in %s idempotency response persistence failed after durable commit: key=%s',\n                operation,\n                key,\n            )\n\n'''
+          assert s.count(marker) == 1, s.count(marker)
+          s = s.replace(marker, helper, 1)
+
+          start_call = '        deps.idempotency_save(idempotency_key, response, idempotency_scope)\n        return response\n'
+          start_new = "        _save_idempotency_response_after_commit(\n            idempotency_key, response, idempotency_scope, operation='start'\n        )\n        return response\n"
+          assert s.count(start_call) == 1, s.count(start_call)
+          s = s.replace(start_call, start_new, 1)
+
+          finish_call = '                    deps.idempotency_save(idempotency_key, session, idempotency_scope)\n                    return session\n'
+          finish_new = "                    _save_idempotency_response_after_commit(\n                        idempotency_key, session, idempotency_scope, operation='finish'\n                    )\n                    return session\n"
+          assert s.count(finish_call) == 2, s.count(finish_call)
+          s = s.replace(finish_call, finish_new)
+
+          final_call = '        deps.idempotency_save(idempotency_key, session, idempotency_scope)\n        return session\n'
+          final_new = "        _save_idempotency_response_after_commit(\n            idempotency_key, session, idempotency_scope, operation='finish'\n        )\n        return session\n"
+          assert s.count(final_call) == 1, s.count(final_call)
+          s = s.replace(final_call, final_new, 1)
+
+          # Structural safety: the raw secondary-store write now exists only inside
+          # the after-commit helper. Claim/release paths remain untouched.
+          assert s.count('deps.idempotency_save(') == 1, s.count('deps.idempotency_save(')
+          assert s.count('_save_idempotency_response_after_commit(') == 5
+          p.write_text(s)
+          PY
+          python -m py_compile backend/routes/checkin.py
+          rm .github/workflows/phase21-patch.yml
+          git diff --check
+      - name: Commit guarded result
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add backend/routes/checkin.py .github/workflows/phase21-patch.yml
+          git commit -m 'Harden post-commit check-in idempotency [phase21]'
+          git push origin HEAD:fix/checkin-idempotency-phase-21
