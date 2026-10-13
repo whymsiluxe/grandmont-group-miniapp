@@ -414,9 +414,9 @@ def create_checkin_router(deps: CheckinRouteDeps):
         deps.idempotency_save(idempotency_key, response, idempotency_scope)
         return response
 
-@router.post("/api/checkin/{session_id}/pause")
-def checkin_pause(session_id: str, action: str = Query(''), user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
-    return call_access(access_service.pause_session, session_id, action, str(user['id']), role)
+    @router.post("/api/checkin/{session_id}/pause")
+    def checkin_pause(session_id: str, action: str = Query(''), user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
+        return call_access(access_service.pause_session, session_id, action, str(user['id']), role)
 
 
     @router.post("/api/checkin/{session_id}/finish")
@@ -865,21 +865,21 @@ def checkin_pause(session_id: str, action: str = Query(''), user: dict = Depends
             headers={'Content-Disposition': f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}"}
         )
 
-@router.get("/api/checkin")
-def list_checkins(object_id: str = '', date: str = '', user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
-    return access_service.list_sessions(str(user['id']), role, object_id, date)
+    @router.get("/api/checkin")
+    def list_checkins(object_id: str = '', date: str = '', user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
+        return access_service.list_sessions(str(user['id']), role, object_id, date)
 
 
-@router.get("/api/checkin/{session_id}/finish-context")
-def checkin_finish_context(session_id: str, user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
-    session = call_access(access_service.get_accessible_session, session_id, str(user['id']), role)
-    return _build_finish_context(session)
+    @router.get("/api/checkin/{session_id}/finish-context")
+    def checkin_finish_context(session_id: str, user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
+        session = call_access(access_service.get_accessible_session, session_id, str(user['id']), role)
+        return _build_finish_context(session)
 
 
-@router.get("/api/checkin/{session_id}/photo/{which}/{index}")
-def get_checkin_photo(session_id: str, which: str, index: int, user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
-    path = call_access(access_service.photo_path, session_id, which, index, str(user['id']), role)
-    return FileResponse(path)
+    @router.get("/api/checkin/{session_id}/photo/{which}/{index}")
+    def get_checkin_photo(session_id: str, which: str, index: int, user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
+        path = call_access(access_service.photo_path, session_id, which, index, str(user['id']), role)
+        return FileResponse(path)
 
 
     handlers = SimpleNamespace(
