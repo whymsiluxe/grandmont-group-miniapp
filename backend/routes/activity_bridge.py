@@ -18,8 +18,10 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 try:
+    from ..core.media_paths import resolve_owned_media_path
     from ..core.storage import update_json_transaction
 except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
     from core.storage import update_json_transaction  # noqa: E402
 
 
@@ -278,8 +280,8 @@ def create_activity_bridge_router(
         files = entry.get('files') or ([entry['file']] if entry.get('file') else [])
         if index < 0 or index >= len(files):
             raise HTTPException(404, 'Файл не найден по этому индексу')
-        path = os.path.join(deps.photo_dir(), files[index])
-        if not os.path.exists(path):
+        path = resolve_owned_media_path(deps.photo_dir(), str(files[index] or ''))
+        if not path or not os.path.isfile(path):
             raise HTTPException(404, 'Файл отсутствует')
         return FileResponse(path)
 
