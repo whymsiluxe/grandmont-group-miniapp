@@ -73,7 +73,7 @@ import shutil
 import sys
 import time
 
-DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/promonta/agent/miniapp')
+DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/grandmont/agent/miniapp')
 CRITICAL_ALERTS_FILE = os.path.join(DATA_ROOT, 'critical_alerts.json')
 
 

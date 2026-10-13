@@ -125,6 +125,39 @@ if [[ ! -x "$TEST_PYTHON" ]]; then
   echo "ОШИБКА: $TEST_PYTHON не найден -- venv сервиса недоступен" >&2
   exit 1
 fi
+echo "== 6a/14 Проверка production venv против backend/requirements.txt =="
+"$TEST_PYTHON" - "$REPO_DIR/backend/requirements.txt" <<'PYREQ'
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+import sys
+
+requirements = Path(sys.argv[1])
+problems = []
+for raw in requirements.read_text(encoding='utf-8').splitlines():
+    line = raw.strip()
+    if not line or line.startswith('#'):
+        continue
+    if '==' not in line:
+        problems.append(f'unpinned requirement: {line}')
+        continue
+    name, expected = line.split('==', 1)
+    name = name.strip()
+    expected = expected.strip()
+    try:
+        actual = version(name)
+    except PackageNotFoundError:
+        problems.append(f'{name}: missing (expected {expected})')
+        continue
+    if actual != expected:
+        problems.append(f'{name}: installed {actual}, expected {expected}')
+
+if problems:
+    print('ОШИБКА: production venv не соответствует backend/requirements.txt:', file=sys.stderr)
+    for problem in problems:
+        print(f'  - {problem}', file=sys.stderr)
+    raise SystemExit(1)
+print('OK: production venv exactly matches backend/requirements.txt')
+PYREQ
 TEST_DATA_ROOT="$(mktemp -d)"
 BOT_TOKEN="ci-dummy-token-not-a-real-secret" MINIAPP_DATA_ROOT="$TEST_DATA_ROOT" \
   "$TEST_PYTHON" -m pytest tests/ -q
