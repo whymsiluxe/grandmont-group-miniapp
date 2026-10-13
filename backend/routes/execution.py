@@ -328,12 +328,16 @@ def create_execution_router(deps: ExecutionRouteDeps):
         return session
 
     def _save_checkin_analysis(session_id: str, key: str, value):
-        items = deps.load_checkin_meta()
-        for i in items:
-            if i.get('id') == session_id:
-                i.setdefault('analysis', {})[key] = value
-                deps.save_checkin_meta(items)
-                return
+        # Serialize the read-modify-write with Start/Finish/Manual mutations.
+        # Without the shared check-in lock, an AI result can persist a stale
+        # snapshot and erase a concurrent finish/update on the same session.
+        with deps.checkin_lock:
+            items = deps.load_checkin_meta()
+            for i in items:
+                if i.get('id') == session_id:
+                    i.setdefault('analysis', {})[key] = value
+                    deps.save_checkin_meta(items)
+                    return
         raise HTTPException(404, "Сессия не найдена")
 
     @router.post("/api/checkin/{session_id}/analyze-progress")
