@@ -1,0 +1,103 @@
+name: Independent Deep Audit
+
+on:
+  push:
+    branches:
+      - audit/independent-deep-audit-2026-10-13
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: ci-dummy-token-not-a-real-secret
+      MINIAPP_DATA_ROOT: /tmp/deep-audit-miniapp-data
+      GRANDMONT_GROUP_ENV: test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libmagic1
+
+      - name: Install production Python graph plus audit tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest==8.3.4 ruff==0.17.0 bandit pip-audit
+          pip check
+
+      - name: Full tests on production dependency graph
+        run: |
+          cd tests
+          python -m pytest . -q -rs
+
+      - name: Ruff correctness bugbear security audit
+        continue-on-error: true
+        run: |
+          echo '=== Ruff E9,F,B,S ==='
+          ruff check backend --select E9,F,B,S --output-format concise
+
+      - name: Bandit security audit
+        continue-on-error: true
+        run: |
+          echo '=== Bandit medium+ confidence/severity ==='
+          bandit -r backend -q -ll -ii
+
+      - name: Dependency vulnerability audit
+        continue-on-error: true
+        run: |
+          echo '=== pip-audit production requirements ==='
+          pip-audit -r backend/requirements.txt
+
+      - name: Legacy path and dangerous primitive inventory
+        run: |
+          echo '=== hard-coded legacy /home/promonta references ==='
+          grep -RIn '/home/promonta' backend scripts docs --exclude-dir=archive || true
+          echo '=== shell/eval/exec primitives ==='
+          grep -RInE 'shell\s*=\s*True|os\.system\(|\beval\(|\bexec\(' backend scripts || true
+          echo '=== broad exception catches ==='
+          grep -RInE 'except (Exception|BaseException)' backend --include='*.py' || true
+
+      - name: Python AST risk inventory
+        run: |
+          python - <<'PY'
+          import ast, pathlib
+          roots=[pathlib.Path('backend')]
+          blocking={'open','urlopen','subprocess.run','subprocess.Popen','time.sleep','requests.get','requests.post'}
+          broad=[]; async_block=[]; huge=[]
+          for root in roots:
+            for path in root.rglob('*.py'):
+              try:
+                src=path.read_text(encoding='utf-8'); tree=ast.parse(src)
+              except Exception as exc:
+                print('PARSE_FAIL', path, exc); continue
+              for node in ast.walk(tree):
+                if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)) and getattr(node,'end_lineno',None):
+                  size=node.end_lineno-node.lineno+1
+                  if size>=120: huge.append((size,str(path),node.name,node.lineno))
+                if isinstance(node,ast.ExceptHandler):
+                  t=node.type
+                  name=(t.id if isinstance(t,ast.Name) else '')
+                  if name in {'Exception','BaseException'}:
+                    broad.append((str(path),node.lineno,name))
+              for fn in [n for n in ast.walk(tree) if isinstance(n,ast.AsyncFunctionDef)]:
+                for n in ast.walk(fn):
+                  if isinstance(n,ast.Call):
+                    f=n.func
+                    if isinstance(f,ast.Name): call=f.id
+                    elif isinstance(f,ast.Attribute) and isinstance(f.value,ast.Name): call=f'{f.value.id}.{f.attr}'
+                    else: continue
+                    if call in blocking:
+                      async_block.append((str(path),fn.name,n.lineno,call))
+          print('=== HUGE FUNCTIONS >=120 lines ===')
+          for row in sorted(huge,reverse=True)[:80]: print(*row)
+          print('=== BROAD EXCEPTIONS ===',len(broad))
+          for row in broad[:200]: print(*row)
+          print('=== POSSIBLE BLOCKING CALLS INSIDE async def ===',len(async_block))
+          for row in async_block[:200]: print(*row)
+          PY
