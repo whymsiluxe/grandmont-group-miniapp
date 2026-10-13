@@ -7,6 +7,7 @@ import main as backend
 from conftest import iter_app_routes
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 TARGETS = {
     ("GET", "/api/health"): "routes.system",
     ("GET", "/api/health/ready"): "routes.system",
@@ -67,7 +68,7 @@ def test_main_has_no_direct_phase8_route_decorators():
 
 def test_extracted_modules_do_not_import_main():
     for rel in ("backend/routes/system.py", "backend/routes/session_identity.py"):
-        tree = ast.parse(Path(rel).read_text())
+        tree = ast.parse((REPO_ROOT / rel).read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 assert all(alias.name not in {"main", "backend.main"} for alias in node.names)
