@@ -102,10 +102,18 @@ def create_chat_router(deps: ChatRouteDeps) -> tuple[APIRouter, ChatHandlers]:
         )
     )
     chat_lock = storage.lock
-    archive_chat_messages = storage.archive_messages
-    load_chat = storage.load_chat
-    save_chat = storage.save_chat
-    purge_old_chat = storage.purge_old_chat
+
+    def archive_chat_messages(messages: list):
+        return storage.archive_messages(messages)
+
+    def load_chat() -> list:
+        return storage.load_chat()
+
+    def save_chat(messages: list):
+        return storage.save_chat(messages)
+
+    def purge_old_chat(messages: list) -> list:
+        return storage.purge_old_chat(messages)
 
     def load_reads() -> dict:
         return deps.safe_load_json(deps.chat_reads_file(), {})
