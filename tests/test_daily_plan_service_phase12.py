@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import ast
+import os
+import sys
 from pathlib import Path
-from types import SimpleNamespace
 
-from backend.services.daily_plan import DailyPlanService, DailyPlanServiceDeps
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+
+from services.daily_plan import DailyPlanService, DailyPlanServiceDeps  # noqa: E402
 
 
 class FakeDpl:
@@ -108,7 +111,7 @@ def test_blocker_stays_successful_when_secondary_alert_side_effect_fails():
 
 
 def test_daily_plan_service_has_no_framework_or_route_back_edge():
-    path = Path("backend/services/daily_plan.py")
+    path = Path(__file__).resolve().parents[1] / "backend" / "services" / "daily_plan.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     forbidden_roots = {"fastapi", "pydantic"}
 
