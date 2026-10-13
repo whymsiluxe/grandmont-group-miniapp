@@ -1,0 +1,39 @@
+name: Production Dependency Guard
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  production-deps:
+    runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: ci-dummy-token-not-a-real-secret
+      MINIAPP_DATA_ROOT: /tmp/ci-production-miniapp-data
+      GRANDMONT_GROUP_ENV: test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install libmagic
+        run: sudo apt-get update && sudo apt-get install -y libmagic1
+
+      - name: Install exact production graph
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest==8.3.4 pip-audit==2.10.1
+          pip check
+
+      - name: Audit production dependencies
+        run: pip-audit -r backend/requirements.txt
+
+      - name: Run full tests on production graph
+        run: |
+          cd tests
+          python -m pytest . -q -rs
