@@ -1091,81 +1091,44 @@ def _save_object_images(images: dict):
 # moved to core/limits.py -- OBJECT_PHOTO_MAX
 
 
-@app.post("/api/objects/{object_id}/image")
-async def upload_object_image(object_id: str, file: UploadFile = File(...),
-                               user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    # 28.07 v2: расширено до массива фото (carousel в карточке объекта, PHASE F спека) --
-    # раньше был единственный fname (перезаписывался при повторной загрузке). Только owner.
-    raw = await file.read()
-    if len(raw) > 8 * 1024 * 1024:
-        raise HTTPException(400, "Фото слишком большое (макс. 8 МБ)")
-    detected = sniff_image(raw)
-    if not detected:
-        raise HTTPException(400, "Файл должен быть изображением")
-    ext = _ALLOWED_IMAGE_MIME_EXT[detected]
-    os.makedirs(OBJECT_PHOTO_DIR, exist_ok=True)
-    fname = f"{uuid.uuid4().hex}.{ext}"
-    fpath = os.path.join(OBJECT_PHOTO_DIR, fname)
-    with open(fpath, 'wb') as f_out:
-        f_out.write(raw)
+# ---------- Object media domain ----------
+try:
+    from .routes.object_media import ObjectMediaDeps, create_object_media_router
+except ImportError:
+    from routes.object_media import ObjectMediaDeps, create_object_media_router  # noqa: E402
 
-    # 28.07 v3 (real bug found by external audit): было _load_object_images() +
-    # _save_object_images() как два отдельных вызова -- read происходил СНАРУЖИ лока,
-    # два параллельных upload на один object_id могли оба прочитать одинаковый
-    # existing-список и один затирал фото, добавленное другим. update_json_transaction
-    # держит read+mutate+write под одним захватом _lock_for(path).
-    def _mutator(images):
-        existing = images.get(object_id) or []
-        if len(existing) >= OBJECT_PHOTO_MAX:
-            raise HTTPException(400, f"Максимум {OBJECT_PHOTO_MAX} фото на объект")
-        images[object_id] = existing + [fname]
-        return images[object_id]
+_object_media_router, _object_media_handlers = create_object_media_router(
+    ObjectMediaDeps(
+        get_current_user=get_current_user,
+        require_owner=require_owner,
+        require_object_access=require_object_access,
+        load_object_images=lambda: _load_object_images(),
+        update_json_transaction=lambda path, default, mutator: update_json_transaction(path, default, mutator),
+        object_images_file=lambda: OBJECT_IMAGES_FILE,
+        object_photo_dir=lambda: OBJECT_PHOTO_DIR,
+        blocker_photo_dir=lambda: BLOCKER_PHOTO_DIR,
+        sniff_image=lambda raw: sniff_image(raw),
+        allowed_image_mime_ext=_ALLOWED_IMAGE_MIME_EXT,
+        object_photo_max=OBJECT_PHOTO_MAX,
+        object_photo_max_bytes=8 * 1024 * 1024,
+        blocker_photo_max_bytes=PHOTO_MAX_BYTES,
+    )
+)
+app.include_router(_object_media_router)
 
-    try:
-        photos = update_json_transaction(OBJECT_IMAGES_FILE, {}, _mutator)
-    except HTTPException:
-        # 28.07: metadata-транзакция не прошла (лимит фото достигнут) -- не оставляем
-        # orphan-файл на диске без записи в metadata (ТЗ п.24: "не оставлять файл на
-        # диске при неуспешной транзакции").
-        if os.path.exists(fpath):
-            os.remove(fpath)
-        raise
-    return {"status": "ok", "photos": photos}
+upload_object_image = _object_media_handlers.upload_object_image
+delete_object_image = _object_media_handlers.delete_object_image
+get_object_image_file = _object_media_handlers.get_object_image_file
+upload_blocker_photo = _object_media_handlers.upload_blocker_photo
+get_blocker_photo = _object_media_handlers.get_blocker_photo
 
 
-@app.delete("/api/objects/{object_id}/image/{fname}")
-def delete_object_image(object_id: str, fname: str, user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    safe_name = os.path.basename(fname)
-
-    def _mutator(images):
-        existing = images.get(object_id) or []
-        if safe_name not in existing:
-            raise HTTPException(404, "Фото не найдено")
-        images[object_id] = [f for f in existing if f != safe_name]
-        return images[object_id]
-
-    photos = update_json_transaction(OBJECT_IMAGES_FILE, {}, _mutator)
-    path = os.path.join(OBJECT_PHOTO_DIR, safe_name)
-    if os.path.exists(path):
-        os.remove(path)
-    return {"status": "ok", "photos": photos}
 
 
-@app.get("/api/objects/{object_id}/image/file")
-def get_object_image_file(object_id: str, index: int = 0, user: dict = Depends(get_current_user)):
-    # 30.07 (Release-аудит P1-5): нет require_object_access -- согласовано с
-    # GET /api/objects (весь список объектов виден любому авторизованному, см.
-    # тот же паттерн у /stages, /roadmap notes GET). Upload/delete фото остаются
-    # owner-only. Не меняем это в рамках feature freeze -- задокументировано как
-    # by-design consistency с остальным просмотром объектов, не отдельная дыра.
-    images = _load_object_images()
-    photos = images.get(object_id) or []
-    if not photos or index < 0 or index >= len(photos):
-        raise HTTPException(404, "Фото не загружено")
-    path = os.path.join(OBJECT_PHOTO_DIR, photos[index])
-    if not os.path.exists(path):
-        raise HTTPException(404, "Файл отсутствует")
-    return FileResponse(path)
+
+
+
+
 
 
 _sheets_cache: dict = {}
@@ -2293,39 +2256,10 @@ list_stage_requests = _stages_handlers.list_stage_requests
 decide_stage_request_endpoint = _stages_handlers.decide_stage_request_endpoint
 
 
-# moved to core/paths.py -- BLOCKER_PHOTO_DIR
-os.makedirs(BLOCKER_PHOTO_DIR, exist_ok=True)
+# Blocker-photo directory setup is owned by routes/object_media.py.
 
 
-@app.post("/api/objects/{object_id}/blocker-photo")
-async def upload_blocker_photo(object_id: str, file: UploadFile = File(...),
-                                user: dict = Depends(get_current_user), _: None = Depends(require_object_access)):
-    # 29.07 (аудит): blocker sheet заявлял поле фото, но реального upload не было --
-    # тот же паттерн, что и остальные фото-эндпоинты (sniff_image, размер-лимит).
-    # photo_url -- относительный путь к get_blocker_photo ниже, не прямая файловая ссылка
-    # (доступ к самому файлу тоже идёт через require_object_access, не голый static serve).
-    raw = await file.read()
-    if len(raw) > PHOTO_MAX_BYTES:
-        raise HTTPException(400, "Фото слишком большое (макс. 8 МБ)")
-    detected = sniff_image(raw)
-    if not detected:
-        raise HTTPException(400, "Файл должен быть изображением")
-    ext = _ALLOWED_IMAGE_MIME_EXT[detected]
-    fname = f"{uuid.uuid4().hex}.{ext}"
-    with open(os.path.join(BLOCKER_PHOTO_DIR, fname), 'wb') as out:
-        out.write(raw)
-    return {"photo_url": f"/api/objects/{object_id}/blocker-photo/{fname}"}
 
-
-@app.get("/api/objects/{object_id}/blocker-photo/{fname}")
-def get_blocker_photo(object_id: str, fname: str, user: dict = Depends(get_current_user), _: None = Depends(require_object_access)):
-    if '/' in fname or '..' in fname:
-        raise HTTPException(400, "Некорректное имя файла")
-    path = os.path.join(BLOCKER_PHOTO_DIR, fname)
-    if not os.path.exists(path):
-        raise HTTPException(404, "Файл отсутствует")
-    from fastapi.responses import FileResponse
-    return FileResponse(path)
 
 
 # ---------- Потребности / Needs domain ----------
