@@ -34,6 +34,37 @@ jobs:
       - name: Apply guarded transform
         run: python scripts/refactor_phase7_object_media.py
 
+      - name: Update obsolete blocker-photo ownership regression guard
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('tests/test_stages_routes_extraction.py')
+          text = path.read_text()
+          old = '''def test_blocker_photo_routes_stay_in_main_until_media_split():
+              rows = list(_route_rows())
+              keys = [(method, path) for method, path, _ in rows]
+
+              for key in BLOCKER_PHOTO_ROUTE_KEYS:
+                  assert keys.count(key) == 1, key
+                  route = next(route for method, path, route in rows if (method, path) == key)
+                  assert route.endpoint.__module__ == 'main'
+          '''
+          new = '''def test_blocker_photo_routes_are_owned_by_object_media_module():
+              rows = list(_route_rows())
+              keys = [(method, path) for method, path, _ in rows]
+
+              for key in BLOCKER_PHOTO_ROUTE_KEYS:
+                  assert keys.count(key) == 1, key
+                  route = next(route for method, path, route in rows if (method, path) == key)
+                  assert route.endpoint.__module__.endswith('routes.object_media')
+          '''
+          old = old.replace('          ', '')
+          new = new.replace('          ', '')
+          if text.count(old) != 1:
+              raise SystemExit(f'obsolete blocker-photo guard mismatch: {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+          PY
+
       - name: Remove one-shot transform artifacts
         run: |
           rm scripts/refactor_phase7_object_media.py
@@ -41,13 +72,13 @@ jobs:
 
       - name: Validate syntax and Ruff
         run: |
-          python -m py_compile backend/main.py backend/routes/object_media.py tests/test_phase7_object_media_contract.py
+          python -m py_compile backend/main.py backend/routes/object_media.py tests/test_phase7_object_media_contract.py tests/test_stages_routes_extraction.py
           ruff check backend/core backend/routes --select F --output-format concise
 
       - name: Run Phase 7 contract tests
         run: |
           cd tests
-          python -m pytest test_phase7_object_media_contract.py -q
+          python -m pytest test_phase7_object_media_contract.py test_stages_routes_extraction.py -q
 
       - name: Run full Python suite
         run: |
@@ -58,7 +89,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add backend/main.py backend/routes/object_media.py tests/test_phase7_object_media_contract.py
+          git add backend/main.py backend/routes/object_media.py tests/test_phase7_object_media_contract.py tests/test_stages_routes_extraction.py
           git add -u scripts/refactor_phase7_object_media.py .github/workflows/phase7-object-media-transform.yml
           git commit -m "Extract object media routes from main.py [phase7-final]"
           git push origin HEAD:refactor/main-monolith-phase-7-object-media
