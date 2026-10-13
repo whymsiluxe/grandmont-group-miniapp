@@ -1,0 +1,70 @@
+name: Phase 14 execution hardening
+
+on:
+  push:
+    branches:
+      - fix/manual-time-race-phase-14
+    paths:
+      - .github/workflows/phase14-execution-hardening.yml
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/manual-time-race-phase-14
+      - name: Harden manual-time and AI media reads
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('backend/routes/execution.py')
+          text = path.read_text()
+
+          marker = "from pydantic import BaseModel\n\n\nMANUAL_TIME_ART_WHITELIST"
+          replacement = """from pydantic import BaseModel\n\ntry:\n    from ..core.media_paths import resolve_owned_media_path\nexcept ImportError:\n    from core.media_paths import resolve_owned_media_path  # noqa: E402\n\n\nMANUAL_TIME_ART_WHITELIST"""
+          assert marker in text
+          text = text.replace(marker, replacement, 1)
+
+          old = """    def _assert_no_manual_time_overlap(target_user_id: str, date_str: str, start_minutes: int, end_minutes: int,\n                                        exclude_id: str | None = None) -> None:\n"""
+          new = """    def _assert_no_manual_time_overlap(target_user_id: str, date_str: str, start_minutes: int, end_minutes: int,\n                                        exclude_id: str | None = None, items: list | None = None) -> None:\n"""
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          old = """        for item in deps.load_checkin_meta():\n"""
+          new = """        for item in items if items is not None else deps.load_checkin_meta():\n"""
+          idx = text.index("    def _assert_no_manual_time_overlap")
+          pos = text.index(old, idx)
+          text = text[:pos] + text[pos:].replace(old, new, 1)
+
+          old = """        # F02/F03: overlap is checked here (not inside _validate_manual_time_body) and\n        # excludes entity_id -- a crash-recovered retry with the SAME Idempotency-Key\n        # must not be rejected as \"overlapping\" against the very entry it's replaying.\n        _assert_no_manual_time_overlap(\n            target_user_id, clean['date'],\n            _parse_manual_hhmm(clean['start_time'], 'start_time'), _parse_manual_hhmm(clean['end_time'], 'end_time'),\n            exclude_id=entity_id,\n        )\n        entry = {\n"""
+          new = """        entry = {\n"""
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          old = """            with deps.checkin_lock:\n                items = deps.load_checkin_meta()\n                existing_entry = next((i for i in items if i.get('id') == entity_id), None)\n"""
+          new = """            with deps.checkin_lock:\n                items = deps.load_checkin_meta()\n                # F02/F03: overlap validation and the append must share the same\n                # critical section. Otherwise two concurrent requests can both\n                # validate the same stale snapshot and persist overlapping time.\n                # exclude_id keeps crash-recovered retries for the same key valid.\n                _assert_no_manual_time_overlap(\n                    target_user_id, clean['date'],\n                    _parse_manual_hhmm(clean['start_time'], 'start_time'),\n                    _parse_manual_hhmm(clean['end_time'], 'end_time'),\n                    exclude_id=entity_id,\n                    items=items,\n                )\n                existing_entry = next((i for i in items if i.get('id') == entity_id), None)\n"""
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          old = """        for p in image_paths:\n            block = _image_block_from_file(os.path.join(deps.checkin_photo_base(), p))\n            if block:\n                content.append(block)\n"""
+          new = """        for p in image_paths:\n            safe_path = resolve_owned_media_path(deps.checkin_photo_base(), p)\n            if not safe_path:\n                continue\n            block = _image_block_from_file(safe_path)\n            if block:\n                content.append(block)\n"""
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          path.write_text(text)
+          PY
+          python -m py_compile backend/routes/execution.py backend/core/media_paths.py
+      - name: Remove one-shot workflow
+        run: rm .github/workflows/phase14-execution-hardening.yml
+      - name: Commit hardening
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add backend/routes/execution.py .github/workflows/phase14-execution-hardening.yml
+          git commit -m 'Harden manual time and AI media reads [phase14]'
+          git push origin HEAD:fix/manual-time-race-phase-14
