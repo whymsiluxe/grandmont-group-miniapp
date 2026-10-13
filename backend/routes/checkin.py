@@ -21,6 +21,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 import re
 import time
@@ -32,6 +33,8 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
+
+logger = logging.getLogger(__name__)
 
 try:
     from .. import daily_plan_lib as dpl
@@ -104,6 +107,25 @@ def create_checkin_router(deps: CheckinRouteDeps):
             return method(*args, **kwargs)
         except CheckinAccessError as exc:
             raise HTTPException(exc.status_code, exc.detail) from exc
+
+    def _save_idempotency_response_after_commit(
+        key: str, response: dict, scope: dict, *, operation: str
+    ) -> None:
+        """Persist replay metadata without undoing an already-durable shift.
+
+        checkin_meta (and finish outbox where applicable) is the primary business
+        state. A failure in the secondary idempotency response store after that
+        commit must not turn a successful Start/Finish into a false 500. Retries
+        remain safe because session ids are deterministic for an idempotency scope.
+        """
+        try:
+            deps.idempotency_save(key, response, scope)
+        except Exception:
+            logger.exception(
+                'Check-in %s idempotency response persistence failed after durable commit: key=%s',
+                operation,
+                key,
+            )
 
     CHECKIN_EVENT_MAX_AGE_SECONDS = 7 * 24 * 3600
     CHECKIN_EVENT_FUTURE_SKEW_SECONDS = 5 * 60
@@ -421,7 +443,9 @@ def create_checkin_router(deps: CheckinRouteDeps):
             print(f'WARNING: checkin-start finish-context prefetch failed: {e}')
             response['finish_context'] = None
 
-        deps.idempotency_save(idempotency_key, response, idempotency_scope)
+        _save_idempotency_response_after_commit(
+            idempotency_key, response, idempotency_scope, operation='start'
+        )
         return response
 
     @router.post("/api/checkin/{session_id}/pause")
@@ -531,7 +555,9 @@ def create_checkin_router(deps: CheckinRouteDeps):
                 # original result -- self-heal the durable store instead of erasing
                 # the caller's ability to see what actually happened.
                 if idempotency_key:
-                    deps.idempotency_save(idempotency_key, session, idempotency_scope)
+                    _save_idempotency_response_after_commit(
+                        idempotency_key, session, idempotency_scope, operation='finish'
+                    )
                     return session
                 deps.idempotency_release(idempotency_key, idempotency_scope)
                 raise HTTPException(400, "Смена уже завершена")
@@ -570,7 +596,9 @@ def create_checkin_router(deps: CheckinRouteDeps):
                 # attempt that lost this race already got its own finish committed by
                 # the other one; replay that result instead of erasing it.
                 if idempotency_key:
-                    deps.idempotency_save(idempotency_key, session, idempotency_scope)
+                    _save_idempotency_response_after_commit(
+                        idempotency_key, session, idempotency_scope, operation='finish'
+                    )
                     return session
                 deps.idempotency_release(idempotency_key, idempotency_scope)
                 raise HTTPException(400, "Смена уже завершена")
@@ -809,7 +837,9 @@ def create_checkin_router(deps: CheckinRouteDeps):
                             f"📋 На завтра нужно ({object_id}): {next_day_needs.strip()[:300]}")
                     except Exception:
                         pass
-        deps.idempotency_save(idempotency_key, session, idempotency_scope)
+        _save_idempotency_response_after_commit(
+            idempotency_key, session, idempotency_scope, operation='finish'
+        )
         return session
 
     @router.get("/api/checkin/stundenzettel")
