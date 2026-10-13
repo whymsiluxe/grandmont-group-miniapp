@@ -1,6 +1,7 @@
 """Persisted critical-alert workflow: create, acknowledge, resolve and photos."""
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
@@ -10,6 +11,14 @@ from typing import Any, Callable, Mapping
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
+try:
+    from ..core.media_paths import resolve_owned_media_path
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+
+
+logger = logging.getLogger(__name__)
 
 
 class CriticalAlertAckBody(BaseModel):
@@ -166,11 +175,22 @@ def create_critical_alerts_router(
             deps.chat_thread_id(target_user_id, owner_ids[0] if owner_ids else None)
             if owner_ids else 'group'
         )
-        ensure_critical_alert_chat(alert, thread_id, owner_ids)
+        try:
+            ensure_critical_alert_chat(alert, thread_id, owner_ids)
+        except Exception:
+            # Alert persistence is the primary durable operation. Chat delivery
+            # is secondary and must not turn a committed alert into a false 500.
+            logger.exception(
+                'Critical alert chat delivery failed after durable create',
+                extra={'alert_id': alert['id']},
+            )
         try:
             deps.send_telegram_message(int(target_user_id), f'🔴 {title}')
         except Exception:
-            pass
+            logger.exception(
+                'Critical alert Telegram delivery failed',
+                extra={'alert_id': alert['id']},
+            )
         return alert
 
     @router.post('/api/critical-alerts/{alert_id}/ack')
@@ -207,10 +227,16 @@ def create_critical_alerts_router(
                 'to_user_id': None if thread_id == 'group' else thread_id,
                 'critical_alert_id': alert['id'],
             }
-            with deps.chat_lock:
-                messages = deps.load_chat()
-                messages.append(msg)
-                deps.save_chat(messages)
+            try:
+                with deps.chat_lock:
+                    messages = deps.load_chat()
+                    messages.append(msg)
+                    deps.save_chat(messages)
+            except Exception:
+                logger.exception(
+                    'Critical alert acknowledgement chat delivery failed',
+                    extra={'alert_id': alert['id']},
+                )
         return alert
 
     @router.post('/api/critical-alerts/{alert_id}/resolve')
@@ -231,12 +257,9 @@ def create_critical_alerts_router(
         if existing['target_user_id'] != str(user['id']):
             raise HTTPException(403, 'Не ваш алерт')
 
-        saved_photos = []
+        validated_photos = []
         if resolution == 'yes' and files:
-            alert_dir = os.path.join(
-                deps.critical_alert_photo_dir(), os.path.basename(alert_id)
-            )
-            os.makedirs(alert_dir, exist_ok=True)
+            # Validate the full batch before creating a single binary.
             for upload in files:
                 data = upload.file.read()
                 if len(data) > 8 * 1024 * 1024:
@@ -244,11 +267,42 @@ def create_critical_alerts_router(
                 detected = deps.sniff_image(data)
                 if not detected:
                     raise HTTPException(400, 'Файл должен быть изображением')
-                ext = '.' + deps.allowed_image_mime_ext[detected]
-                filename = f'{uuid.uuid4().hex}{ext}'
-                with open(os.path.join(alert_dir, filename), 'wb') as output:
-                    output.write(data)
-                saved_photos.append(filename)
+                validated_photos.append((data, '.' + deps.allowed_image_mime_ext[detected]))
+
+        saved_photos = []
+        alert_dir = os.path.join(
+            deps.critical_alert_photo_dir(), os.path.basename(alert_id)
+        )
+
+        def cleanup_saved_photos():
+            for filename in saved_photos:
+                path = resolve_owned_media_path(
+                    deps.critical_alert_photo_dir(),
+                    os.path.join(os.path.basename(alert_id), filename),
+                )
+                if not path:
+                    continue
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.exception(
+                        'Failed to clean orphan critical-alert photo',
+                        extra={'alert_id': alert_id, 'filename': filename},
+                    )
+
+        if validated_photos:
+            os.makedirs(alert_dir, exist_ok=True)
+            try:
+                for data, ext in validated_photos:
+                    filename = f'{uuid.uuid4().hex}{ext}'
+                    with open(os.path.join(alert_dir, filename), 'wb') as output:
+                        output.write(data)
+                    saved_photos.append(filename)
+            except Exception:
+                cleanup_saved_photos()
+                raise
 
         def _mutate(items):
             alert = next((item for item in items if item['id'] == alert_id), None)
@@ -261,7 +315,12 @@ def create_critical_alerts_router(
             alert['resolution_photos'] = saved_photos
             return alert
 
-        alert = deps.update_json_transaction(deps.critical_alerts_file(), [], _mutate)
+        try:
+            alert = deps.update_json_transaction(deps.critical_alerts_file(), [], _mutate)
+        except Exception:
+            cleanup_saved_photos()
+            raise
+
         roles = deps.load_roles()
         owner_ids = [uid for uid, role in roles.items() if role == 'owner']
         thread_id = (
@@ -282,10 +341,18 @@ def create_critical_alerts_router(
             'to_user_id': None if thread_id == 'group' else thread_id,
             'critical_alert_id': alert['id'],
         }
-        with deps.chat_lock:
-            messages = deps.load_chat()
-            messages.append(msg)
-            deps.save_chat(messages)
+        try:
+            with deps.chat_lock:
+                messages = deps.load_chat()
+                messages.append(msg)
+                deps.save_chat(messages)
+        except Exception:
+            # Resolution and its photo metadata are already durable. Chat is a
+            # secondary notification channel and cannot invalidate that state.
+            logger.exception(
+                'Critical alert resolution chat delivery failed',
+                extra={'alert_id': alert['id']},
+            )
         return alert
 
     @router.get('/api/critical-alerts/{alert_id}/photo/{filename}')
@@ -299,17 +366,21 @@ def create_critical_alerts_router(
         safe_filename = os.path.basename(filename)
         if safe_alert_id != alert_id or safe_filename != filename:
             raise HTTPException(404, 'Фото не найдено')
-        path = os.path.join(
-            deps.critical_alert_photo_dir(), safe_alert_id, safe_filename
+        alert = next(
+            (item for item in load_critical_alerts() if item['id'] == alert_id), None
         )
-        if not os.path.exists(path):
+        if not alert:
             raise HTTPException(404, 'Фото не найдено')
-        if role != 'owner':
-            alert = next(
-                (item for item in load_critical_alerts() if item['id'] == alert_id), None
-            )
-            if not alert or alert['target_user_id'] != str(user['id']):
-                raise HTTPException(403, 'Нет доступа к этому фото')
+        if role != 'owner' and alert['target_user_id'] != str(user['id']):
+            raise HTTPException(403, 'Нет доступа к этому фото')
+        if safe_filename not in alert.get('resolution_photos', []):
+            raise HTTPException(404, 'Фото не найдено')
+        path = resolve_owned_media_path(
+            deps.critical_alert_photo_dir(),
+            os.path.join(safe_alert_id, safe_filename),
+        )
+        if not path or not os.path.exists(path):
+            raise HTTPException(404, 'Фото не найдено')
         return FileResponse(path)
 
     @router.get('/api/critical-alerts/pending')
