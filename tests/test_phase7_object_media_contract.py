@@ -217,9 +217,13 @@ def test_blocker_photo_upload_get_and_filename_guard():
             "OBJ-9", UploadFile(filename="x.bin", file=io.BytesIO(b"photo")), user={"id": 10}, _=None
         ))
         fname = result["photo_url"].rsplit("/", 1)[-1]
-        assert os.path.isfile(os.path.join(blocker_dir, fname))
+        # Phase 28 keeps the public URL stable but no longer treats a global
+        # blocker-photos/<fname> file as authoritative for every object.
+        assert not os.path.isfile(os.path.join(blocker_dir, fname))
         response = handlers.get_blocker_photo("OBJ-9", fname, user={"id": 10}, _=None)
         assert os.path.basename(response.path) == fname
+        assert os.path.commonpath((blocker_dir, response.path)) == blocker_dir
+        assert os.path.dirname(response.path) != blocker_dir
         with pytest.raises(HTTPException) as exc:
             handlers.get_blocker_photo("OBJ-9", "../secret.png", user={"id": 10}, _=None)
         assert exc.value.status_code == 400
