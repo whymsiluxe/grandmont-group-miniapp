@@ -797,86 +797,76 @@ except ImportError:
     from routes.auth import list_roles, set_role, revoke_role  # noqa: E402
 
 
-# 30.07 (Release-аудит Этап 6): commit SHA для /api/health читается из файла рядом
-# с main.py, который пишет deploy-скрипт при выкладке -- НЕ subprocess'ом git на
-# каждый health-запрос (дорого, плюс serving-путь /home/promonta/agent/miniapp/
-# не является git-репозиторием, git там просто не сработает). Файл опционален --
-# если деплой был сделан вручную без записи VERSION, health всё равно отвечает,
-# просто без SHA.
-# moved to core/paths.py -- APP_VERSION_FILE
+# System status and identity/session routes live outside the composition root.
+# main.py only wires runtime collaborators and preserves legacy direct-call aliases.
+try:
+    from .routes.system import SystemDeps, create_system_router
+    from .routes.session_identity import SessionIdentityDeps, create_session_identity_router
+except ImportError:
+    from routes.system import SystemDeps, create_system_router  # noqa: E402
+    from routes.session_identity import SessionIdentityDeps, create_session_identity_router  # noqa: E402
 
 
 def _read_app_version() -> dict:
     return system_status.read_app_version(APP_VERSION_FILE)
 
 
-@app.get("/api/health")
-def health():
-    """Лёгкая liveness-проверка -- процесс жив, отвечает. Не трогает диск/сеть
-    (кроме чтения маленького локального VERSION-файла) -- безопасно дёргать часто
-    из мониторинга. Никаких токенов/секретов/путей к credentials/персональных
-    данных в ответе (30.07, Release-аудит Этап 6)."""
-    return system_status.health_response(APP_VERSION_FILE)
-
-
-@app.get("/api/health/ready")
-def health_ready(user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    """Readiness-проверка для Owner/внутреннего мониторинга -- owner-only (в отличие
-    от /api/health): проверяет реальную готовность обслуживать запросы, не только
-    "процесс жив". Каждая проверка дешёвая (stat/os.access), НЕ дорогой сетевой
-    запрос к Google Sheets на каждый вызов -- иначе readiness сам стал бы точкой
-    перегрузки при частом опросе мониторингом."""
-    return system_status.readiness_response(
-        object_photo_dir=OBJECT_PHOTO_DIR,
-        chat_attach_dir=CHAT_ATTACH_DIR,
-        tools_lib_path=TOOLS_LIB_PATH,
-        mangel_lib_path=MANGEL_LIB_PATH,
-        backend_dir=BACKEND_DIR,
-        roles_file=ROLES_FILE,
-    )
-
-
-@app.get("/api/diagnostics")
-def diagnostics(_: None = Depends(require_owner)):
-    """Owner-only system status snapshot — all checks are cheap (file I/O + in-memory cache
-    inspection only, no live Sheets or Drive API calls). Designed so a "данные не грузятся"
-    report can be diagnosed in under a minute without touching prod data."""
-    return system_status.diagnostics_response(
-        data_root=DATA_ROOT,
-        roles_file=ROLES_FILE,
-        sheets_cache=_sheets_cache,
-        sheets_cache_ttl=SHEETS_CACHE_TTL,
-        activity_alerts_file=ACTIVITY_ALERTS_FILE,
-        news_feed_file=NEWS_FEED_FILE,
-        chat_file=CHAT_FILE,
-        plan_sync_state_file=PLAN_SYNC_STATE_FILE,
-        contract_ingest_state_file=CONTRACT_INGEST_STATE_FILE,
-        contracts_drive_folder_id=CONTRACTS_DRIVE_FOLDER_ID,
-        app_version_file=APP_VERSION_FILE,
-        safe_load_json=_safe_load_json,
-        outbox_dead_letter_count=_outbox_dead_letter_count,
-    )
-
-
-@app.get("/api/me")
-def me(user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    return {"user_id": user['id'], "name": user.get('first_name'), "role": role}
-
-
-@app.post("/api/session")
-def create_session(x_telegram_init_data: str = Header(...)) -> dict:
-    """03.08 (ТЗ Задача 1): выдаёт 12-часовой session token. Требует ЖИВОЙ initData
-    (обычная HMAC + 1-час TTL проверка через get_current_user-путь ниже, не отдельный
-    ослабленный код) -- токен можно получить только пройдя ту же проверку, что раньше
-    требовалась на каждый запрос. Whitelist-проверка тоже здесь: не-whitelisted юзер
-    не получает токен вообще, не только 403 на защищённых эндпоинтах."""
-    user = get_current_user(authorization=None, x_telegram_init_data=x_telegram_init_data)
-    token = create_session_token(user['id'])
+def _system_readiness_kwargs() -> dict:
     return {
-        "token": token,
-        "expires_in": SESSION_TOKEN_MAX_AGE,
-        "user_id": user['id'],
+        "object_photo_dir": OBJECT_PHOTO_DIR,
+        "chat_attach_dir": CHAT_ATTACH_DIR,
+        "tools_lib_path": TOOLS_LIB_PATH,
+        "mangel_lib_path": MANGEL_LIB_PATH,
+        "backend_dir": BACKEND_DIR,
+        "roles_file": ROLES_FILE,
     }
+
+
+def _system_diagnostics_kwargs() -> dict:
+    return {
+        "data_root": DATA_ROOT,
+        "roles_file": ROLES_FILE,
+        "sheets_cache": _sheets_cache,
+        "sheets_cache_ttl": SHEETS_CACHE_TTL,
+        "activity_alerts_file": ACTIVITY_ALERTS_FILE,
+        "news_feed_file": NEWS_FEED_FILE,
+        "chat_file": CHAT_FILE,
+        "plan_sync_state_file": PLAN_SYNC_STATE_FILE,
+        "contract_ingest_state_file": CONTRACT_INGEST_STATE_FILE,
+        "contracts_drive_folder_id": CONTRACTS_DRIVE_FOLDER_ID,
+        "app_version_file": APP_VERSION_FILE,
+        "safe_load_json": _safe_load_json,
+        "outbox_dead_letter_count": _outbox_dead_letter_count,
+    }
+
+
+_system_router, _system_handlers = create_system_router(SystemDeps(
+    get_current_user=get_current_user,
+    require_owner=require_owner,
+    health_response=system_status.health_response,
+    readiness_response=system_status.readiness_response,
+    diagnostics_response=system_status.diagnostics_response,
+    get_app_version_file=lambda: APP_VERSION_FILE,
+    get_readiness_kwargs=_system_readiness_kwargs,
+    get_diagnostics_kwargs=_system_diagnostics_kwargs,
+))
+app.include_router(_system_router)
+health = _system_handlers.health
+health_ready = _system_handlers.health_ready
+diagnostics = _system_handlers.diagnostics
+
+
+_session_identity_router, _session_identity_handlers = create_session_identity_router(
+    SessionIdentityDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        create_session_token=create_session_token,
+        session_token_max_age=SESSION_TOKEN_MAX_AGE,
+    )
+)
+app.include_router(_session_identity_router)
+me = _session_identity_handlers.me
+create_session = _session_identity_handlers.create_session
 
 
 # ---------- Workforce profiles domain ----------
