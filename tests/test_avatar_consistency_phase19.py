@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 from fastapi import UploadFile
+from starlette.datastructures import Headers
 
 import main as backend
 
@@ -24,9 +25,11 @@ GIF_1X1 = base64.b64decode(
 
 
 def _upload(name: str, raw: bytes, content_type: str) -> UploadFile:
-    upload = UploadFile(filename=name, file=io.BytesIO(raw))
-    upload.headers.__dict__['_list'] = [(b'content-type', content_type.encode())]
-    return upload
+    return UploadFile(
+        filename=name,
+        file=io.BytesIO(raw),
+        headers=Headers({'content-type': content_type}),
+    )
 
 
 def test_avatar_profile_commit_failure_restores_previous_binary_exactly():
