@@ -19,6 +19,11 @@ from pydantic import BaseModel
 
 from .chat import ChatHandlers
 
+try:
+    from ..core.media_paths import resolve_owned_media_path
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+
 
 class ChatMessageBody(BaseModel):
     text: str = ''
@@ -146,14 +151,17 @@ def create_chat_actions_router(
         safe_fname = os.path.basename(fname)
         if safe_fname != fname:
             raise HTTPException(404, "Файл не найден")
-        path = os.path.join(deps.chat_attach_dir(), safe_fname)
-        if not os.path.exists(path):
+
+        messages = core.load_chat() + deps.safe_load_json(deps.chat_archive_file(), [])
+        candidates = [
+            msg for msg in messages
+            if isinstance(msg, dict)
+            and (msg.get('attachment') or {}).get('file') == safe_fname
+        ]
+        if not candidates:
             raise HTTPException(404, "Файл не найден")
+
         if role != 'owner':
-            messages = core.load_chat() + deps.safe_load_json(deps.chat_archive_file(), [])
-            candidates = [m for m in messages if (m.get('attachment') or {}).get('file') == safe_fname]
-            if not candidates:
-                raise HTTPException(404, "Файл не найден")
             uid = str(user['id'])
             allowed = False
             for msg in candidates:
@@ -165,6 +173,10 @@ def create_chat_actions_router(
                     continue
             if not allowed:
                 raise HTTPException(403, "Нет доступа к этому файлу")
+
+        path = resolve_owned_media_path(deps.chat_attach_dir(), safe_fname)
+        if not path or not os.path.isfile(path):
+            raise HTTPException(404, "Файл не найден")
         return FileResponse(path, headers={'X-Content-Type-Options': 'nosniff'})
 
     @router.post('/api/manager/broadcast')
