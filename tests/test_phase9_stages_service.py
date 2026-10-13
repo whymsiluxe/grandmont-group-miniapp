@@ -3,11 +3,10 @@ from __future__ import annotations
 import ast
 from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from backend.services.stages import StageService, StageServiceDeps, StageServiceError
+from services.stages import StageService, StageServiceDeps, StageServiceError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
