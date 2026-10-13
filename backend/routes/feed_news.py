@@ -304,7 +304,10 @@ def create_feed_news_router(deps: FeedNewsRouteDeps) -> tuple[APIRouter, FeedNew
         saved = load_feed_saved()
         uid = str(user['id'])
         for post in feed:
-            post['my_reaction'] = reactions.get(post['id'], {}).get(uid)
+            post_reactions = reactions.get(post['id'], {})
+            post['likes'] = sum(1 for reaction in post_reactions.values() if reaction == 'like')
+            post['dislikes'] = sum(1 for reaction in post_reactions.values() if reaction == 'dislike')
+            post['my_reaction'] = post_reactions.get(uid)
             post['saved_by_me'] = is_feed_saved(saved, uid, 'news', post['id'])
             post_comments = comments.get(post['id'], [])
             post['comment_count'] = len(post_comments)
@@ -332,33 +335,27 @@ def create_feed_news_router(deps: FeedNewsRouteDeps) -> tuple[APIRouter, FeedNew
             raise HTTPException(404, 'лента новостей пуста')
         with open(path, encoding='utf-8') as handle:
             feed = json.load(handle)
-        post = next((item for item in feed if item['id'] == post_id), None)
-        if not post:
+        if not any(item.get('id') == post_id for item in feed):
             raise HTTPException(404, 'пост не найден')
-        reactions = load_news_reactions()
-        post_reactions = reactions.setdefault(post_id, {})
+
         uid = str(user['id'])
-        previous = post_reactions.get(uid)
-        if previous == 'like':
-            post['likes'] = max(0, post.get('likes', 0) - 1)
-        elif previous == 'dislike':
-            post['dislikes'] = max(0, post.get('dislikes', 0) - 1)
-        if body.reaction == 'none':
-            post_reactions.pop(uid, None)
-        else:
-            post_reactions[uid] = body.reaction
-            if body.reaction == 'like':
-                post['likes'] = post.get('likes', 0) + 1
+
+        def mutate(reactions: dict):
+            post_reactions = reactions.setdefault(post_id, {})
+            if body.reaction == 'none':
+                post_reactions.pop(uid, None)
             else:
-                post['dislikes'] = post.get('dislikes', 0) + 1
-        save_news_reactions(reactions)
-        deps.atomic_write_json(path, feed)
-        return {
-            'ok': True,
-            'likes': post['likes'],
-            'dislikes': post['dislikes'],
-            'my_reaction': body.reaction if body.reaction != 'none' else None,
-        }
+                post_reactions[uid] = body.reaction
+            likes = sum(1 for reaction in post_reactions.values() if reaction == 'like')
+            dislikes = sum(1 for reaction in post_reactions.values() if reaction == 'dislike')
+            return {
+                'ok': True,
+                'likes': likes,
+                'dislikes': dislikes,
+                'my_reaction': body.reaction if body.reaction != 'none' else None,
+            }
+
+        return deps.update_json_transaction(deps.news_reactions_file(), {}, mutate)
 
     @router.post('/api/feed/news/{post_id}/comments')
     def add_news_comment(
