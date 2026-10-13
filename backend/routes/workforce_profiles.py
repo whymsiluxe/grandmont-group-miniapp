@@ -20,8 +20,10 @@ from pydantic import BaseModel
 
 try:
     from ..core.media_paths import resolve_owned_media_path
+    from ..core.storage import _safe_load_json
 except ImportError:
     from core.media_paths import resolve_owned_media_path  # noqa: E402
+    from core.storage import _safe_load_json  # noqa: E402
 
 
 class SkillV2Body(BaseModel):
@@ -477,7 +479,8 @@ def create_workforce_profiles_router(
     def get_avatar(user_id: str, user: dict = Depends(deps.get_current_user)):
         if not user_id.isdigit():
             raise HTTPException(400, 'user_id должен быть числовым Telegram ID')
-        profile = deps.load_worker_profiles().get(str(user_id), {})
+        profiles = _safe_load_json(deps.worker_profiles_file(), {})
+        profile = profiles.get(str(user_id), {}) if isinstance(profiles, dict) else {}
         if not isinstance(profile, dict) or not profile.get('avatar'):
             raise HTTPException(404, 'Аватар не найден')
 
