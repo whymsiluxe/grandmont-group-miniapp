@@ -97,10 +97,7 @@ class StageService:
 
     def update_stage_status(self, object_id: str, row_num: int, status: str, user: dict) -> dict:
         o = self.deps.load_repo_objekte_lib()
-        try:
-            stage_before = self.find_stage_by_row(object_id, row_num)
-        except StageServiceError:
-            stage_before = {}
+        stage_before = self.find_stage_by_row(object_id, row_num)
         try:
             o.update_stage_status(row_num, status, self.deps.business_today_str())
         except ValueError as exc:

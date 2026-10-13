@@ -152,3 +152,16 @@ def test_approved_request_rolls_back_to_pending_if_sheet_mutation_fails():
     assert stored["decided_at"] is None
     assert stored["decided_by"] is None
     assert objects.status_updates == [(12, "Готово", "2026-10-13")]
+
+
+def test_status_update_rejects_object_row_mismatch_before_mutation():
+    objects = FakeObjects([
+        {"object_id": "OBJ-B", "_row": 7, "ID строки этапа": "OBJ-B-S1", "Название этапа": "Other"},
+    ])
+    service, _ = build_service(objects, FakeRoadmap())
+
+    with pytest.raises(StageServiceError) as exc_info:
+        service.update_stage_status("OBJ-A", 7, "Готово", {"id": "1"})
+
+    assert exc_info.value.status_code == 404
+    assert objects.status_updates == []
