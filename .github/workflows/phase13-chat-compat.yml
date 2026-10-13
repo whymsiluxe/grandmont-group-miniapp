@@ -1,0 +1,42 @@
+name: Phase 13 chat compatibility adapters
+
+on:
+  push:
+    branches:
+      - refactor/chat-consistency-phase-13
+    paths:
+      - .github/workflows/phase13-chat-compat.yml
+
+permissions:
+  contents: write
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refactor/chat-consistency-phase-13
+      - name: Restore route-local compatibility adapters
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('backend/routes/chat.py')
+          text = path.read_text()
+          old = """    chat_lock = storage.lock\n    archive_chat_messages = storage.archive_messages\n    load_chat = storage.load_chat\n    save_chat = storage.save_chat\n    purge_old_chat = storage.purge_old_chat\n"""
+          new = """    chat_lock = storage.lock\n\n    def archive_chat_messages(messages: list):\n        return storage.archive_messages(messages)\n\n    def load_chat() -> list:\n        return storage.load_chat()\n\n    def save_chat(messages: list):\n        return storage.save_chat(messages)\n\n    def purge_old_chat(messages: list) -> list:\n        return storage.purge_old_chat(messages)\n"""
+          assert old in text
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+          python -m py_compile backend/services/chat_storage.py backend/routes/chat.py backend/routes/chat_actions.py
+      - name: Remove one-shot workflow
+        run: rm .github/workflows/phase13-chat-compat.yml
+      - name: Commit compatibility adapters
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add backend/routes/chat.py .github/workflows/phase13-chat-compat.yml
+          git commit -m 'Preserve chat route compatibility adapters [phase13]'
+          git push origin HEAD:refactor/chat-consistency-phase-13
