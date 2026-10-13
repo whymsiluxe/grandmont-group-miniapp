@@ -592,9 +592,15 @@ async def audit_log_middleware(request, call_next):
                 "status": response.status_code,
                 "rejected": response.status_code >= 400,
             }
-            with AUDIT_LOCK:
-                with open(AUDIT_FILE, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            try:
+                with AUDIT_LOCK:
+                    with open(AUDIT_FILE, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except OSError as exc:
+                # The business handler already produced its response. Audit persistence
+                # is observability, not a second transaction boundary: never turn an
+                # already-committed mutation into a client-visible 500.
+                print(f"[audit] failed to append {AUDIT_FILE}: {exc}")
 
         return response
     finally:
