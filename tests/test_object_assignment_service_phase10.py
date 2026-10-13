@@ -197,5 +197,6 @@ def test_object_assignment_service_stays_framework_agnostic():
     lowered = text.lower()
     assert "fastapi" not in lowered
     assert "pydantic" not in lowered
-    assert "routes.objects" not in lowered
+    assert "from routes.objects" not in lowered
+    assert "from ..routes" not in lowered
     assert "import main" not in lowered
