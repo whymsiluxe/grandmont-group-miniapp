@@ -1,6 +1,7 @@
 """Phase 27 regressions for identity-bound media ownership."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
@@ -37,6 +38,7 @@ def _build_avatar_handlers(tmp_path, profiles):
     avatar_root = tmp_path / 'avatars'
     profiles_file = tmp_path / 'worker_profiles.json'
     state = deepcopy(profiles)
+    profiles_file.write_text(json.dumps(profiles), encoding='utf-8')
 
     def update_json_transaction(_path, default, mutator):
         nonlocal state
