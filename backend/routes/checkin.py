@@ -378,7 +378,17 @@ def create_checkin_router(deps: CheckinRouteDeps):
                     deps.idempotency_release(idempotency_key, idempotency_scope)
                     raise HTTPException(409, f"У вас уже есть незавершённая смена на объекте {open_session['object_id']} — сначала завершите её")
                 items.append(entry)
-                deps.save_checkin_meta(items)
+                try:
+                    deps.save_checkin_meta(items)
+                except Exception:
+                    # Photo files are written before the metadata commit so async
+                    # file I/O stays outside checkin_lock. Atomic JSON persistence
+                    # has no fallible step after os.replace; therefore an exception
+                    # here means the new session was not committed and these files
+                    # are safe to remove.
+                    deps.cleanup_checkin_photo_files(photo_paths)
+                    deps.idempotency_release(idempotency_key, idempotency_scope)
+                    raise
 
         if existing_entry is None and photo_paths:
             try:
@@ -620,7 +630,15 @@ def create_checkin_router(deps: CheckinRouteDeps):
             # find a finished session with pending_execution_report set and no
             # outbox event, and rebuild the outbox entry from it.
             session['pending_execution_report'] = daily_plan_report.strip() or None
-            deps.save_checkin_meta(items)
+            try:
+                deps.save_checkin_meta(items)
+            except Exception:
+                # Same ordering as Start: finish photos exist before the atomic
+                # metadata write. If that write fails, finish_at was not committed,
+                # so retain no unreferenced binaries and release the claim for retry.
+                deps.cleanup_checkin_photo_files(photo_paths)
+                deps.idempotency_release(idempotency_key, idempotency_scope)
+                raise
 
         # Apply daily plan execution report via durable outbox.
         # Outbox event is written AFTER checkin_meta is committed and BEFORE apply_daily_execution,
