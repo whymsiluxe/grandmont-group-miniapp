@@ -1,6 +1,7 @@
 """Object and blocker photo HTTP routes extracted from backend.main."""
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from dataclasses import dataclass
@@ -8,6 +9,15 @@ from typing import Any, Callable, Mapping
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+
+try:
+    from .. import roadmap_lib as _roadmap_lib
+    from ..core.media_paths import resolve_owned_media_path
+    from ..core.storage import _safe_load_json
+except ImportError:
+    import roadmap_lib as _roadmap_lib  # noqa: E402
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+    from core.storage import _safe_load_json  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -43,6 +53,26 @@ def _safe_stored_filename(value: Any) -> str | None:
     if not safe_name or safe_name != name or safe_name in (".", ".."):
         return None
     return safe_name
+
+
+def _blocker_object_namespace(object_id: str) -> str:
+    """Stable filesystem namespace without trusting object IDs as path segments."""
+    return hashlib.sha256(str(object_id).encode("utf-8")).hexdigest()
+
+
+def _legacy_blocker_photo_owned(object_id: str, fname: str) -> bool:
+    """Verify a pre-Phase-28 global blocker file through persisted roadmap metadata."""
+    store = _safe_load_json(_roadmap_lib.ROADMAP_FILE, _roadmap_lib._default_store())
+    if not isinstance(store, dict):
+        return False
+    blocks = store.get("stage_blocks") or {}
+    if not isinstance(blocks, dict):
+        return False
+    expected_url = f"/api/objects/{object_id}/blocker-photo/{fname}"
+    return any(
+        isinstance(meta, dict) and meta.get("photo_url") == expected_url
+        for meta in blocks.values()
+    )
 
 
 def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, ObjectMediaHandlers]:
@@ -99,7 +129,9 @@ def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, Object
         user: dict = Depends(deps.get_current_user),
         _: None = Depends(deps.require_owner),
     ):
-        safe_name = os.path.basename(fname)
+        safe_name = _safe_stored_filename(fname)
+        if not safe_name:
+            raise HTTPException(404, "Фото не найдено")
 
         def _mutator(images):
             existing = images.get(object_id) or []
@@ -109,8 +141,8 @@ def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, Object
             return images[object_id]
 
         photos = deps.update_json_transaction(deps.object_images_file(), {}, _mutator)
-        path = os.path.join(deps.object_photo_dir(), safe_name)
-        if os.path.exists(path):
+        path = resolve_owned_media_path(deps.object_photo_dir(), safe_name)
+        if path and os.path.isfile(path):
             os.remove(path)
         return {"status": "ok", "photos": photos}
 
@@ -129,8 +161,8 @@ def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, Object
         safe_name = _safe_stored_filename(photos[index])
         if not safe_name:
             raise HTTPException(404, "Файл отсутствует")
-        path = os.path.join(deps.object_photo_dir(), safe_name)
-        if not os.path.isfile(path):
+        path = resolve_owned_media_path(deps.object_photo_dir(), safe_name)
+        if not path or not os.path.isfile(path):
             raise HTTPException(404, "Файл отсутствует")
         return FileResponse(path)
 
@@ -149,7 +181,18 @@ def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, Object
             raise HTTPException(400, "Файл должен быть изображением")
         ext = deps.allowed_image_mime_ext[detected]
         fname = f"{uuid.uuid4().hex}.{ext}"
-        with open(os.path.join(deps.blocker_photo_dir(), fname), "wb") as out:
+        blocker_root = deps.blocker_photo_dir()
+        relative_path = os.path.join(_blocker_object_namespace(object_id), fname)
+        path = resolve_owned_media_path(blocker_root, relative_path)
+        if not path:
+            raise HTTPException(500, "Не удалось подготовить хранилище фото")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Re-resolve after directory creation so a pre-existing symlink namespace
+        # cannot redirect this object's upload to another media identity.
+        path = resolve_owned_media_path(blocker_root, relative_path)
+        if not path:
+            raise HTTPException(500, "Не удалось подготовить хранилище фото")
+        with open(path, "wb") as out:
             out.write(raw)
         return {"photo_url": f"/api/objects/{object_id}/blocker-photo/{fname}"}
 
@@ -160,12 +203,25 @@ def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, Object
         user: dict = Depends(deps.get_current_user),
         _: None = Depends(deps.require_object_access),
     ):
-        if "/" in fname or ".." in fname:
+        safe_name = _safe_stored_filename(fname)
+        if not safe_name:
             raise HTTPException(400, "Некорректное имя файла")
-        path = os.path.join(deps.blocker_photo_dir(), fname)
-        if not os.path.exists(path):
+
+        blocker_root = deps.blocker_photo_dir()
+        relative_path = os.path.join(_blocker_object_namespace(object_id), safe_name)
+        path = resolve_owned_media_path(blocker_root, relative_path)
+        if path and os.path.isfile(path):
+            return FileResponse(path)
+
+        # Pre-Phase-28 files lived directly in BLOCKER_PHOTO_DIR. Preserve those
+        # links only when roadmap metadata proves this exact URL belongs to the
+        # requested object; physical file existence alone is no longer authority.
+        if not _legacy_blocker_photo_owned(object_id, safe_name):
             raise HTTPException(404, "Файл отсутствует")
-        return FileResponse(path)
+        legacy_path = resolve_owned_media_path(blocker_root, safe_name)
+        if not legacy_path or not os.path.isfile(legacy_path):
+            raise HTTPException(404, "Файл отсутствует")
+        return FileResponse(legacy_path)
 
     return router, ObjectMediaHandlers(
         upload_object_image=upload_object_image,
