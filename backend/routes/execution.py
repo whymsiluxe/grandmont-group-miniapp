@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import time
@@ -37,6 +38,9 @@ try:
     from ..core.media_paths import resolve_owned_media_path
 except ImportError:
     from core.media_paths import resolve_owned_media_path  # noqa: E402
+
+
+logger = logging.getLogger(__name__)
 
 
 MANUAL_TIME_ART_WHITELIST = {'Arbeitszeit', 'Fahrzeit'}
@@ -251,10 +255,20 @@ def create_execution_router(deps: ExecutionRouteDeps):
                     deps.save_checkin_meta(items)
             if existing_entry is None:
                 deps.write_zeiterfassung_row(entry, entry['object_id'], target_user_id)
-            deps.idempotency_save(idempotency_key, entry, idempotency_scope)
         except Exception:
             deps.idempotency_release(idempotency_key, idempotency_scope)
             raise
+
+        # The manual-time business fact is already durable in checkin_meta here.
+        # The idempotency response store is a secondary replay cache; failure must
+        # not turn a committed time entry into a false 500/retry loop.
+        try:
+            deps.idempotency_save(idempotency_key, entry, idempotency_scope)
+        except Exception:
+            logger.exception(
+                'Manual-time idempotency response persistence failed after durable commit: key=%s',
+                idempotency_key,
+            )
         return entry
 
     def _image_block_from_file(path: str) -> dict | None:

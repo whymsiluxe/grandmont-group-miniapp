@@ -152,24 +152,23 @@ class CheckinManualAndIdempotencyTests(unittest.TestCase):
         write_row.assert_called_once()
 
     def test_manual_time_survives_crash_between_business_write_and_idempotency_save(self):
-        # F03 (owner review commit db584ac, CHANGES REQUIRED): simulate the exact
-        # crash window the owner described -- business fact written to
-        # checkin_meta.json, but the process dies BEFORE _idempotency_save() runs
-        # (so the durable checkin_idempotency.json entry is stuck at state=pending
-        # forever, and after _IDEMPOTENCY_TTL a bare retry would previously create
-        # a SECOND manual entry). We force this by making _idempotency_save raise,
-        # which reproduces "process died right there" for the purposes of this test.
+        # Phase 22 strengthens the old F03 crash-window contract: once the manual
+        # time entry is durable in checkin_meta.json, failure of the secondary
+        # idempotency response store must NOT turn the request into a false 500.
+        # A retry with the same key must still resolve the same deterministic entry.
         with patch.object(backend, '_cached_get_used_range', return_value=self._object_rows()), \
              patch.object(backend, '_write_zeiterfassung_row'), \
              patch.object(backend, '_idempotency_save', side_effect=RuntimeError('simulated crash')):
-            with self.assertRaises(RuntimeError):
-                backend.checkin_manual(_manual_body(), user=WORKER, role='worker', idempotency_key='manual-crash')
+            first = backend.checkin_manual(
+                _manual_body(), user=WORKER, role='worker', idempotency_key='manual-crash'
+            )
 
         # "Restart": in-memory cache lost, durable idempotency entry still 'pending'.
         backend._idempotency_cache.clear()
         items_after_crash = backend._load_checkin_meta()
         self.assertEqual(len(items_after_crash), 1, "business fact must have survived the simulated crash")
         crashed_entry_id = items_after_crash[0]['id']
+        self.assertEqual(first['id'], crashed_entry_id)
 
         with patch.object(backend, '_cached_get_used_range', return_value=self._object_rows()), \
              patch.object(backend, '_write_zeiterfassung_row') as write_row:
