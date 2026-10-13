@@ -1,0 +1,44 @@
+name: Phase 10 objects route rewrite v2
+
+on:
+  push:
+    branches:
+      - refactor/objects-service-phase-10
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite:
+    if: contains(github.event.head_commit.message, '[phase10-route-rewrite-v2]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refactor/objects-service-phase-10
+          fetch-depth: 0
+      - name: Run corrected route rewrite
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/phase10-objects-route-rewrite.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "python - <<'PY'" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == 'PY')
+          script_lines = []
+          for line in workflow[start:end]:
+              line = line[10:] if line.startswith('          ') else line
+              if "replacement = '\\n'.join(line[12:]" in line:
+                  continue
+              script_lines.append(line)
+          Path('/tmp/phase10_rewrite.py').write_text('\n'.join(script_lines) + '\n')
+          PY
+          python /tmp/phase10_rewrite.py
+          python -m py_compile backend/routes/objects.py backend/services/object_assignments.py
+          rm .github/workflows/phase10-objects-route-rewrite.yml
+          rm .github/workflows/phase10-objects-route-rewrite-v2.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/routes/objects.py .github/workflows/phase10-objects-route-rewrite.yml .github/workflows/phase10-objects-route-rewrite-v2.yml
+          git commit -m "Wire object assignment service [phase10]"
+          git push origin HEAD:refactor/objects-service-phase-10
