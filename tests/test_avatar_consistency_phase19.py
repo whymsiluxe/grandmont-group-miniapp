@@ -34,22 +34,23 @@ def _upload(name: str, raw: bytes, content_type: str) -> UploadFile:
 
 def test_avatar_profile_commit_failure_restores_previous_binary_exactly():
     with tempfile.TemporaryDirectory() as tmp:
-        profiles_file = os.path.join(tmp, 'profiles.json')
+        # Point the metadata store at an existing directory. The real
+        # update_json_transaction() therefore fails with IsADirectoryError after
+        # the staged avatar binary has already been installed.
+        profiles_store = os.path.join(tmp, 'profiles-store')
         avatar_dir = os.path.join(tmp, 'avatars')
+        os.makedirs(profiles_store)
         os.makedirs(avatar_dir)
         old_path = os.path.join(avatar_dir, '42.png')
         old_bytes = b'previous-avatar-bytes'
         with open(old_path, 'wb') as handle:
             handle.write(old_bytes)
-        with open(profiles_file, 'w', encoding='utf-8') as handle:
-            json.dump({'42': {'name': 'Worker', 'avatar': True, 'avatar_ext': 'png'}}, handle)
 
         with (
             patch.object(backend, 'AVATAR_DIR', avatar_dir),
-            patch.object(backend, 'WORKER_PROFILES_FILE', profiles_file),
-            patch.object(backend, 'update_json_transaction', side_effect=OSError('profile store failed')),
+            patch.object(backend, 'WORKER_PROFILES_FILE', profiles_store),
         ):
-            with pytest.raises(OSError, match='profile store failed'):
+            with pytest.raises(IsADirectoryError):
                 asyncio.run(
                     backend.upload_my_avatar(
                         file=_upload('new.png', PNG_1X1, 'image/png'),
