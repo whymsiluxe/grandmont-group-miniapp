@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Collection, Mapping
@@ -16,6 +17,11 @@ from typing import Any, Callable, Collection, Mapping
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
+try:
+    from ..core.media_paths import resolve_owned_media_path
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
 
 
 class SkillV2Body(BaseModel):
@@ -373,20 +379,50 @@ def create_workforce_profiles_router(
         uid = str(user['id'])
         avatar_dir = deps.avatar_dir()
         os.makedirs(avatar_dir, exist_ok=True)
-        for filename in os.listdir(avatar_dir):
-            if filename.startswith(uid + '.'):
-                os.remove(os.path.join(avatar_dir, filename))
-        with open(os.path.join(avatar_dir, f'{uid}.{ext}'), 'wb') as handle:
-            handle.write(raw)
+        prior_paths = [
+            os.path.join(avatar_dir, f'{uid}.{candidate_ext}')
+            for candidate_ext in ('jpg', 'png', 'webp')
+            if os.path.lexists(os.path.join(avatar_dir, f'{uid}.{candidate_ext}'))
+        ]
+        target_path = os.path.join(avatar_dir, f'{uid}.{ext}')
+        rollback_path = None
+        if os.path.lexists(target_path):
+            rollback_path = f'{target_path}.rollback-{uuid.uuid4().hex}'
+            os.replace(target_path, rollback_path)
 
-        def _mutator(profiles):
-            profile = profiles.get(uid, {"skills": [], "quiz_completed": False})
-            profile['avatar'] = True
-            if not profile.get('name'):
-                profile['name'] = user.get('first_name', uid)
-            profiles[uid] = profile
+        try:
+            with open(target_path, 'wb') as handle:
+                handle.write(raw)
 
-        deps.update_json_transaction(deps.worker_profiles_file(), {}, _mutator)
+            def _mutator(profiles):
+                profile = profiles.get(uid, {"skills": [], "quiz_completed": False})
+                profile['avatar'] = True
+                if not profile.get('name'):
+                    profile['name'] = user.get('first_name', uid)
+                profiles[uid] = profile
+
+            deps.update_json_transaction(deps.worker_profiles_file(), {}, _mutator)
+        except Exception:
+            try:
+                os.remove(target_path)
+            except FileNotFoundError:
+                pass
+            if rollback_path and os.path.lexists(rollback_path):
+                os.replace(rollback_path, target_path)
+            raise
+
+        if rollback_path:
+            try:
+                os.remove(rollback_path)
+            except FileNotFoundError:
+                pass
+        for old_path in prior_paths:
+            if old_path == target_path:
+                continue
+            try:
+                os.remove(old_path)
+            except FileNotFoundError:
+                pass
         return {'status': 'ok'}
 
     @router.get('/api/profile/{user_id}/avatar')
@@ -394,8 +430,8 @@ def create_workforce_profiles_router(
         if not user_id.isdigit():
             raise HTTPException(400, 'user_id должен быть числовым Telegram ID')
         for ext in ('jpg', 'png', 'webp'):
-            path = os.path.join(deps.avatar_dir(), f'{user_id}.{ext}')
-            if os.path.exists(path):
+            path = resolve_owned_media_path(deps.avatar_dir(), f'{user_id}.{ext}')
+            if path and os.path.exists(path):
                 return FileResponse(path)
         raise HTTPException(404, 'Аватар не найден')
 
