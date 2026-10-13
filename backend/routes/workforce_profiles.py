@@ -18,6 +18,11 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+try:
+    from ..core.media_paths import resolve_owned_media_path
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+
 
 class SkillV2Body(BaseModel):
     skill_id: str
@@ -473,15 +478,24 @@ def create_workforce_profiles_router(
         if not user_id.isdigit():
             raise HTTPException(400, 'user_id должен быть числовым Telegram ID')
         profile = deps.load_worker_profiles().get(str(user_id), {})
-        preferred_ext = profile.get('avatar_ext') if isinstance(profile, dict) else None
+        if not isinstance(profile, dict) or not profile.get('avatar'):
+            raise HTTPException(404, 'Аватар не найден')
+
+        preferred_ext = profile.get('avatar_ext')
         allowed_exts = list(dict.fromkeys(deps.allowed_image_mime_ext.values()))
-        candidate_exts = []
-        if preferred_ext in allowed_exts:
-            candidate_exts.append(preferred_ext)
-        candidate_exts.extend(ext for ext in allowed_exts if ext not in candidate_exts)
+        if preferred_ext is not None:
+            if preferred_ext not in allowed_exts:
+                raise HTTPException(404, 'Аватар не найден')
+            candidate_exts = [preferred_ext]
+        else:
+            # Legacy profiles may predate avatar_ext metadata. Keep the old
+            # extension probe only for those explicitly marked as having an avatar.
+            candidate_exts = allowed_exts
+
+        avatar_dir = deps.avatar_dir()
         for ext in candidate_exts:
-            path = os.path.join(deps.avatar_dir(), f'{user_id}.{ext}')
-            if os.path.exists(path):
+            path = resolve_owned_media_path(avatar_dir, f'{user_id}.{ext}')
+            if path and os.path.isfile(path):
                 return FileResponse(path)
         raise HTTPException(404, 'Аватар не найден')
 
