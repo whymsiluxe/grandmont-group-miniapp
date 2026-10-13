@@ -15,6 +15,11 @@ from typing import Any, Callable, Mapping
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
+try:
+    from ..services.chat_storage import ChatStorageDeps, ChatStorageService
+except ImportError:
+    from services.chat_storage import ChatStorageDeps, ChatStorageService  # noqa: E402
+
 
 @dataclass(frozen=True)
 class ChatRouteDeps:
@@ -80,36 +85,28 @@ class ChatHandlers:
     get_unread_by_thread: Callable[..., dict]
     mark_chat_read: Callable[..., dict]
     post_chat_attachment: Callable[..., dict]
+    delete_messages_by_ids: Callable[[set[str]], int]
 
 
 def create_chat_router(deps: ChatRouteDeps) -> tuple[APIRouter, ChatHandlers]:
     router = APIRouter()
-    chat_lock = threading.Lock()
-    os.makedirs(deps.chat_attach_dir(), exist_ok=True)
-
-    def archive_chat_messages(messages: list):
-        if not messages:
-            return
-        archive = deps.safe_load_json(deps.chat_archive_file(), [])
-        archive.extend(messages)
-        deps.atomic_write_json(deps.chat_archive_file(), archive)
-
-    def load_chat() -> list:
-        return deps.safe_load_json(deps.chat_file(), [])
-
-    def save_chat(messages: list):
-        if len(messages) > deps.chat_max:
-            archive_chat_messages(messages[:-deps.chat_max])
-            messages = messages[-deps.chat_max:]
-        deps.atomic_write_json(deps.chat_file(), messages)
-
-    def purge_old_chat(messages: list) -> list:
-        cutoff = time.time() - deps.chat_retention_seconds
-        keep = [m for m in messages if m.get('ts', 0) >= cutoff]
-        expired = [m for m in messages if m.get('ts', 0) < cutoff]
-        if expired:
-            archive_chat_messages(expired)
-        return keep
+    storage = ChatStorageService(
+        ChatStorageDeps(
+            safe_load_json=deps.safe_load_json,
+            atomic_write_json=deps.atomic_write_json,
+            chat_file=deps.chat_file,
+            chat_archive_file=deps.chat_archive_file,
+            chat_reactions_file=deps.chat_reactions_file,
+            chat_attach_dir=deps.chat_attach_dir,
+            chat_max=deps.chat_max,
+            chat_retention_seconds=deps.chat_retention_seconds,
+        )
+    )
+    chat_lock = storage.lock
+    archive_chat_messages = storage.archive_messages
+    load_chat = storage.load_chat
+    save_chat = storage.save_chat
+    purge_old_chat = storage.purge_old_chat
 
     def load_reads() -> dict:
         return deps.safe_load_json(deps.chat_reads_file(), {})
@@ -527,9 +524,6 @@ def create_chat_router(deps: ChatRouteDeps) -> tuple[APIRouter, ChatHandlers]:
             raise HTTPException(400, "Недопустимый тип файла")
         _, extension = sniffed
         filename = f'{uuid.uuid4().hex}.{extension}'
-        with open(os.path.join(deps.chat_attach_dir(), filename), 'wb') as output:
-            output.write(data)
-
         message = {
             'id': uuid.uuid4().hex,
             'ts': int(time.time()),
@@ -544,10 +538,11 @@ def create_chat_router(deps: ChatRouteDeps) -> tuple[APIRouter, ChatHandlers]:
                 'content_type': file.content_type or '',
             },
         }
-        with chat_lock:
-            messages = load_chat()
-            messages.append(message)
-            save_chat(messages)
+        storage.persist_attachment_and_message(
+            filename=filename,
+            data=data,
+            message=message,
+        )
         return {'message': message}
 
     return router, ChatHandlers(
@@ -581,4 +576,5 @@ def create_chat_router(deps: ChatRouteDeps) -> tuple[APIRouter, ChatHandlers]:
         get_unread_by_thread=get_unread_by_thread,
         mark_chat_read=mark_chat_read,
         post_chat_attachment=post_chat_attachment,
+        delete_messages_by_ids=storage.delete_messages_by_ids,
     )

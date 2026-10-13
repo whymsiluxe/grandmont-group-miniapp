@@ -356,13 +356,9 @@ def create_chat_actions_router(
                 raise HTTPException(404, 'Сообщение не найдено')
             if role != 'owner' and target['user_id'] != user['id']:
                 raise HTTPException(403, 'Можно удалять только свои сообщения')
-            messages = [m for m in messages if m['id'] != msg_id]
-            core.save_chat(messages)
-        core.archive_chat_messages([target])
-        reactions = core.load_chat_reactions()
-        remaining = [r for r in reactions if r['message_id'] != msg_id]
-        if len(remaining) != len(reactions):
-            core.save_chat_reactions(remaining)
+        deleted = core.delete_messages_by_ids({msg_id})
+        if not deleted:
+            raise HTTPException(404, 'Сообщение не найдено')
         return {'status': 'ok'}
 
     @router.delete('/api/chat/threads')
@@ -378,7 +374,6 @@ def create_chat_actions_router(
             messages = core.load_chat()
             if thread_key:
                 to_delete = [m for m in messages if m.get('thread_key') == thread_key]
-                remaining = [m for m in messages if m.get('thread_key') != thread_key]
             else:
                 core.reject_self_chat(user['id'], with_)
                 core.validate_dm_recipient(with_)
@@ -388,16 +383,9 @@ def create_chat_actions_router(
                     if not m.get('thread_key')
                     and core.chat_thread_id(m.get('user_id'), m.get('to_user_id')) == target_thread_id
                 ]
-                deleted_ids = {m['id'] for m in to_delete}
-                remaining = [m for m in messages if m['id'] not in deleted_ids]
-            core.save_chat(remaining)
-        core.archive_chat_messages(to_delete)
-        deleted_ids = {m['id'] for m in to_delete}
-        reactions = core.load_chat_reactions()
-        remaining_reactions = [r for r in reactions if r['message_id'] not in deleted_ids]
-        if len(remaining_reactions) != len(reactions):
-            core.save_chat_reactions(remaining_reactions)
-        return {'status': 'ok', 'deleted_count': len(to_delete)}
+        deleted_ids = {str(m['id']) for m in to_delete}
+        deleted_count = core.delete_messages_by_ids(deleted_ids)
+        return {'status': 'ok', 'deleted_count': deleted_count}
 
     @router.post('/api/chat/messages/{msg_id}/reactions')
     def toggle_chat_reaction(
