@@ -1,0 +1,49 @@
+name: Phase 21 test contract patch
+on:
+  push:
+    branches:
+      - fix/checkin-idempotency-phase-21
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/checkin-idempotency-phase-21
+          fetch-depth: 0
+      - name: Update exact legacy assertion
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tests/test_checkin_manual_idempotency.py')
+          s = p.read_text()
+          old_comment = '''    def test_start_survives_crash_between_business_write_and_idempotency_save(self):\n        # F03: same crash-window scenario as manual entry, but for checkin_start --\n        # the open session gets written to checkin_meta.json, then the process dies\n        # before _idempotency_save() runs. A retry with the same key must land on\n        # the SAME session (deterministic entity id), not open a second one.\n'''
+          new_comment = '''    def test_start_survives_crash_between_business_write_and_idempotency_save(self):\n        # Phase 21 strengthens the old F03 crash-window contract: once the open\n        # session is durable in checkin_meta.json, failure of the secondary\n        # idempotency response store must NOT turn Start into a false 500. A retry\n        # with the same key must still land on the SAME deterministic session.\n'''
+          assert s.count(old_comment) == 1, s.count(old_comment)
+          s = s.replace(old_comment, new_comment, 1)
+
+          old_call = '''        with patch.object(backend.time, 'time', return_value=first_received_at), \\\n             patch.object(backend, '_save_checkin_photos', new=save_photos), \\\n             patch.object(backend, '_cached_get_used_range', return_value=self._object_rows()), \\\n             patch.object(backend, '_upsert_checkin_feed_post'), \\\n             patch.object(backend, '_idempotency_save', side_effect=RuntimeError('simulated crash')):\n            with self.assertRaises(RuntimeError):\n                asyncio.run(backend.checkin_start(\n                    object_id='OBJ-1', lat='52.5', lon='13.4', accuracy='', geo_timestamp='',\n                    occurred_at=str(event_ts * 1000), stage_name='', files=[MagicMock()],\n                    daily_plan_id='', daily_plan_version='', daily_plan_acceptance_id='',\n                    user=WORKER, role='worker', idempotency_key='start-crash',\n                ))\n'''
+          new_call = '''        with patch.object(backend.time, 'time', return_value=first_received_at), \\\n             patch.object(backend, '_save_checkin_photos', new=save_photos), \\\n             patch.object(backend, '_cached_get_used_range', return_value=self._object_rows()), \\\n             patch.object(backend, '_upsert_checkin_feed_post'), \\\n             patch.object(backend, '_idempotency_save', side_effect=RuntimeError('simulated crash')):\n            first = asyncio.run(backend.checkin_start(\n                object_id='OBJ-1', lat='52.5', lon='13.4', accuracy='', geo_timestamp='',\n                occurred_at=str(event_ts * 1000), stage_name='', files=[MagicMock()],\n                daily_plan_id='', daily_plan_version='', daily_plan_acceptance_id='',\n                user=WORKER, role='worker', idempotency_key='start-crash',\n            ))\n'''
+          assert s.count(old_call) == 1, s.count(old_call)
+          s = s.replace(old_call, new_call, 1)
+
+          marker = '''        crashed_session_id = items_after_crash[0]['id']\n\n        # A retry (even immediately after) must not be blocked by the crashed\n'''
+          replacement = '''        crashed_session_id = items_after_crash[0]['id']\n        self.assertEqual(first['id'], crashed_session_id)\n\n        # A retry (even immediately after) must not be blocked by the crashed\n'''
+          assert s.count(marker) == 1, s.count(marker)
+          s = s.replace(marker, replacement, 1)
+
+          p.write_text(s)
+          PY
+          python -m py_compile tests/test_checkin_manual_idempotency.py
+          rm .github/workflows/phase21-test-contract.yml
+          git diff --check
+      - name: Commit test contract
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tests/test_checkin_manual_idempotency.py .github/workflows/phase21-test-contract.yml
+          git commit -m 'Update check-in post-commit idempotency contract [phase21]'
+          git push origin HEAD:fix/checkin-idempotency-phase-21
