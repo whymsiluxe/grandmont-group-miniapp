@@ -1,0 +1,54 @@
+name: Phase 23 guarded patch
+on:
+  push:
+    branches:
+      - fix/execution-analysis-race-phase-23
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Apply exact execution analysis patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('backend/routes/execution.py')
+          text = path.read_text()
+          old = '''    def _save_checkin_analysis(session_id: str, key: str, value):
+        items = deps.load_checkin_meta()
+        for i in items:
+            if i.get('id') == session_id:
+                i.setdefault('analysis', {})[key] = value
+                deps.save_checkin_meta(items)
+                return
+        raise HTTPException(404, "Сессия не найдена")
+'''
+          new = '''    def _save_checkin_analysis(session_id: str, key: str, value):
+        # Serialize the read-modify-write with Start/Finish/Manual mutations.
+        # Without the shared check-in lock, an AI result can persist a stale
+        # snapshot and erase a concurrent finish/update on the same session.
+        with deps.checkin_lock:
+            items = deps.load_checkin_meta()
+            for i in items:
+                if i.get('id') == session_id:
+                    i.setdefault('analysis', {})[key] = value
+                    deps.save_checkin_meta(items)
+                    return
+        raise HTTPException(404, "Сессия не найдена")
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one analysis save block, found {text.count(old)}')
+          path.write_text(text.replace(old, new))
+          PY
+          python -m py_compile backend/routes/execution.py
+          rm .github/workflows/phase23-patch.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add backend/routes/execution.py .github/workflows/phase23-patch.yml
+          git commit -m 'Serialize check-in analysis persistence [phase23]'
+          git push
