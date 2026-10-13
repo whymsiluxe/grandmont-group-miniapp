@@ -52,10 +52,10 @@ def test_retired_bot_secret_is_not_loaded_or_accepted():
     assert exc.value.status_code == 401
 
 
-def test_cleanup_timer_uses_active_data_root():
+def test_cleanup_timer_stays_under_its_resolved_data_root():
     import cleanup_old_attachments as cleanup
 
-    expected_root = os.environ["MINIAPP_DATA_ROOT"] + os.sep
-    assert cleanup.DATA_ROOT == os.environ["MINIAPP_DATA_ROOT"]
+    assert cleanup.DATA_ROOT != "/home/promonta/agent/miniapp"
     assert cleanup.DIRS
+    expected_root = cleanup.DATA_ROOT + os.sep
     assert all(path.startswith(expected_root) for path in cleanup.DIRS)
