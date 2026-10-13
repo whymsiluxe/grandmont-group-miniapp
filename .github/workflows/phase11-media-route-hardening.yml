@@ -1,0 +1,80 @@
+name: Phase 11 checkin media route hardening
+
+on:
+  push:
+    branches:
+      - refactor/checkin-service-phase-11
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: contains(github.event.head_commit.message, '[phase11-media-route-hardening]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refactor/checkin-service-phase-11
+          fetch-depth: 0
+      - name: Harden check-in photo route
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('backend/routes/checkin.py')
+          src = path.read_text()
+
+          old_import = '''try:
+              from .. import daily_plan_lib as dpl
+          except ImportError:
+              import daily_plan_lib as dpl  # noqa: E402
+          '''
+          old_import = '\n'.join(line[10:] if line.startswith('          ') else line for line in old_import.splitlines()) + '\n'
+          new_import = '''try:
+              from .. import daily_plan_lib as dpl
+              from ..core.media_paths import resolve_owned_media_path
+          except ImportError:
+              import daily_plan_lib as dpl  # noqa: E402
+              from core.media_paths import resolve_owned_media_path  # noqa: E402
+          '''
+          new_import = '\n'.join(line[10:] if line.startswith('          ') else line for line in new_import.splitlines()) + '\n'
+          if old_import not in src:
+              raise SystemExit('checkin import marker not found')
+          src = src.replace(old_import, new_import, 1)
+
+          old = '''        key = 'start_photos' if which == 'start' else 'finish_photos'
+                  photos = session.get(key, [])
+                  if index < 0 or index >= len(photos):
+                      raise HTTPException(404, "Фото не найдено")
+                  path = os.path.join(deps.checkin_photo_base(), photos[index])
+                  if not os.path.exists(path):
+                      raise HTTPException(404, "Файл отсутствует")
+                  return FileResponse(path)
+          '''
+          old = '\n'.join(line[8:] if line.startswith('        ') else line for line in old.splitlines()) + '\n'
+          new = '''        if which not in {'start', 'finish'}:
+                      raise HTTPException(404, "Фото не найдено")
+                  key = 'start_photos' if which == 'start' else 'finish_photos'
+                  photos = session.get(key, [])
+                  if not isinstance(photos, list) or index < 0 or index >= len(photos):
+                      raise HTTPException(404, "Фото не найдено")
+                  path = resolve_owned_media_path(deps.checkin_photo_base(), photos[index])
+                  if not path or not os.path.isfile(path):
+                      raise HTTPException(404, "Файл отсутствует")
+                  return FileResponse(path)
+          '''
+          new = '\n'.join(line[8:] if line.startswith('        ') else line for line in new.splitlines()) + '\n'
+          if old not in src:
+              raise SystemExit('photo route marker not found')
+          src = src.replace(old, new, 1)
+          path.write_text(src)
+          PY
+          python -m py_compile backend/routes/checkin.py backend/core/media_paths.py backend/core/checkin_support.py
+          pytest -q tests/test_checkin_media_paths_phase11.py
+          rm .github/workflows/phase11-media-route-hardening.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/routes/checkin.py .github/workflows/phase11-media-route-hardening.yml
+          git commit -m "Contain check-in photo reads inside media root [phase11]"
+          git push origin HEAD:refactor/checkin-service-phase-11
