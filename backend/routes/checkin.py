@@ -35,8 +35,10 @@ from fastapi.responses import FileResponse, Response
 
 try:
     from .. import daily_plan_lib as dpl
+    from ..core.media_paths import resolve_owned_media_path
 except ImportError:
     import daily_plan_lib as dpl  # noqa: E402
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -928,12 +930,14 @@ def create_checkin_router(deps: CheckinRouteDeps):
             raise HTTPException(404, "Сессия не найдена")
         if role != 'owner' and str(session.get('user_id')) != str(user['id']):
             raise HTTPException(403, "Нет доступа к фото этой смены")
+        if which not in {'start', 'finish'}:
+            raise HTTPException(404, "Фото не найдено")
         key = 'start_photos' if which == 'start' else 'finish_photos'
         photos = session.get(key, [])
-        if index < 0 or index >= len(photos):
+        if not isinstance(photos, list) or index < 0 or index >= len(photos):
             raise HTTPException(404, "Фото не найдено")
-        path = os.path.join(deps.checkin_photo_base(), photos[index])
-        if not os.path.exists(path):
+        path = resolve_owned_media_path(deps.checkin_photo_base(), photos[index])
+        if not path or not os.path.isfile(path):
             raise HTTPException(404, "Файл отсутствует")
         return FileResponse(path)
 
