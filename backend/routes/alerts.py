@@ -8,6 +8,11 @@ from typing import Any, Callable
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
+try:
+    from ..core.storage import update_json_transaction
+except ImportError:
+    from core.storage import update_json_transaction  # noqa: E402
+
 
 class AlertDismissBody(BaseModel):
     alert_ids: list[str]
@@ -202,12 +207,15 @@ def create_alerts_router(deps: AlertsDeps) -> tuple[APIRouter, AlertsHandlers]:
         body: AlertDismissBody,
         user: dict = Depends(deps.get_current_user),
     ):
-        data = load_alert_dismissals()
-        entry = data.setdefault(str(user['id']), {})
+        uid = str(user['id'])
         now = int(time.time())
-        for alert_id in body.alert_ids:
-            entry[alert_id] = now
-        save_alert_dismissals(data)
+
+        def _mutate(data: dict):
+            entry = data.setdefault(uid, {})
+            for alert_id in body.alert_ids:
+                entry[alert_id] = now
+
+        update_json_transaction(deps.alert_dismissals_file(), {}, _mutate)
         return {'ok': True}
 
     return router, AlertsHandlers(

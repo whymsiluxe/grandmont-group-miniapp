@@ -17,6 +17,11 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from starlette.responses import FileResponse
 
+try:
+    from ..core.media_paths import resolve_owned_media_path
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 
@@ -232,8 +237,8 @@ def create_mangel_router(deps: MangelRouteDeps) -> tuple[APIRouter, MangelHandle
             ):
                 raise HTTPException(403, "Нет доступа к этому файлу")
 
-        path = os.path.join(deps.photo_dir(), safe_name)
-        if not os.path.exists(path):
+        path = resolve_owned_media_path(deps.photo_dir(), safe_name)
+        if not path or not os.path.exists(path):
             raise HTTPException(404, "Файл отсутствует")
         return FileResponse(path)
 

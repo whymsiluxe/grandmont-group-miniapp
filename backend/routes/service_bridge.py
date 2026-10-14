@@ -132,17 +132,24 @@ def create_service_bridge_router(deps: ServiceBridgeRouteDeps):
         return _build_plan_response(str(telegram_user_id), target_date.strftime('%Y-%m-%d'))
 
     @router.post("/api/bridge/daily-plan/{plan_id}/accept", dependencies=[Depends(verify_service_token)])
-    def bridge_accept_plan(plan_id: str, telegram_user_id: str):
-        """Same semantics as POST /api/daily-plan/{id}/accept — CRM's
-        "ПЛАН ПОНЯТЕН — БЕРУ В РАБОТУ" action must create/update this exact
-        acceptance record, not a CRM-local copy, so Mini App sees it
-        immediately and vice versa."""
+    def bridge_accept_plan(plan_id: str, telegram_user_id: str, plan_version: int | None = None):
+        """Accept the exact plan version the caller actually displayed.
+
+        CRM sends ``plan_version`` from its PlanAcceptIn body. Older/native
+        Mini App callers may omit it and retain the historical behaviour of
+        accepting the current version. Supplying a stale version is never
+        silently upgraded: daily_plan_lib raises StaleAcceptanceError and the
+        bridge returns HTTP 409 so the caller can reload the changed plan.
+        """
         _require_known_worker(telegram_user_id)
         plan = dpl.get_plan(plan_id)
         if not plan:
             raise HTTPException(404, "План не найден")
+        if plan_version is not None and plan_version < 1:
+            raise HTTPException(400, "plan_version должен быть >= 1")
+        expected_version = plan["version"] if plan_version is None else plan_version
         try:
-            acceptance = dpl.accept_plan(plan_id, plan["version"], str(telegram_user_id))
+            acceptance = dpl.accept_plan(plan_id, expected_version, str(telegram_user_id))
         except PermissionError:
             raise HTTPException(403, "Работник не назначен на этот план")
         except dpl.StaleAcceptanceError as e:
