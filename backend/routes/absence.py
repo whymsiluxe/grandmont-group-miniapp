@@ -7,6 +7,7 @@ and temporarily re-exports handler aliases for legacy direct-call callers/tests.
 from __future__ import annotations
 
 import calendar
+import logging
 import time
 import uuid
 from dataclasses import dataclass
@@ -15,6 +16,9 @@ from typing import Any, Callable, Collection
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+
+
+logger = logging.getLogger(__name__)
 
 
 class AbwesenheitBody(BaseModel):
@@ -228,15 +232,27 @@ def create_absence_router(deps: AbsenceRouteDeps) -> tuple[APIRouter, AbsenceHan
 
         entry = deps.update_json_transaction(deps.absence_file(), [], _mutate)
         notify_worker_abwesenheit_decision(entry)
-        deps.create_critical_alert(
-            target_user_id=entry["user_id"],
-            kind="abwesenheit_decision",
-            title=(
-                f"Отсутствие {entry['date_from']}—{entry['date_to']}: "
-                f"{'одобрено' if body.status == 'approved' else 'не одобрено'}"
-            ),
-            ref_id=entry.get("id", ""),
-        )
+        try:
+            deps.create_critical_alert(
+                target_user_id=entry["user_id"],
+                kind="abwesenheit_decision",
+                title=(
+                    f"Отсутствие {entry['date_from']}—{entry['date_to']}: "
+                    f"{'одобрено' if body.status == 'approved' else 'не одобрено'}"
+                ),
+                ref_id=entry.get("id", ""),
+            )
+        except Exception:
+            # The absence decision is already durably committed. Critical-alert
+            # fan-out is secondary and must not turn that decision into a false 500.
+            logger.exception(
+                "Failed to create critical alert after absence decision commit",
+                extra={
+                    "entry_id": entry.get("id"),
+                    "target_user_id": entry.get("user_id"),
+                    "status": body.status,
+                },
+            )
         return entry
 
     @router.patch("/api/abwesenheit/{entry_id}")
