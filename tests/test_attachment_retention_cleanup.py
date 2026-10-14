@@ -1,32 +1,11 @@
-"""cleanup_old_attachments.cleanup_dir() -- retention-by-age безопасность
-(hardening Этап 0.5, п.4 "voice cleanup").
+"""cleanup_old_attachments cleanup behavior and retention coverage guards.
 
-Контекст (аудит этой сессии): изначальный план ожидал "временный voice-файл,
-удаляемый сразу после транскрипции". Реальная архитектура другая и это
-осознанное продуктовое решение, задокументированное в
-docs/plan-phases/02-product-flows-worker.md:37 -- owner explicit correction:
-"транскрибация может быть хуёвой", голосовые (transcribe_audio/ и
-chat_attachments/) хранятся ПОСТОЯННО, не как temp-файлы, юзер должен мочь
-переслушать оригинал. Поэтому тестировать "хендлер не оставляет файл" было
-бы тестом неверной предпосылки.
-
-Единственная реальная страховка от бесконечного роста этих папок --
-периодический cleanup_old_attachments.py по возрасту (RETENTION_DAYS=90).
-Этот файл тестирует именно его.
-
-НАЙДЕННЫЙ ПРИ АУДИТЕ ПРОБЕЛ (задокументирован, не тихо исправлен -- см.
-CLAUDE.md репозитория "No silent security fixes"): DIRS в
-cleanup_old_attachments.py покрывает chat_attachments/critical_alert_photos/
-checkin_photos, но НЕ transcribe_audio/ -- при том что
-docs/DATA_RETENTION_POLICY.md:31 заявляет 90-дневный retention и для
-voice/transcription audio. test_transcribe_audio_dir_not_yet_covered_by_cleanup
-ниже фиксирует ЭТОТ текущий (неполный) охват как явный факт, а не молчаливое
-допущение -- если кто-то добавит transcribe_audio/ в DIRS, тест нужно
-обновить осознанно, не будет падать незаметно.
-
-Run:
-    /home/promonta/agent/miniapp/.venv/bin/python3 -m unittest tests.test_attachment_retention_cleanup -v
+The configured retention period and covered data categories are policy choices.
+These tests exercise the currently configured cleanup without expanding the set
+of automatically deleted live-data categories.
 """
+import errno
+import io
 import os
 import sys
 import tempfile
@@ -59,7 +38,6 @@ class CleanupDirTests(unittest.TestCase):
             fpath = os.path.join(tmp, 'fresh.jpg')
             with open(fpath, 'wb') as f:
                 f.write(b'x')
-            # mtime = now, well inside retention window
 
             removed = cleanup.cleanup_dir(tmp)
 
@@ -70,9 +48,7 @@ class CleanupDirTests(unittest.TestCase):
         removed = cleanup.cleanup_dir('/no/such/grandmont-group/dir')
         self.assertEqual(removed, 0)
 
-    def test_unremovable_file_does_not_abort_the_whole_pass(self):
-        # OSError on one file (e.g. permission, race with another deleter)
-        # must not stop cleanup of the rest of the directory.
+    def test_unremovable_file_is_reported_without_aborting_the_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_time = cleanup.CUTOFF - DAY
             paths = []
@@ -90,28 +66,87 @@ class CleanupDirTests(unittest.TestCase):
                     raise OSError('simulated permission error')
                 return real_remove(path)
 
+            errors = []
             with patch.object(cleanup.os, 'remove', side_effect=flaky_remove):
-                removed = cleanup.cleanup_dir(tmp)
+                removed = cleanup.cleanup_dir(tmp, errors=errors)
 
-            self.assertEqual(removed, 1)  # only b.jpg counted
-            self.assertTrue(os.path.exists(paths[0]))  # a.jpg survived the error
-            self.assertFalse(os.path.exists(paths[1]))  # b.jpg still removed
+            self.assertEqual(removed, 1)
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0][0], paths[0])
+            self.assertIn('simulated permission error', errors[0][1])
+            self.assertTrue(os.path.exists(paths[0]))
+            self.assertFalse(os.path.exists(paths[1]))
+
+    def test_walk_error_is_reported(self):
+        errors = []
+
+        def fake_walk(path, onerror=None):
+            locked = os.path.join(path, 'locked')
+            exc = PermissionError(errno.EACCES, 'simulated scandir failure', locked)
+            if onerror:
+                onerror(exc)
+            return []
+
+        with patch.object(cleanup.os.path, 'isdir', return_value=True), patch.object(
+            cleanup.os, 'walk', side_effect=fake_walk
+        ):
+            removed = cleanup.cleanup_dir('/retained', errors=errors)
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0][0], '/retained/locked')
+        self.assertIn('simulated scandir failure', errors[0][1])
+
+
+class CleanupMainObservabilityTests(unittest.TestCase):
+    def test_main_returns_nonzero_and_does_not_claim_ok_on_filesystem_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fpath = os.path.join(tmp, 'old.jpg')
+            with open(fpath, 'wb') as f:
+                f.write(b'x')
+            old_time = cleanup.CUTOFF - DAY
+            os.utime(fpath, (old_time, old_time))
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch.object(cleanup, 'DIRS', [tmp]), patch.object(
+                cleanup.os, 'remove', side_effect=OSError('permission denied')
+            ), patch('sys.stdout', stdout), patch('sys.stderr', stderr):
+                result = cleanup.main()
+
+            self.assertEqual(result, 1)
+            self.assertNotIn('OK: nothing to clean', stdout.getvalue())
+            self.assertIn('ERROR: cleanup failed for', stderr.getvalue())
+            self.assertIn('permission denied', stderr.getvalue())
+            self.assertIn('cleanup incomplete', stderr.getvalue())
+
+    def test_main_returns_zero_when_nothing_needs_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch.object(cleanup, 'DIRS', [tmp]), patch(
+                'sys.stdout', stdout
+            ), patch('sys.stderr', stderr):
+                result = cleanup.main()
+
+            self.assertEqual(result, 0)
+            self.assertIn('OK: nothing to clean', stdout.getvalue())
+            self.assertEqual(stderr.getvalue(), '')
 
 
 class RetentionCoverageGapTests(unittest.TestCase):
     def test_transcribe_audio_dir_not_yet_covered_by_cleanup(self):
-        """Документирует текущий (неполный) охват DIRS -- см. docstring файла.
+        """Keep draft retention categories out of automatic deletion by accident.
 
-        Если это когда-нибудь станет False (transcribe_audio/ добавлена в
-        DIRS), тест начнёт падать -- это ЖЕЛАТЕЛЬНО: значит кто-то осознанно
-        закрыл retention-пробел и должен обновить этот тест, а не наоборот
-        (пробел тихо остаётся закрытым в docs, но не в коде)."""
+        ``docs/DATA_RETENTION_POLICY.md`` explicitly marks its periods as a draft
+        needing owner/legal review.  If transcribe_audio is deliberately added to
+        automatic cleanup, update the policy decision and this guard together.
+        """
         covered_basenames = {os.path.basename(d.rstrip('/')) for d in cleanup.DIRS}
         self.assertNotIn(
             'transcribe_audio', covered_basenames,
-            "transcribe_audio/ теперь покрыта cleanup_old_attachments.DIRS -- "
-            "отлично, но тогда обнови docs/DATA_RETENTION_POLICY.md и удали "
-            "этот guard-тест, он больше не нужен."
+            "transcribe_audio/ is now auto-deleted; record the retention-policy "
+            "decision and update this guard intentionally."
         )
 
 
