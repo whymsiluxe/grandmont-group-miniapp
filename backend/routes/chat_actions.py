@@ -7,7 +7,6 @@ back to the monolith is allowed.
 from __future__ import annotations
 
 import math
-import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -16,6 +15,11 @@ from typing import Any, Callable
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
+try:
+    from ..core.media_paths import resolve_owned_media_path
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
 
 from .chat import ChatHandlers
 
@@ -143,29 +147,34 @@ def create_chat_actions_router(
         user: dict = Depends(deps.get_current_user),
         role: str = Depends(deps.get_role),
     ):
-        safe_fname = os.path.basename(fname)
-        if safe_fname != fname:
+        messages = core.load_chat() + deps.safe_load_json(deps.chat_archive_file(), [])
+        candidates = [
+            message
+            for message in messages
+            if (message.get('attachment') or {}).get('file') == fname
+        ]
+        if not candidates:
             raise HTTPException(404, "Файл не найден")
-        path = os.path.join(deps.chat_attach_dir(), safe_fname)
-        if not os.path.exists(path):
-            raise HTTPException(404, "Файл не найден")
+
         if role != 'owner':
-            messages = core.load_chat() + deps.safe_load_json(deps.chat_archive_file(), [])
-            candidates = [m for m in messages if (m.get('attachment') or {}).get('file') == safe_fname]
-            if not candidates:
-                raise HTTPException(404, "Файл не найден")
             uid = str(user['id'])
-            allowed = False
-            for msg in candidates:
-                try:
-                    check_message_access(msg, uid, role)
-                    allowed = True
-                    break
-                except HTTPException:
-                    continue
-            if not allowed:
+            if not any(
+                _message_accessible(message, uid, role)
+                for message in candidates
+            ):
                 raise HTTPException(403, "Нет доступа к этому файлу")
+
+        path = resolve_owned_media_path(deps.chat_attach_dir(), fname)
+        if not path:
+            raise HTTPException(404, "Файл не найден")
         return FileResponse(path, headers={'X-Content-Type-Options': 'nosniff'})
+
+    def _message_accessible(message: dict, uid: str, role: str) -> bool:
+        try:
+            check_message_access(message, uid, role)
+            return True
+        except HTTPException:
+            return False
 
     @router.post('/api/manager/broadcast')
     def send_manager_broadcast(
