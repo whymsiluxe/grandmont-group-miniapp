@@ -19,6 +19,7 @@ import asyncio
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 
@@ -46,14 +47,18 @@ class ObjectAccessScopeTests(unittest.TestCase):
         self.assertFalse(backend.can_access_object({'id': 12345}, 'worker', 'OBJ-DOES-NOT-EXIST'))
 
     def test_worker_allowed_for_assigned_object(self):
-        assignments = backend._load_assignments()
-        for object_id, entries in assignments.items():
-            for entry in entries:
-                uid = entry.get('user_id')
-                if uid:
-                    self.assertTrue(backend.can_access_object({'id': uid}, 'worker', object_id))
-                    return
-        self.skipTest('no real assignment found in object_assignments.json to test against')
+        # Regression must never depend on production/object_assignments.json
+        # containing a convenient live row. A legacy accepted assignment without
+        # date bounds is intentionally treated as active by has_active_object_access.
+        fixture = {
+            'OBJ-FIXTURE': [
+                {'user_id': '12345', 'status': 'accepted'},
+            ]
+        }
+        with patch.object(backend, '_load_assignments', return_value=fixture):
+            self.assertTrue(
+                backend.can_access_object({'id': 12345}, 'worker', 'OBJ-FIXTURE')
+            )
 
 
 class CheckinStartRequiresGeoTests(unittest.TestCase):

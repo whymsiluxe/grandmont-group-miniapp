@@ -7,6 +7,26 @@ _RUNTIME_MANIFEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=manifest.sh
 source "${_RUNTIME_MANIFEST_DIR}/manifest.sh"
 
+# JSON persistence uses process-local locks. Until PostgreSQL replaces these
+# stores, production MUST stay single-worker. deploy.sh always sources this file
+# before touching production, so fail closed if the systemd unit drifts to a
+# multi-worker/reload configuration. Other consumers (rollback/tests) only get
+# the helper functions below and do not query systemd.
+if [[ "${BASH_SOURCE[1]:-}" == *"/deploy.sh" ]]; then
+  _runtime_service_name="${GRANDMONT_GROUP_SERVICE_NAME:-grandmont-group-miniapp.service}"
+  if ! _runtime_exec_start="$(systemctl show "$_runtime_service_name" -p ExecStart --value)"; then
+    echo "ОШИБКА: не удалось прочитать ExecStart для $_runtime_service_name" >&2
+    return 1
+  fi
+  if ! _runtime_environment="$(systemctl show "$_runtime_service_name" -p Environment --value)"; then
+    echo "ОШИБКА: не удалось прочитать Environment для $_runtime_service_name" >&2
+    return 1
+  fi
+  bash "${_RUNTIME_MANIFEST_DIR}/assert_single_worker.sh" \
+    "$_runtime_exec_start" "$_runtime_environment"
+  unset _runtime_service_name _runtime_exec_start _runtime_environment
+fi
+
 BACKEND_RUNTIME_ENTRIES=("__init__.py" "main.py")
 BACKEND_RUNTIME_ENTRIES+=("${BACKEND_PY_LIBS[@]}")
 BACKEND_RUNTIME_ENTRIES+=("${BACKEND_CORE_DIR}/")
