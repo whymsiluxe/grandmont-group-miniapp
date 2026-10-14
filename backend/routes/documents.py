@@ -13,8 +13,10 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 try:
+    from ..core.media_paths import resolve_owned_media_path
     from ..core.object_info_store import ObjectInfoStore
 except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
     from core.object_info_store import ObjectInfoStore  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -39,25 +41,6 @@ class DocumentsHandlers:
     upload_object_document: Callable[..., Any]
     delete_object_document: Callable[..., dict]
     get_object_document_file: Callable[..., Any]
-
-
-def _contained_document_path(base_dir: str, file_name: str) -> str | None:
-    """Return a path inside ``base_dir`` or ``None`` for unsafe legacy metadata.
-
-    Uploaded document names are server-generated basenames.  Older/corrupt JSON
-    metadata is nevertheless treated as untrusted so serving/deletion can never
-    escape the document directory via ``..`` or an absolute path.
-    """
-    if not file_name or os.path.basename(file_name) != file_name:
-        return None
-    base_real = os.path.realpath(base_dir)
-    candidate = os.path.realpath(os.path.join(base_real, file_name))
-    try:
-        if os.path.commonpath([base_real, candidate]) != base_real:
-            return None
-    except ValueError:
-        return None
-    return candidate
 
 
 def create_documents_router(deps: DocumentsRouteDeps) -> tuple[APIRouter, DocumentsHandlers]:
@@ -95,7 +78,7 @@ def create_documents_router(deps: DocumentsRouteDeps) -> tuple[APIRouter, Docume
         content_type = detected
         ext = ".pdf" if detected == "application/pdf" else "." + deps.allowed_image_mime_ext[detected]
         fname = f"{uuid.uuid4().hex}{ext}"
-        file_path = _contained_document_path(deps.object_doc_dir(), fname)
+        file_path = resolve_owned_media_path(deps.object_doc_dir(), fname)
         if file_path is None:  # defensive: server-generated fname should always pass
             raise HTTPException(500, "Некорректный путь документа")
         with open(file_path, "wb") as output:
@@ -174,12 +157,14 @@ def create_documents_router(deps: DocumentsRouteDeps) -> tuple[APIRouter, Docume
             return doc
 
         doc = deps.update_json_transaction(deps.store.file_path(), {}, _mutator)
-        file_path = _contained_document_path(deps.object_doc_dir(), str(doc.get("file") or ""))
+        file_path = resolve_owned_media_path(
+            deps.object_doc_dir(), str(doc.get("file") or "")
+        )
         # Metadata deletion is the primary durable operation. Once it commits the
         # document is no longer reachable through the API. A filesystem cleanup
         # failure must not turn that committed delete into a false 500/404 retry
         # loop; leave an orphan for retention cleanup and log it explicitly.
-        if file_path and os.path.exists(file_path):
+        if file_path and os.path.isfile(file_path):
             try:
                 os.remove(file_path)
             except OSError:
@@ -209,8 +194,8 @@ def create_documents_router(deps: DocumentsRouteDeps) -> tuple[APIRouter, Docume
         )
         if not doc:
             raise HTTPException(404, "Файл не найден")
-        path = _contained_document_path(deps.object_doc_dir(), fname)
-        if path is None or not os.path.exists(path):
+        path = resolve_owned_media_path(deps.object_doc_dir(), fname)
+        if path is None or not os.path.isfile(path):
             raise HTTPException(404, "Файл не найден")
         return FileResponse(path, media_type=doc.get("content_type") or None)
 

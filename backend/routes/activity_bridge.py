@@ -17,6 +17,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+try:
+    from ..core.media_paths import resolve_owned_media_path
+    from ..core.storage import update_json_transaction
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+    from core.storage import update_json_transaction  # noqa: E402
+
 
 class ActivityReadBody(BaseModel):
     kind: str
@@ -137,51 +144,50 @@ def create_activity_bridge_router(
     ):
         if not recipients:
             return
-        items = load_activity_alerts()
-        existing = {
-            (item.get('target_user_id'), item.get('comment_id')) for item in items
-        }
         now = int(time.time())
-        changed = False
-        for uid in recipients:
-            if (str(uid), comment_id) in existing:
-                continue
-            items.append({
-                'id': uuid.uuid4().hex,
-                'target_user_id': str(uid),
-                'kind': kind,
-                'ref_id': str(ref_id),
-                'comment_id': comment_id,
-                'actor_id': str(actor_id),
-                'actor_name': actor_name,
-                'title': title,
-                'subtitle': subtitle,
-                'created_at': now,
-                'read_at': None,
-            })
-            changed = True
-        if changed:
-            save_activity_alerts(items)
+
+        def _mutate(items: list):
+            existing = {
+                (item.get('target_user_id'), item.get('comment_id')) for item in items
+            }
+            for uid in recipients:
+                if (str(uid), comment_id) in existing:
+                    continue
+                items.append({
+                    'id': uuid.uuid4().hex,
+                    'target_user_id': str(uid),
+                    'kind': kind,
+                    'ref_id': str(ref_id),
+                    'comment_id': comment_id,
+                    'actor_id': str(actor_id),
+                    'actor_name': actor_name,
+                    'title': title,
+                    'subtitle': subtitle,
+                    'created_at': now,
+                    'read_at': None,
+                })
+
+        update_json_transaction(deps.activity_alerts_file(), [], _mutate)
 
     @router.post('/api/activity-alerts/read')
     def mark_activity_alerts_read(
         body: ActivityReadBody,
         user: dict = Depends(deps.get_current_user),
     ):
-        items = load_activity_alerts()
         now = int(time.time())
-        changed = False
-        for item in items:
-            if (
-                item.get('target_user_id') == str(user['id'])
-                and item.get('kind') == body.kind
-                and item.get('ref_id') == str(body.ref_id)
-                and not item.get('read_at')
-            ):
-                item['read_at'] = now
-                changed = True
-        if changed:
-            save_activity_alerts(items)
+        uid = str(user['id'])
+
+        def _mutate(items: list):
+            for item in items:
+                if (
+                    item.get('target_user_id') == uid
+                    and item.get('kind') == body.kind
+                    and item.get('ref_id') == str(body.ref_id)
+                    and not item.get('read_at')
+                ):
+                    item['read_at'] = now
+
+        update_json_transaction(deps.activity_alerts_file(), [], _mutate)
         return {'status': 'ok'}
 
     @router.post('/api/comments/forward')
@@ -274,8 +280,8 @@ def create_activity_bridge_router(
         files = entry.get('files') or ([entry['file']] if entry.get('file') else [])
         if index < 0 or index >= len(files):
             raise HTTPException(404, 'Файл не найден по этому индексу')
-        path = os.path.join(deps.photo_dir(), files[index])
-        if not os.path.exists(path):
+        path = resolve_owned_media_path(deps.photo_dir(), str(files[index] or ''))
+        if not path or not os.path.isfile(path):
             raise HTTPException(404, 'Файл отсутствует')
         return FileResponse(path)
 
