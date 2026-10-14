@@ -129,8 +129,9 @@ class ChatStorageService:
         """Archive then remove active messages with retry-safe ordering.
 
         If archive succeeds and active save fails, the message remains active and
-        retrying is safe because archive_messages is idempotent.  We therefore do
-        not lose a message across the two durable stores.
+        retrying is safe because archive_messages is idempotent.  Reaction cleanup
+        is secondary metadata, but its read-modify-write must share the same lock
+        as reaction mutations so it cannot erase a concurrent reaction.
         """
         if not message_ids:
             return 0
@@ -151,21 +152,21 @@ class ChatStorageService:
             ]
             self.save_chat(remaining)
 
-        try:
-            reactions = self.load_reactions()
-            remaining_reactions = [
-                reaction
-                for reaction in reactions
-                if str(reaction.get("message_id")) not in message_ids
-            ]
-            if len(remaining_reactions) != len(reactions):
-                self.save_reactions(remaining_reactions)
-        except Exception:
-            # Message deletion is already durable.  Stale reaction rows are
-            # secondary metadata and must not turn a completed delete into a
-            # false 500/retry loop.
-            logger.exception(
-                "Failed to clean chat reactions after durable message deletion",
-                extra={"message_ids": sorted(message_ids)},
-            )
+            try:
+                reactions = self.load_reactions()
+                remaining_reactions = [
+                    reaction
+                    for reaction in reactions
+                    if str(reaction.get("message_id")) not in message_ids
+                ]
+                if len(remaining_reactions) != len(reactions):
+                    self.save_reactions(remaining_reactions)
+            except Exception:
+                # Message deletion is already durable.  Stale reaction rows are
+                # secondary metadata and must not turn a completed delete into a
+                # false 500/retry loop.
+                logger.exception(
+                    "Failed to clean chat reactions after durable message deletion",
+                    extra={"message_ids": sorted(message_ids)},
+                )
         return len(targets)
