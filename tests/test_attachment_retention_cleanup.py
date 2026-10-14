@@ -4,6 +4,7 @@ The configured retention period and covered data categories are policy choices.
 These tests exercise the currently configured cleanup without expanding the set
 of automatically deleted live-data categories.
 """
+import errno
 import io
 import os
 import sys
@@ -80,8 +81,8 @@ class CleanupDirTests(unittest.TestCase):
         errors = []
 
         def fake_walk(path, onerror=None):
-            exc = PermissionError('simulated scandir failure')
-            exc.filename = os.path.join(path, 'locked')
+            locked = os.path.join(path, 'locked')
+            exc = PermissionError(errno.EACCES, 'simulated scandir failure', locked)
             if onerror:
                 onerror(exc)
             return []
@@ -92,7 +93,9 @@ class CleanupDirTests(unittest.TestCase):
             removed = cleanup.cleanup_dir('/retained', errors=errors)
 
         self.assertEqual(removed, 0)
-        self.assertEqual(errors, [('/retained/locked', 'simulated scandir failure')])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0][0], '/retained/locked')
+        self.assertIn('simulated scandir failure', errors[0][1])
 
 
 class CleanupMainObservabilityTests(unittest.TestCase):
