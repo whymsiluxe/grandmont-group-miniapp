@@ -21,6 +21,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 import re
 import time
@@ -33,10 +34,16 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 
+logger = logging.getLogger(__name__)
+
 try:
     from .. import daily_plan_lib as dpl
+    from ..core.media_paths import resolve_owned_media_path
+    from ..services.checkin_access import CheckinAccessDeps, CheckinAccessError, CheckinAccessService
 except ImportError:
     import daily_plan_lib as dpl  # noqa: E402
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+    from services.checkin_access import CheckinAccessDeps, CheckinAccessError, CheckinAccessService  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -86,6 +93,39 @@ class CheckinRouteDeps:
 
 def create_checkin_router(deps: CheckinRouteDeps):
     router = APIRouter()
+    access_service = CheckinAccessService(CheckinAccessDeps(
+        checkin_lock=deps.checkin_lock,
+        load_meta=deps.load_checkin_meta,
+        save_meta=deps.save_checkin_meta,
+        photo_base=deps.checkin_photo_base,
+        resolve_media_path=resolve_owned_media_path,
+        now_timestamp=lambda: int(time.time()),
+    ))
+
+    def call_access(method, *args, **kwargs):
+        try:
+            return method(*args, **kwargs)
+        except CheckinAccessError as exc:
+            raise HTTPException(exc.status_code, exc.detail) from exc
+
+    def _save_idempotency_response_after_commit(
+        key: str, response: dict, scope: dict, *, operation: str
+    ) -> None:
+        """Persist replay metadata without undoing an already-durable shift.
+
+        checkin_meta (and finish outbox where applicable) is the primary business
+        state. A failure in the secondary idempotency response store after that
+        commit must not turn a successful Start/Finish into a false 500. Retries
+        remain safe because session ids are deterministic for an idempotency scope.
+        """
+        try:
+            deps.idempotency_save(key, response, scope)
+        except Exception:
+            logger.exception(
+                'Check-in %s idempotency response persistence failed after durable commit: key=%s',
+                operation,
+                key,
+            )
 
     CHECKIN_EVENT_MAX_AGE_SECONDS = 7 * 24 * 3600
     CHECKIN_EVENT_FUTURE_SKEW_SECONDS = 5 * 60
@@ -360,7 +400,17 @@ def create_checkin_router(deps: CheckinRouteDeps):
                     deps.idempotency_release(idempotency_key, idempotency_scope)
                     raise HTTPException(409, f"У вас уже есть незавершённая смена на объекте {open_session['object_id']} — сначала завершите её")
                 items.append(entry)
-                deps.save_checkin_meta(items)
+                try:
+                    deps.save_checkin_meta(items)
+                except Exception:
+                    # Photo files are written before the metadata commit so async
+                    # file I/O stays outside checkin_lock. Atomic JSON persistence
+                    # has no fallible step after os.replace; therefore an exception
+                    # here means the new session was not committed and these files
+                    # are safe to remove.
+                    deps.cleanup_checkin_photo_files(photo_paths)
+                    deps.idempotency_release(idempotency_key, idempotency_scope)
+                    raise
 
         if existing_entry is None and photo_paths:
             try:
@@ -393,58 +443,15 @@ def create_checkin_router(deps: CheckinRouteDeps):
             print(f'WARNING: checkin-start finish-context prefetch failed: {e}')
             response['finish_context'] = None
 
-        deps.idempotency_save(idempotency_key, response, idempotency_scope)
+        _save_idempotency_response_after_commit(
+            idempotency_key, response, idempotency_scope, operation='start'
+        )
         return response
 
     @router.post("/api/checkin/{session_id}/pause")
     def checkin_pause(session_id: str, action: str = Query(''), user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
-        """Целевое управление паузой во время активной смены.
+        return call_access(access_service.pause_session, session_id, action, str(user['id']), role)
 
-        F08: это больше не toggle. Клиент обязан прислать action=pause|resume, чтобы
-        повтор того же запроса из-за retry/double delivery не перевернул состояние назад.
-        Клиент подставляет накопленные минуты как default в анкету при Финише, юзер может
-        доправить вручную если нужно."""
-        action_clean = str(action or '').strip().lower()
-        if action_clean not in {'pause', 'resume'}:
-            raise HTTPException(400, "action должен быть pause или resume")
-        with deps.checkin_lock:
-            items = deps.load_checkin_meta()
-            session = next((i for i in items if i.get('id') == session_id), None)
-            if not session:
-                raise HTTPException(404, "Сессия check-in не найдена")
-            if role != 'owner' and str(session.get('user_id')) != str(user['id']):
-                raise HTTPException(403, "Нельзя управлять чужой сменой")
-            if session.get('manual_entry'):
-                raise HTTPException(400, "Ручная запись времени не поддерживает паузу")
-            if session.get('finish_at') is not None:
-                raise HTTPException(400, "Смена уже завершена")
-
-            now = int(time.time())
-            changed = False
-            if action_clean == 'resume' and session.get('pause_started_at'):
-                # Продолжить — закрываем текущий отрезок паузы, добавляем в накопленное
-                elapsed = max(0, now - session['pause_started_at'])
-                session['pause_accumulated_seconds'] = session.get('pause_accumulated_seconds', 0) + elapsed
-                session['pause_started_at'] = None
-                paused = False
-                changed = True
-            elif action_clean == 'pause' and not session.get('pause_started_at'):
-                # Пауза — фиксируем момент начала
-                session['pause_started_at'] = now
-                paused = True
-                changed = True
-            else:
-                paused = bool(session.get('pause_started_at'))
-            if changed:
-                deps.save_checkin_meta(items)
-
-        return {
-            "action": action_clean,
-            "changed": changed,
-            "paused": paused,
-            "pause_accumulated_seconds": session['pause_accumulated_seconds'],
-            "pause_accumulated_minutes": round(session['pause_accumulated_seconds'] / 60),
-        }
 
     @router.post("/api/checkin/{session_id}/finish")
     async def checkin_finish(
@@ -548,7 +555,9 @@ def create_checkin_router(deps: CheckinRouteDeps):
                 # original result -- self-heal the durable store instead of erasing
                 # the caller's ability to see what actually happened.
                 if idempotency_key:
-                    deps.idempotency_save(idempotency_key, session, idempotency_scope)
+                    _save_idempotency_response_after_commit(
+                        idempotency_key, session, idempotency_scope, operation='finish'
+                    )
                     return session
                 deps.idempotency_release(idempotency_key, idempotency_scope)
                 raise HTTPException(400, "Смена уже завершена")
@@ -587,7 +596,9 @@ def create_checkin_router(deps: CheckinRouteDeps):
                 # attempt that lost this race already got its own finish committed by
                 # the other one; replay that result instead of erasing it.
                 if idempotency_key:
-                    deps.idempotency_save(idempotency_key, session, idempotency_scope)
+                    _save_idempotency_response_after_commit(
+                        idempotency_key, session, idempotency_scope, operation='finish'
+                    )
                     return session
                 deps.idempotency_release(idempotency_key, idempotency_scope)
                 raise HTTPException(400, "Смена уже завершена")
@@ -647,7 +658,15 @@ def create_checkin_router(deps: CheckinRouteDeps):
             # find a finished session with pending_execution_report set and no
             # outbox event, and rebuild the outbox entry from it.
             session['pending_execution_report'] = daily_plan_report.strip() or None
-            deps.save_checkin_meta(items)
+            try:
+                deps.save_checkin_meta(items)
+            except Exception:
+                # Same ordering as Start: finish photos exist before the atomic
+                # metadata write. If that write fails, finish_at was not committed,
+                # so retain no unreferenced binaries and release the claim for retry.
+                deps.cleanup_checkin_photo_files(photo_paths)
+                deps.idempotency_release(idempotency_key, idempotency_scope)
+                raise
 
         # Apply daily plan execution report via durable outbox.
         # Outbox event is written AFTER checkin_meta is committed and BEFORE apply_daily_execution,
@@ -818,7 +837,9 @@ def create_checkin_router(deps: CheckinRouteDeps):
                             f"📋 На завтра нужно ({object_id}): {next_day_needs.strip()[:300]}")
                     except Exception:
                         pass
-        deps.idempotency_save(idempotency_key, session, idempotency_scope)
+        _save_idempotency_response_after_commit(
+            idempotency_key, session, idempotency_scope, operation='finish'
+        )
         return session
 
     @router.get("/api/checkin/stundenzettel")
@@ -894,48 +915,20 @@ def create_checkin_router(deps: CheckinRouteDeps):
 
     @router.get("/api/checkin")
     def list_checkins(object_id: str = '', date: str = '', user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
-        items = deps.load_checkin_meta()
-        if role != 'owner':
-            # 10.29 (Fable-аудит): раньше worker видел GPS-координаты старта/финиша
-            # смены ВСЕХ коллег — только свои сессии.
-            items = [i for i in items if str(i.get('user_id')) == str(user['id'])]
-        if object_id:
-            items = [i for i in items if i['object_id'] == object_id]
-        if date:
-            items = [i for i in items if i['date'] == date]
-        # 28.07: voice_note_file_id -- отдаём готовый audio_url, фронтенду не нужно самому
-        # собирать путь (тот же паттерн, что /api/transcribe уже возвращает при записи).
-        for i in items:
-            if i.get('voice_note_file_id'):
-                i['voice_note_audio_url'] = f"/api/transcribe/{i['voice_note_file_id']}/audio"
-        return {"sessions": items}
+        return access_service.list_sessions(str(user['id']), role, object_id, date)
+
 
     @router.get("/api/checkin/{session_id}/finish-context")
     def checkin_finish_context(session_id: str, user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
-        items = deps.load_checkin_meta()
-        session = next((i for i in items if i.get('id') == session_id), None)
-        if not session:
-            raise HTTPException(404, "Сессия не найдена")
-        if role != 'owner' and str(session.get('user_id')) != str(user['id']):
-            raise HTTPException(403, "Нет доступа к этой смене")
+        session = call_access(access_service.get_accessible_session, session_id, str(user['id']), role)
         return _build_finish_context(session)
+
 
     @router.get("/api/checkin/{session_id}/photo/{which}/{index}")
     def get_checkin_photo(session_id: str, which: str, index: int, user: dict = Depends(deps.get_current_user), role: str = Depends(deps.get_role)):
-        items = deps.load_checkin_meta()
-        session = next((i for i in items if i.get('id') == session_id), None)
-        if not session:
-            raise HTTPException(404, "Сессия не найдена")
-        if role != 'owner' and str(session.get('user_id')) != str(user['id']):
-            raise HTTPException(403, "Нет доступа к фото этой смены")
-        key = 'start_photos' if which == 'start' else 'finish_photos'
-        photos = session.get(key, [])
-        if index < 0 or index >= len(photos):
-            raise HTTPException(404, "Фото не найдено")
-        path = os.path.join(deps.checkin_photo_base(), photos[index])
-        if not os.path.exists(path):
-            raise HTTPException(404, "Файл отсутствует")
+        path = call_access(access_service.photo_path, session_id, which, index, str(user['id']), role)
         return FileResponse(path)
+
 
     handlers = SimpleNamespace(
         checkin_start=checkin_start,

@@ -7,7 +7,6 @@ back to the monolith is allowed.
 from __future__ import annotations
 
 import math
-import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -16,6 +15,11 @@ from typing import Any, Callable
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
+try:
+    from ..core.media_paths import resolve_owned_media_path
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
 
 from .chat import ChatHandlers
 
@@ -143,29 +147,34 @@ def create_chat_actions_router(
         user: dict = Depends(deps.get_current_user),
         role: str = Depends(deps.get_role),
     ):
-        safe_fname = os.path.basename(fname)
-        if safe_fname != fname:
+        messages = core.load_chat() + deps.safe_load_json(deps.chat_archive_file(), [])
+        candidates = [
+            message
+            for message in messages
+            if (message.get('attachment') or {}).get('file') == fname
+        ]
+        if not candidates:
             raise HTTPException(404, "Файл не найден")
-        path = os.path.join(deps.chat_attach_dir(), safe_fname)
-        if not os.path.exists(path):
-            raise HTTPException(404, "Файл не найден")
+
         if role != 'owner':
-            messages = core.load_chat() + deps.safe_load_json(deps.chat_archive_file(), [])
-            candidates = [m for m in messages if (m.get('attachment') or {}).get('file') == safe_fname]
-            if not candidates:
-                raise HTTPException(404, "Файл не найден")
             uid = str(user['id'])
-            allowed = False
-            for msg in candidates:
-                try:
-                    check_message_access(msg, uid, role)
-                    allowed = True
-                    break
-                except HTTPException:
-                    continue
-            if not allowed:
+            if not any(
+                _message_accessible(message, uid, role)
+                for message in candidates
+            ):
                 raise HTTPException(403, "Нет доступа к этому файлу")
+
+        path = resolve_owned_media_path(deps.chat_attach_dir(), fname)
+        if not path:
+            raise HTTPException(404, "Файл не найден")
         return FileResponse(path, headers={'X-Content-Type-Options': 'nosniff'})
+
+    def _message_accessible(message: dict, uid: str, role: str) -> bool:
+        try:
+            check_message_access(message, uid, role)
+            return True
+        except HTTPException:
+            return False
 
     @router.post('/api/manager/broadcast')
     def send_manager_broadcast(
@@ -356,13 +365,9 @@ def create_chat_actions_router(
                 raise HTTPException(404, 'Сообщение не найдено')
             if role != 'owner' and target['user_id'] != user['id']:
                 raise HTTPException(403, 'Можно удалять только свои сообщения')
-            messages = [m for m in messages if m['id'] != msg_id]
-            core.save_chat(messages)
-        core.archive_chat_messages([target])
-        reactions = core.load_chat_reactions()
-        remaining = [r for r in reactions if r['message_id'] != msg_id]
-        if len(remaining) != len(reactions):
-            core.save_chat_reactions(remaining)
+        deleted = core.delete_messages_by_ids({msg_id})
+        if not deleted:
+            raise HTTPException(404, 'Сообщение не найдено')
         return {'status': 'ok'}
 
     @router.delete('/api/chat/threads')
@@ -378,7 +383,6 @@ def create_chat_actions_router(
             messages = core.load_chat()
             if thread_key:
                 to_delete = [m for m in messages if m.get('thread_key') == thread_key]
-                remaining = [m for m in messages if m.get('thread_key') != thread_key]
             else:
                 core.reject_self_chat(user['id'], with_)
                 core.validate_dm_recipient(with_)
@@ -388,16 +392,9 @@ def create_chat_actions_router(
                     if not m.get('thread_key')
                     and core.chat_thread_id(m.get('user_id'), m.get('to_user_id')) == target_thread_id
                 ]
-                deleted_ids = {m['id'] for m in to_delete}
-                remaining = [m for m in messages if m['id'] not in deleted_ids]
-            core.save_chat(remaining)
-        core.archive_chat_messages(to_delete)
-        deleted_ids = {m['id'] for m in to_delete}
-        reactions = core.load_chat_reactions()
-        remaining_reactions = [r for r in reactions if r['message_id'] not in deleted_ids]
-        if len(remaining_reactions) != len(reactions):
-            core.save_chat_reactions(remaining_reactions)
-        return {'status': 'ok', 'deleted_count': len(to_delete)}
+        deleted_ids = {str(m['id']) for m in to_delete}
+        deleted_count = core.delete_messages_by_ids(deleted_ids)
+        return {'status': 'ok', 'deleted_count': deleted_count}
 
     @router.post('/api/chat/messages/{msg_id}/reactions')
     def toggle_chat_reaction(
@@ -473,12 +470,13 @@ def create_chat_actions_router(
         core.reject_self_chat(user['id'], body.to_user_id)
         core.validate_dm_recipient(body.to_user_id)
         thread_id = core.chat_thread_id(user['id'], body.to_user_id)
-        meta = core.load_chat_thread_meta()
-        thread_meta = meta.setdefault(thread_id, {})
-        thread_meta['closed'] = True
-        thread_meta['closed_at'] = int(time.time())
-        thread_meta['closed_by'] = str(user['id'])
-        core.save_chat_thread_meta(meta)
+        with core.chat_lock:
+            meta = core.load_chat_thread_meta()
+            thread_meta = meta.setdefault(thread_id, {})
+            thread_meta['closed'] = True
+            thread_meta['closed_at'] = int(time.time())
+            thread_meta['closed_by'] = str(user['id'])
+            core.save_chat_thread_meta(meta)
         for uid in chat_thread_participants(thread_id):
             if uid == str(user['id']):
                 continue
@@ -497,10 +495,11 @@ def create_chat_actions_router(
         core.reject_self_chat(user['id'], body.to_user_id)
         core.validate_dm_recipient(body.to_user_id)
         thread_id = core.chat_thread_id(user['id'], body.to_user_id)
-        meta = core.load_chat_thread_meta()
-        if thread_id in meta:
-            meta[thread_id]['closed'] = False
-            core.save_chat_thread_meta(meta)
+        with core.chat_lock:
+            meta = core.load_chat_thread_meta()
+            if thread_id in meta:
+                meta[thread_id]['closed'] = False
+                core.save_chat_thread_meta(meta)
         return {'status': 'ok', 'thread_id': thread_id}
 
     @router.get('/api/chat/threads/status')

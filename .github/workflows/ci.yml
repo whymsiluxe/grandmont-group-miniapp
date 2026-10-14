@@ -29,11 +29,11 @@ jobs:
         run: pip install -r requirements-test.txt
 
       - name: Ruff correctness check (extracted backend modules)
-        run: ruff check backend/core backend/routes --select F --output-format concise
+        run: ruff check backend/core backend/routes backend/services --select F --output-format concise
 
-      - name: Python syntax check (backend/*.py, backend/core/*.py, backend/routes/*.py, tests/*.py)
+      - name: Python syntax check (backend modules + tests)
         run: |
-          python -m py_compile backend/*.py backend/core/*.py backend/routes/*.py tests/*.py
+          python -m py_compile backend/*.py backend/core/*.py backend/routes/*.py backend/services/*.py tests/*.py
 
       - name: Verify backend/main.py importable in test environment
         run: |
@@ -57,6 +57,7 @@ jobs:
           cp backend/*.py /tmp/ci-pkgtest/miniapp/
           cp -r backend/core /tmp/ci-pkgtest/miniapp/
           cp -r backend/routes /tmp/ci-pkgtest/miniapp/
+          cp -r backend/services /tmp/ci-pkgtest/miniapp/
           cd /tmp/ci-pkgtest && python -c "
           import sys
           sys.path.insert(0, '.')
@@ -104,13 +105,6 @@ jobs:
 
       - name: Guard against work-type catalog duplication (01.08)
         run: |
-          # 01.08 (единый каталог видов работ): backend/work_types.py -- ЕДИНСТВЕННЫЙ
-          # источник истины. Раньше один и тот же список навыков был вручную продублирован
-          # в main.py + 2 frontend-файлах, что дало реальный дрифт (SKILL_STAGE_MAP
-          # покрывал только 8 из 19 навыков). Эта проверка ловит повторное появление
-          # статичного списка ВНЕ work_types.py -- любой JS-файл с массивом из 15+
-          # захардкоженных строк-навыков (тот же класс паттерна, что были ONBOARDING_GROUPS/
-          # BUBBLE_STAGE_OPTIONS/SKILL_STAGE_MAP) считается регрессией.
           FOUND=0
           for f in frontend/js/*.js; do
             if grep -qE '(SKILL_OPTIONS|ONBOARDING_GROUPS|BUBBLE_STAGE_OPTIONS|SKILL_STAGE_MAP)\s*=' "$f"; then
@@ -123,8 +117,6 @@ jobs:
 
       - name: Check for obvious committed secrets
         run: |
-          # Ищем реальные значения секретов, не сами имена переменных (BOT_TOKEN=
-          # os.environ[...] -- нормальный код, BOT_TOKEN=123456:ABC-DEF... -- утечка).
           FOUND=0
           if grep -rEn 'BOT_TOKEN\s*=\s*["\x27][0-9]+:[A-Za-z0-9_-]{30,}' backend/ frontend/ 2>/dev/null; then FOUND=1; fi
           if grep -rEn '\-\-\-\-\-BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY\-\-\-\-\-' . --exclude-dir=.git 2>/dev/null; then FOUND=1; fi
@@ -153,12 +145,6 @@ jobs:
         run: node -e "require('pdfkit'); console.log('pdfkit OK')"
 
       - name: Notify Engineering Center on failure
-        # Reuses the SAME bot/chat as every grandmont-group-*.service on the VPS
-        # (see scripts/engineering-center.sh in engineering-os) -- GitHub Actions
-        # can't reach /etc/claude-agent.env directly, so the same two values are
-        # mirrored into this repo's Actions secrets (BOT_TOKEN_NOTIFY, CHAT_ID).
-        # Named BOT_TOKEN_NOTIFY (not BOT_TOKEN) to avoid colliding with this
-        # workflow's own existing dummy BOT_TOKEN env var above. No new bot.
         if: failure() && github.ref == 'refs/heads/main'
         env:
           BOT_TOKEN_NOTIFY: ${{ secrets.BOT_TOKEN_NOTIFY }}

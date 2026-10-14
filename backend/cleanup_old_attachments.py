@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Удаляет файлы вложений старше RETENTION_DAYS из папок chat_attachments/
-critical_alert_photos/checkin_photos — без этого лимита папки растут бесконечно
-(10.29, Fable-аудит). Запускается по systemd timer раз в сутки."""
+"""Delete retained attachment files older than ``RETENTION_DAYS``.
+
+Uses the same ``MINIAPP_DATA_ROOT`` contract as the application so the timer
+cannot silently clean a retired pre-rebrand serving path.
+"""
 import os
 import time
 
 RETENTION_DAYS = 90
 CUTOFF = time.time() - RETENTION_DAYS * 86400
+DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/grandmont/agent/miniapp')
 
 DIRS = [
-    '/home/promonta/agent/miniapp/chat_attachments',
-    '/home/promonta/agent/miniapp/critical_alert_photos',
-    '/home/promonta/agent/miniapp/checkin_photos',
+    os.path.join(DATA_ROOT, 'chat_attachments'),
+    os.path.join(DATA_ROOT, 'critical_alert_photos'),
+    os.path.join(DATA_ROOT, 'checkin_photos'),
 ]
 
 
@@ -19,7 +22,7 @@ def cleanup_dir(path):
     if not os.path.isdir(path):
         return 0
     removed = 0
-    for root, dirs, files in os.walk(path):
+    for root, _dirs, files in os.walk(path):
         for fname in files:
             fpath = os.path.join(root, fname)
             try:
@@ -33,11 +36,11 @@ def cleanup_dir(path):
 
 def main():
     total = 0
-    for d in DIRS:
-        n = cleanup_dir(d)
-        total += n
-        if n:
-            print(f'{d}: removed {n} files older than {RETENTION_DAYS}d')
+    for directory in DIRS:
+        removed = cleanup_dir(directory)
+        total += removed
+        if removed:
+            print(f'{directory}: removed {removed} files older than {RETENTION_DAYS}d')
     if not total:
         print('OK: nothing to clean')
 

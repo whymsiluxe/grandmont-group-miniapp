@@ -633,7 +633,7 @@ class ProductionPackageImportTests(unittest.TestCase):
                 src = os.path.join(backend_dir, fname)
                 if fname.endswith('.py'):
                     shutil.copy(src, pkg_dir)
-                elif os.path.isdir(src) and fname in ('core', 'routes'):
+                elif os.path.isdir(src) and fname in ('core', 'routes', 'services'):
                     # Phase A: backend/core/ subpackage must travel with main.py
                     # for `import miniapp.main` to resolve its `from core.time
                     # import ...` -- flat *.py copy alone misses subdirectories.
@@ -684,7 +684,7 @@ class ProductionPackageImportTests(unittest.TestCase):
                 src = os.path.join(backend_dir, fname)
                 if fname.endswith('.py'):
                     shutil.copy(src, pkg_dir)
-                elif os.path.isdir(src) and fname in ('core', 'routes'):
+                elif os.path.isdir(src) and fname in ('core', 'routes', 'services'):
                     # 25.09: routes/ (first router extraction) travels alongside
                     # core/ for the same reason -- main.py does
                     # app.include_router(...) from routes.auth.

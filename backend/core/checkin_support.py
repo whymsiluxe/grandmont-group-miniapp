@@ -8,6 +8,11 @@ from typing import Any, Callable
 
 from fastapi import HTTPException
 
+try:
+    from .media_paths import resolve_owned_media_path
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+
 
 @dataclass(frozen=True)
 class CheckinSupportDeps:
@@ -60,8 +65,11 @@ class CheckinSupportRuntime:
 
     def cleanup_photo_files(self, relative_paths: list) -> None:
         for rel_path in relative_paths:
+            path = resolve_owned_media_path(self.deps.photo_base(), rel_path)
+            if not path:
+                continue
             try:
-                os.remove(os.path.join(self.deps.photo_base(), rel_path))
+                os.remove(path)
             except OSError:
                 pass
 

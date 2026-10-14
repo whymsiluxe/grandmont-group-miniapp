@@ -70,9 +70,11 @@ class ObjectHistoryTests(unittest.TestCase):
         self.assertEqual(len(limited['history']), 1)
 
     def test_assignment_creation_appends_worker_assigned_history(self):
+        rows = [['ID объекта', 'Статус'], ['OBJ-1', 'В работе']]
         with self._profiles_patch(), \
              patch.object(backend, '_load_abwesenheit', return_value=[]), \
-             patch.object(backend, '_load_roles', return_value={'10': 'worker'}):
+             patch.object(backend, '_load_roles', return_value={'10': 'worker'}), \
+             patch.object(backend, '_cached_get_used_range', return_value=rows):
             body = backend.AssignBody(
                 user_id='10', work_type_id='tile_work',
                 date_from='2026-09-15', date_to='2026-09-16',

@@ -592,9 +592,15 @@ async def audit_log_middleware(request, call_next):
                 "status": response.status_code,
                 "rejected": response.status_code >= 400,
             }
-            with AUDIT_LOCK:
-                with open(AUDIT_FILE, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            try:
+                with AUDIT_LOCK:
+                    with open(AUDIT_FILE, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except OSError as exc:
+                # The business handler already produced its response. Audit persistence
+                # is observability, not a second transaction boundary: never turn an
+                # already-committed mutation into a client-visible 500.
+                print(f"[audit] failed to append {AUDIT_FILE}: {exc}")
 
         return response
     finally:
@@ -791,86 +797,76 @@ except ImportError:
     from routes.auth import list_roles, set_role, revoke_role  # noqa: E402
 
 
-# 30.07 (Release-аудит Этап 6): commit SHA для /api/health читается из файла рядом
-# с main.py, который пишет deploy-скрипт при выкладке -- НЕ subprocess'ом git на
-# каждый health-запрос (дорого, плюс serving-путь /home/promonta/agent/miniapp/
-# не является git-репозиторием, git там просто не сработает). Файл опционален --
-# если деплой был сделан вручную без записи VERSION, health всё равно отвечает,
-# просто без SHA.
-# moved to core/paths.py -- APP_VERSION_FILE
+# System status and identity/session routes live outside the composition root.
+# main.py only wires runtime collaborators and preserves legacy direct-call aliases.
+try:
+    from .routes.system import SystemDeps, create_system_router
+    from .routes.session_identity import SessionIdentityDeps, create_session_identity_router
+except ImportError:
+    from routes.system import SystemDeps, create_system_router  # noqa: E402
+    from routes.session_identity import SessionIdentityDeps, create_session_identity_router  # noqa: E402
 
 
 def _read_app_version() -> dict:
     return system_status.read_app_version(APP_VERSION_FILE)
 
 
-@app.get("/api/health")
-def health():
-    """Лёгкая liveness-проверка -- процесс жив, отвечает. Не трогает диск/сеть
-    (кроме чтения маленького локального VERSION-файла) -- безопасно дёргать часто
-    из мониторинга. Никаких токенов/секретов/путей к credentials/персональных
-    данных в ответе (30.07, Release-аудит Этап 6)."""
-    return system_status.health_response(APP_VERSION_FILE)
-
-
-@app.get("/api/health/ready")
-def health_ready(user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    """Readiness-проверка для Owner/внутреннего мониторинга -- owner-only (в отличие
-    от /api/health): проверяет реальную готовность обслуживать запросы, не только
-    "процесс жив". Каждая проверка дешёвая (stat/os.access), НЕ дорогой сетевой
-    запрос к Google Sheets на каждый вызов -- иначе readiness сам стал бы точкой
-    перегрузки при частом опросе мониторингом."""
-    return system_status.readiness_response(
-        object_photo_dir=OBJECT_PHOTO_DIR,
-        chat_attach_dir=CHAT_ATTACH_DIR,
-        tools_lib_path=TOOLS_LIB_PATH,
-        mangel_lib_path=MANGEL_LIB_PATH,
-        backend_dir=BACKEND_DIR,
-        roles_file=ROLES_FILE,
-    )
-
-
-@app.get("/api/diagnostics")
-def diagnostics(_: None = Depends(require_owner)):
-    """Owner-only system status snapshot — all checks are cheap (file I/O + in-memory cache
-    inspection only, no live Sheets or Drive API calls). Designed so a "данные не грузятся"
-    report can be diagnosed in under a minute without touching prod data."""
-    return system_status.diagnostics_response(
-        data_root=DATA_ROOT,
-        roles_file=ROLES_FILE,
-        sheets_cache=_sheets_cache,
-        sheets_cache_ttl=SHEETS_CACHE_TTL,
-        activity_alerts_file=ACTIVITY_ALERTS_FILE,
-        news_feed_file=NEWS_FEED_FILE,
-        chat_file=CHAT_FILE,
-        plan_sync_state_file=PLAN_SYNC_STATE_FILE,
-        contract_ingest_state_file=CONTRACT_INGEST_STATE_FILE,
-        contracts_drive_folder_id=CONTRACTS_DRIVE_FOLDER_ID,
-        app_version_file=APP_VERSION_FILE,
-        safe_load_json=_safe_load_json,
-        outbox_dead_letter_count=_outbox_dead_letter_count,
-    )
-
-
-@app.get("/api/me")
-def me(user: dict = Depends(get_current_user), role: str = Depends(get_role)):
-    return {"user_id": user['id'], "name": user.get('first_name'), "role": role}
-
-
-@app.post("/api/session")
-def create_session(x_telegram_init_data: str = Header(...)) -> dict:
-    """03.08 (ТЗ Задача 1): выдаёт 12-часовой session token. Требует ЖИВОЙ initData
-    (обычная HMAC + 1-час TTL проверка через get_current_user-путь ниже, не отдельный
-    ослабленный код) -- токен можно получить только пройдя ту же проверку, что раньше
-    требовалась на каждый запрос. Whitelist-проверка тоже здесь: не-whitelisted юзер
-    не получает токен вообще, не только 403 на защищённых эндпоинтах."""
-    user = get_current_user(authorization=None, x_telegram_init_data=x_telegram_init_data)
-    token = create_session_token(user['id'])
+def _system_readiness_kwargs() -> dict:
     return {
-        "token": token,
-        "expires_in": SESSION_TOKEN_MAX_AGE,
-        "user_id": user['id'],
+        "object_photo_dir": OBJECT_PHOTO_DIR,
+        "chat_attach_dir": CHAT_ATTACH_DIR,
+        "tools_lib_path": TOOLS_LIB_PATH,
+        "mangel_lib_path": MANGEL_LIB_PATH,
+        "backend_dir": BACKEND_DIR,
+        "roles_file": ROLES_FILE,
     }
+
+
+def _system_diagnostics_kwargs() -> dict:
+    return {
+        "data_root": DATA_ROOT,
+        "roles_file": ROLES_FILE,
+        "sheets_cache": _sheets_cache,
+        "sheets_cache_ttl": SHEETS_CACHE_TTL,
+        "activity_alerts_file": ACTIVITY_ALERTS_FILE,
+        "news_feed_file": NEWS_FEED_FILE,
+        "chat_file": CHAT_FILE,
+        "plan_sync_state_file": PLAN_SYNC_STATE_FILE,
+        "contract_ingest_state_file": CONTRACT_INGEST_STATE_FILE,
+        "contracts_drive_folder_id": CONTRACTS_DRIVE_FOLDER_ID,
+        "app_version_file": APP_VERSION_FILE,
+        "safe_load_json": _safe_load_json,
+        "outbox_dead_letter_count": _outbox_dead_letter_count,
+    }
+
+
+_system_router, _system_handlers = create_system_router(SystemDeps(
+    get_current_user=get_current_user,
+    require_owner=require_owner,
+    health_response=system_status.health_response,
+    readiness_response=system_status.readiness_response,
+    diagnostics_response=system_status.diagnostics_response,
+    get_app_version_file=lambda: APP_VERSION_FILE,
+    get_readiness_kwargs=_system_readiness_kwargs,
+    get_diagnostics_kwargs=_system_diagnostics_kwargs,
+))
+app.include_router(_system_router)
+health = _system_handlers.health
+health_ready = _system_handlers.health_ready
+diagnostics = _system_handlers.diagnostics
+
+
+_session_identity_router, _session_identity_handlers = create_session_identity_router(
+    SessionIdentityDeps(
+        get_current_user=get_current_user,
+        get_role=get_role,
+        create_session_token=create_session_token,
+        session_token_max_age=SESSION_TOKEN_MAX_AGE,
+    )
+)
+app.include_router(_session_identity_router)
+me = _session_identity_handlers.me
+create_session = _session_identity_handlers.create_session
 
 
 # ---------- Workforce profiles domain ----------
@@ -1091,81 +1087,44 @@ def _save_object_images(images: dict):
 # moved to core/limits.py -- OBJECT_PHOTO_MAX
 
 
-@app.post("/api/objects/{object_id}/image")
-async def upload_object_image(object_id: str, file: UploadFile = File(...),
-                               user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    # 28.07 v2: расширено до массива фото (carousel в карточке объекта, PHASE F спека) --
-    # раньше был единственный fname (перезаписывался при повторной загрузке). Только owner.
-    raw = await file.read()
-    if len(raw) > 8 * 1024 * 1024:
-        raise HTTPException(400, "Фото слишком большое (макс. 8 МБ)")
-    detected = sniff_image(raw)
-    if not detected:
-        raise HTTPException(400, "Файл должен быть изображением")
-    ext = _ALLOWED_IMAGE_MIME_EXT[detected]
-    os.makedirs(OBJECT_PHOTO_DIR, exist_ok=True)
-    fname = f"{uuid.uuid4().hex}.{ext}"
-    fpath = os.path.join(OBJECT_PHOTO_DIR, fname)
-    with open(fpath, 'wb') as f_out:
-        f_out.write(raw)
+# ---------- Object media domain ----------
+try:
+    from .routes.object_media import ObjectMediaDeps, create_object_media_router
+except ImportError:
+    from routes.object_media import ObjectMediaDeps, create_object_media_router  # noqa: E402
 
-    # 28.07 v3 (real bug found by external audit): было _load_object_images() +
-    # _save_object_images() как два отдельных вызова -- read происходил СНАРУЖИ лока,
-    # два параллельных upload на один object_id могли оба прочитать одинаковый
-    # existing-список и один затирал фото, добавленное другим. update_json_transaction
-    # держит read+mutate+write под одним захватом _lock_for(path).
-    def _mutator(images):
-        existing = images.get(object_id) or []
-        if len(existing) >= OBJECT_PHOTO_MAX:
-            raise HTTPException(400, f"Максимум {OBJECT_PHOTO_MAX} фото на объект")
-        images[object_id] = existing + [fname]
-        return images[object_id]
+_object_media_router, _object_media_handlers = create_object_media_router(
+    ObjectMediaDeps(
+        get_current_user=get_current_user,
+        require_owner=require_owner,
+        require_object_access=require_object_access,
+        load_object_images=lambda: _load_object_images(),
+        update_json_transaction=lambda path, default, mutator: update_json_transaction(path, default, mutator),
+        object_images_file=lambda: OBJECT_IMAGES_FILE,
+        object_photo_dir=lambda: OBJECT_PHOTO_DIR,
+        blocker_photo_dir=lambda: BLOCKER_PHOTO_DIR,
+        sniff_image=lambda raw: sniff_image(raw),
+        allowed_image_mime_ext=_ALLOWED_IMAGE_MIME_EXT,
+        object_photo_max=OBJECT_PHOTO_MAX,
+        object_photo_max_bytes=8 * 1024 * 1024,
+        blocker_photo_max_bytes=PHOTO_MAX_BYTES,
+    )
+)
+app.include_router(_object_media_router)
 
-    try:
-        photos = update_json_transaction(OBJECT_IMAGES_FILE, {}, _mutator)
-    except HTTPException:
-        # 28.07: metadata-транзакция не прошла (лимит фото достигнут) -- не оставляем
-        # orphan-файл на диске без записи в metadata (ТЗ п.24: "не оставлять файл на
-        # диске при неуспешной транзакции").
-        if os.path.exists(fpath):
-            os.remove(fpath)
-        raise
-    return {"status": "ok", "photos": photos}
+upload_object_image = _object_media_handlers.upload_object_image
+delete_object_image = _object_media_handlers.delete_object_image
+get_object_image_file = _object_media_handlers.get_object_image_file
+upload_blocker_photo = _object_media_handlers.upload_blocker_photo
+get_blocker_photo = _object_media_handlers.get_blocker_photo
 
 
-@app.delete("/api/objects/{object_id}/image/{fname}")
-def delete_object_image(object_id: str, fname: str, user: dict = Depends(get_current_user), _: None = Depends(require_owner)):
-    safe_name = os.path.basename(fname)
-
-    def _mutator(images):
-        existing = images.get(object_id) or []
-        if safe_name not in existing:
-            raise HTTPException(404, "Фото не найдено")
-        images[object_id] = [f for f in existing if f != safe_name]
-        return images[object_id]
-
-    photos = update_json_transaction(OBJECT_IMAGES_FILE, {}, _mutator)
-    path = os.path.join(OBJECT_PHOTO_DIR, safe_name)
-    if os.path.exists(path):
-        os.remove(path)
-    return {"status": "ok", "photos": photos}
 
 
-@app.get("/api/objects/{object_id}/image/file")
-def get_object_image_file(object_id: str, index: int = 0, user: dict = Depends(get_current_user)):
-    # 30.07 (Release-аудит P1-5): нет require_object_access -- согласовано с
-    # GET /api/objects (весь список объектов виден любому авторизованному, см.
-    # тот же паттерн у /stages, /roadmap notes GET). Upload/delete фото остаются
-    # owner-only. Не меняем это в рамках feature freeze -- задокументировано как
-    # by-design consistency с остальным просмотром объектов, не отдельная дыра.
-    images = _load_object_images()
-    photos = images.get(object_id) or []
-    if not photos or index < 0 or index >= len(photos):
-        raise HTTPException(404, "Фото не загружено")
-    path = os.path.join(OBJECT_PHOTO_DIR, photos[index])
-    if not os.path.exists(path):
-        raise HTTPException(404, "Файл отсутствует")
-    return FileResponse(path)
+
+
+
+
 
 
 _sheets_cache: dict = {}
@@ -2293,39 +2252,10 @@ list_stage_requests = _stages_handlers.list_stage_requests
 decide_stage_request_endpoint = _stages_handlers.decide_stage_request_endpoint
 
 
-# moved to core/paths.py -- BLOCKER_PHOTO_DIR
-os.makedirs(BLOCKER_PHOTO_DIR, exist_ok=True)
+# Blocker-photo directory setup is owned by routes/object_media.py.
 
 
-@app.post("/api/objects/{object_id}/blocker-photo")
-async def upload_blocker_photo(object_id: str, file: UploadFile = File(...),
-                                user: dict = Depends(get_current_user), _: None = Depends(require_object_access)):
-    # 29.07 (аудит): blocker sheet заявлял поле фото, но реального upload не было --
-    # тот же паттерн, что и остальные фото-эндпоинты (sniff_image, размер-лимит).
-    # photo_url -- относительный путь к get_blocker_photo ниже, не прямая файловая ссылка
-    # (доступ к самому файлу тоже идёт через require_object_access, не голый static serve).
-    raw = await file.read()
-    if len(raw) > PHOTO_MAX_BYTES:
-        raise HTTPException(400, "Фото слишком большое (макс. 8 МБ)")
-    detected = sniff_image(raw)
-    if not detected:
-        raise HTTPException(400, "Файл должен быть изображением")
-    ext = _ALLOWED_IMAGE_MIME_EXT[detected]
-    fname = f"{uuid.uuid4().hex}.{ext}"
-    with open(os.path.join(BLOCKER_PHOTO_DIR, fname), 'wb') as out:
-        out.write(raw)
-    return {"photo_url": f"/api/objects/{object_id}/blocker-photo/{fname}"}
 
-
-@app.get("/api/objects/{object_id}/blocker-photo/{fname}")
-def get_blocker_photo(object_id: str, fname: str, user: dict = Depends(get_current_user), _: None = Depends(require_object_access)):
-    if '/' in fname or '..' in fname:
-        raise HTTPException(400, "Некорректное имя файла")
-    path = os.path.join(BLOCKER_PHOTO_DIR, fname)
-    if not os.path.exists(path):
-        raise HTTPException(404, "Файл отсутствует")
-    from fastapi.responses import FileResponse
-    return FileResponse(path)
 
 
 # ---------- Потребности / Needs domain ----------

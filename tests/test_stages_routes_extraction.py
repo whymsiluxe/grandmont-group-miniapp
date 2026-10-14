@@ -57,14 +57,14 @@ def test_stages_domain_routes_are_registered_once_and_owned_by_routes_module():
         assert route.endpoint.__module__.endswith('routes.stages')
 
 
-def test_blocker_photo_routes_stay_in_main_until_media_split():
+def test_blocker_photo_routes_are_owned_by_object_media_module():
     rows = list(_route_rows())
     keys = [(method, path) for method, path, _ in rows]
 
     for key in BLOCKER_PHOTO_ROUTE_KEYS:
         assert keys.count(key) == 1, key
         route = next(route for method, path, route in rows if (method, path) == key)
-        assert route.endpoint.__module__ == 'main'
+        assert route.endpoint.__module__.endswith('routes.object_media')
 
 
 def test_stages_router_has_no_main_import_or_own_roadmap_state():

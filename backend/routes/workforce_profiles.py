@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Collection, Mapping
@@ -16,6 +17,13 @@ from typing import Any, Callable, Collection, Mapping
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
+try:
+    from ..core.media_paths import resolve_owned_media_path
+    from ..core.storage import _safe_load_json
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+    from core.storage import _safe_load_json  # noqa: E402
 
 
 class SkillV2Body(BaseModel):
@@ -200,13 +208,29 @@ def create_workforce_profiles_router(
         if not healed_name and user.get('first_name'):
             candidate = deps.sanitize_display_name(user.get('first_name'), '')
             if candidate:
-                profiles = deps.load_worker_profiles()
                 key = str(user['id'])
-                profile = profiles.get(key, {"skills": [], "quiz_completed": False})
-                profile['name'] = candidate
-                profiles[key] = profile
-                save_worker_profiles(profiles)
-                healed_name = candidate
+
+                def _heal_name(profiles):
+                    current = profiles.get(
+                        key, {"skills": [], "quiz_completed": False}
+                    )
+                    current_name = deps.sanitize_display_name(
+                        current.get('name'), ''
+                    )
+                    # A PATCH may have committed after the initial read above.
+                    # Fresh transaction state wins; auto-healing must never replace
+                    # a user-supplied name or any concurrently updated profile data.
+                    if not current_name:
+                        current['name'] = candidate
+                        profiles[key] = current
+                    return current
+
+                profile = deps.update_json_transaction(
+                    deps.worker_profiles_file(), {}, _heal_name
+                )
+                healed_name = (
+                    deps.sanitize_display_name(profile.get('name'), '') or None
+                )
         if healed_name:
             profile = {**profile, 'name': healed_name}
         elif not deps.sanitize_display_name(profile.get('name'), ''):
@@ -373,29 +397,108 @@ def create_workforce_profiles_router(
         uid = str(user['id'])
         avatar_dir = deps.avatar_dir()
         os.makedirs(avatar_dir, exist_ok=True)
-        for filename in os.listdir(avatar_dir):
-            if filename.startswith(uid + '.'):
-                os.remove(os.path.join(avatar_dir, filename))
-        with open(os.path.join(avatar_dir, f'{uid}.{ext}'), 'wb') as handle:
-            handle.write(raw)
+
+        allowed_exts = sorted(set(deps.allowed_image_mime_ext.values()))
+        target_path = os.path.join(avatar_dir, f'{uid}.{ext}')
+        temp_path = os.path.join(avatar_dir, f'.{uid}.{uuid.uuid4().hex}.tmp')
+        backup_path = os.path.join(avatar_dir, f'.{uid}.{uuid.uuid4().hex}.bak')
+        target_had_old = os.path.exists(target_path)
+
+        try:
+            with open(temp_path, 'wb') as handle:
+                handle.write(raw)
+            if target_had_old:
+                os.replace(target_path, backup_path)
+            os.replace(temp_path, target_path)
+        except Exception:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                logging.getLogger('grandmont.avatar').exception(
+                    'Failed to clean staged avatar temp file for uid=%s', uid
+                )
+            if target_had_old and os.path.exists(backup_path):
+                try:
+                    os.replace(backup_path, target_path)
+                except OSError:
+                    logging.getLogger('grandmont.avatar').exception(
+                        'Failed to restore previous avatar after binary write failure for uid=%s', uid
+                    )
+            raise
 
         def _mutator(profiles):
             profile = profiles.get(uid, {"skills": [], "quiz_completed": False})
             profile['avatar'] = True
+            profile['avatar_ext'] = ext
             if not profile.get('name'):
                 profile['name'] = user.get('first_name', uid)
             profiles[uid] = profile
 
-        deps.update_json_transaction(deps.worker_profiles_file(), {}, _mutator)
+        try:
+            deps.update_json_transaction(deps.worker_profiles_file(), {}, _mutator)
+        except Exception:
+            try:
+                os.remove(target_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logging.getLogger('grandmont.avatar').exception(
+                    'Failed to remove uncommitted avatar for uid=%s', uid
+                )
+            if target_had_old and os.path.exists(backup_path):
+                try:
+                    os.replace(backup_path, target_path)
+                except OSError:
+                    logging.getLogger('grandmont.avatar').exception(
+                        'Failed to restore previous avatar after profile write failure for uid=%s', uid
+                    )
+            raise
+
+        # Metadata now points to the committed extension. Removing stale formats is
+        # secondary cleanup: failure must not turn a successful upload into false 500.
+        stale_paths = [
+            os.path.join(avatar_dir, f'{uid}.{candidate_ext}')
+            for candidate_ext in allowed_exts
+            if candidate_ext != ext
+        ]
+        if target_had_old:
+            stale_paths.append(backup_path)
+        for stale_path in stale_paths:
+            try:
+                os.remove(stale_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logging.getLogger('grandmont.avatar').exception(
+                    'Failed to clean stale avatar file %s for uid=%s', stale_path, uid
+                )
         return {'status': 'ok'}
 
     @router.get('/api/profile/{user_id}/avatar')
     def get_avatar(user_id: str, user: dict = Depends(deps.get_current_user)):
         if not user_id.isdigit():
             raise HTTPException(400, 'user_id должен быть числовым Telegram ID')
-        for ext in ('jpg', 'png', 'webp'):
-            path = os.path.join(deps.avatar_dir(), f'{user_id}.{ext}')
-            if os.path.exists(path):
+        profiles = _safe_load_json(deps.worker_profiles_file(), {})
+        profile = profiles.get(str(user_id), {}) if isinstance(profiles, dict) else {}
+        if not isinstance(profile, dict) or not profile.get('avatar'):
+            raise HTTPException(404, 'Аватар не найден')
+
+        preferred_ext = profile.get('avatar_ext')
+        allowed_exts = list(dict.fromkeys(deps.allowed_image_mime_ext.values()))
+        if preferred_ext is not None:
+            if preferred_ext not in allowed_exts:
+                raise HTTPException(404, 'Аватар не найден')
+            candidate_exts = [preferred_ext]
+        else:
+            # Legacy profiles may predate avatar_ext metadata. Keep the old
+            # extension probe only for those explicitly marked as having an avatar.
+            candidate_exts = allowed_exts
+
+        avatar_dir = deps.avatar_dir()
+        for ext in candidate_exts:
+            path = resolve_owned_media_path(avatar_dir, f'{user_id}.{ext}')
+            if path and os.path.isfile(path):
                 return FileResponse(path)
         raise HTTPException(404, 'Аватар не найден')
 

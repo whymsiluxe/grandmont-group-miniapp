@@ -6,7 +6,7 @@ is injected so this module never imports ``main``/chat/news.
 """
 from __future__ import annotations
 
-import json
+import logging
 import os
 import threading
 import time
@@ -17,6 +17,14 @@ from typing import Any, Callable, Mapping
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
+
+try:
+    from ..core.media_paths import resolve_owned_media_path
+except ImportError:
+    from core.media_paths import resolve_owned_media_path  # noqa: E402
+
+
+logger = logging.getLogger(__name__)
 
 
 class PhotoCommentBody(BaseModel):
@@ -78,8 +86,22 @@ def create_photo_feed_router(deps: PhotoFeedRouteDeps) -> tuple[APIRouter, Photo
         return deps.safe_load_json(deps.photo_meta_file(), [])
 
     def save_photo_meta(items: list):
-        with open(deps.photo_meta_file(), 'w', encoding='utf-8') as handle:
-            json.dump(items, handle, ensure_ascii=False)
+        deps.atomic_write_json(deps.photo_meta_file(), items)
+
+    def _remove_photo_files_best_effort(filenames: list[str]):
+        for filename in filenames:
+            safe_path = resolve_owned_media_path(deps.photo_dir(), filename)
+            if not safe_path:
+                continue
+            try:
+                os.remove(safe_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.exception(
+                    'Failed to remove photo-feed binary after metadata transition',
+                    extra={'filename': filename},
+                )
 
     def load_photo_reactions() -> dict:
         return deps.safe_load_json(deps.photo_reactions_file(), {})
@@ -90,8 +112,8 @@ def create_photo_feed_router(deps: PhotoFeedRouteDeps) -> tuple[APIRouter, Photo
     def copy_checkin_photos_to_feed(rel_paths: list, prefix: str) -> list:
         saved = []
         for index, rel in enumerate(rel_paths):
-            src_path = os.path.join(deps.checkin_photo_base(), rel)
-            if not os.path.exists(src_path):
+            src_path = resolve_owned_media_path(deps.checkin_photo_base(), rel)
+            if not src_path or not os.path.exists(src_path):
                 continue
             ext = os.path.splitext(rel)[1] or '.jpg'
             filename = f'{prefix}_{index}{ext}'
@@ -114,29 +136,33 @@ def create_photo_feed_router(deps: PhotoFeedRouteDeps) -> tuple[APIRouter, Photo
         ).strftime('%H:%M')
         label = ('Начало смены' if kind == 'start' else 'Конец смены') + f' · {time_str}'
 
-        with photo_lock:
-            items = load_photo_meta()
-            post = next((item for item in items if item.get('checkin_session_id') == session['id']), None)
-            if post:
-                start_index = len(post['files'])
-                post['files'].extend(new_files)
-                post.setdefault('photo_labels', {})
-                for index, _filename in enumerate(new_files):
-                    post['photo_labels'][str(start_index + index)] = label
-            else:
-                post = {
-                    'id': uuid.uuid4().hex,
-                    'files': new_files,
-                    'ts': int(time.time()),
-                    'user_id': user_id,
-                    'name': user_name,
-                    'object_id': object_name,
-                    'caption': '',
-                    'checkin_session_id': session['id'],
-                    'photo_labels': {str(index): label for index in range(len(new_files))},
-                }
-                items.append(post)
-            save_photo_meta(items)
+        try:
+            with photo_lock:
+                items = load_photo_meta()
+                post = next((item for item in items if item.get('checkin_session_id') == session['id']), None)
+                if post:
+                    start_index = len(post['files'])
+                    post['files'].extend(new_files)
+                    post.setdefault('photo_labels', {})
+                    for index, _filename in enumerate(new_files):
+                        post['photo_labels'][str(start_index + index)] = label
+                else:
+                    post = {
+                        'id': uuid.uuid4().hex,
+                        'files': new_files,
+                        'ts': int(time.time()),
+                        'user_id': user_id,
+                        'name': user_name,
+                        'object_id': object_name,
+                        'caption': '',
+                        'checkin_session_id': session['id'],
+                        'photo_labels': {str(index): label for index in range(len(new_files))},
+                    }
+                    items.append(post)
+                save_photo_meta(items)
+        except Exception:
+            _remove_photo_files_best_effort(new_files)
+            raise
 
     @router.get('/api/feed/photos')
     def list_feed_photos(user: dict = Depends(deps.get_current_user)):
@@ -159,7 +185,10 @@ def create_photo_feed_router(deps: PhotoFeedRouteDeps) -> tuple[APIRouter, Photo
                 photo['files'] = [photo['file']] if photo.get('file') else []
             photo['files'] = [
                 filename for filename in photo.get('files', [])
-                if os.path.exists(os.path.join(deps.photo_dir(), filename))
+                if (
+                    (safe_path := resolve_owned_media_path(deps.photo_dir(), filename))
+                    and os.path.exists(safe_path)
+                )
             ]
             if not photo['files']:
                 continue
@@ -178,8 +207,9 @@ def create_photo_feed_router(deps: PhotoFeedRouteDeps) -> tuple[APIRouter, Photo
         if len(files) > deps.photo_max_files:
             raise HTTPException(400, f'Максимум {deps.photo_max_files} фото за раз')
 
-        photo_id = uuid.uuid4().hex
-        saved_files = []
+        # Validate the entire batch before creating any binaries. A bad second
+        # upload must not leave the already-written first file orphaned.
+        validated = []
         for upload in files:
             raw = await upload.read()
             if len(raw) > deps.photo_max_bytes:
@@ -187,34 +217,47 @@ def create_photo_feed_router(deps: PhotoFeedRouteDeps) -> tuple[APIRouter, Photo
             detected = deps.sniff_image(raw)
             if not detected:
                 raise HTTPException(400, 'Все файлы должны быть изображениями')
-            ext = deps.allowed_image_mime_ext[detected]
-            filename = f'{photo_id}_{len(saved_files)}.{ext}'
-            with open(os.path.join(deps.photo_dir(), filename), 'wb') as output:
-                output.write(raw)
-            saved_files.append(filename)
+            validated.append((raw, deps.allowed_image_mime_ext[detected]))
 
-        entry = {
-            'id': photo_id,
-            'files': saved_files,
-            'ts': int(time.time()),
-            'user_id': user['id'],
-            'name': deps.sanitize_display_name(user.get('first_name'), str(user['id'])),
-            'object_id': object_id.strip()[:100],
-            'caption': caption.strip()[:300],
-        }
+        photo_id = uuid.uuid4().hex
+        saved_files = []
+        evicted_files = []
+        try:
+            for raw, ext in validated:
+                filename = f'{photo_id}_{len(saved_files)}.{ext}'
+                with open(os.path.join(deps.photo_dir(), filename), 'wb') as output:
+                    output.write(raw)
+                saved_files.append(filename)
 
-        with photo_lock:
-            items = load_photo_meta()
-            items.append(entry)
-            if len(items) > deps.photo_max_count:
-                for old in items[:-deps.photo_max_count]:
-                    old_files = old.get('files') or ([old['file']] if old.get('file') else [])
-                    for old_filename in old_files:
-                        old_path = os.path.join(deps.photo_dir(), old_filename)
-                        if os.path.exists(old_path):
-                            os.remove(old_path)
-                items = items[-deps.photo_max_count:]
-            save_photo_meta(items)
+            entry = {
+                'id': photo_id,
+                'files': saved_files,
+                'ts': int(time.time()),
+                'user_id': user['id'],
+                'name': deps.sanitize_display_name(user.get('first_name'), str(user['id'])),
+                'object_id': object_id.strip()[:100],
+                'caption': caption.strip()[:300],
+            }
+
+            with photo_lock:
+                items = load_photo_meta()
+                items.append(entry)
+                if len(items) > deps.photo_max_count:
+                    evicted = items[:-deps.photo_max_count]
+                    for old in evicted:
+                        evicted_files.extend(old.get('files') or ([old['file']] if old.get('file') else []))
+                    items = items[-deps.photo_max_count:]
+                # Metadata is the ownership record. Commit it BEFORE deleting
+                # evicted binaries; a failed metadata write must leave the old
+                # feed fully intact rather than pointing at already-deleted files.
+                save_photo_meta(items)
+        except Exception:
+            _remove_photo_files_best_effort(saved_files)
+            raise
+
+        # Metadata commit succeeded. Failure to remove evicted binaries now only
+        # creates harmless disk orphans, never broken live metadata.
+        _remove_photo_files_best_effort(evicted_files)
         return {'photo': entry}
 
     @router.post('/api/feed/photos/{photo_id}/comments')

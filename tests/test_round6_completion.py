@@ -11,8 +11,10 @@ Run:
     BOT_TOKEN='ci-dummy-token-not-a-real-secret' MINIAPP_DATA_ROOT=$(mktemp -d) \
       /home/promonta/agent/miniapp/.venv/bin/python3 -m pytest tests/test_round6_completion.py -v
 """
+import json
 import os
 import sys
+import tempfile
 import unittest
 from datetime import timedelta
 from unittest.mock import patch
@@ -97,10 +99,15 @@ class ProfileCompletionStatusTests(unittest.TestCase):
         self.assertFalse(st['birthday_required'])
 
     def test_get_my_profile_exposes_needs_completion(self):
-        with patch.object(backend, '_load_worker_profiles', return_value={'10': {'quiz_completed': True}}), \
-             patch.object(backend, '_save_worker_profiles'), \
-             patch.object(backend, '_load_roles', return_value=ROLES):
-            prof = backend.get_my_profile(user=W1)
+        initial = {'10': {'quiz_completed': True}}
+        with tempfile.TemporaryDirectory() as tmp:
+            profiles_file = os.path.join(tmp, 'worker_profiles.json')
+            with open(profiles_file, 'w', encoding='utf-8') as handle:
+                json.dump(initial, handle)
+            with patch.object(backend, 'WORKER_PROFILES_FILE', profiles_file), \
+                 patch.object(backend, '_load_worker_profiles', return_value=initial), \
+                 patch.object(backend, '_load_roles', return_value=ROLES):
+                prof = backend.get_my_profile(user=W1)
         self.assertIn('needs_completion', prof)
         self.assertTrue(prof['needs_completion']['birthday_required'])
 

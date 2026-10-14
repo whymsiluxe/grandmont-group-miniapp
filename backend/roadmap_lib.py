@@ -17,7 +17,7 @@ import uuid
 # 31.07 (доп.раунд, П4): тот же MINIAPP_DATA_ROOT, что main.py использует для остальных
 # runtime JSON -- без этого тесты/CI с изолированным DATA_ROOT всё равно писали бы
 # roadmap.json/roadmap_stage_requests.json в реальный prod-путь.
-DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/promonta/agent/miniapp')
+DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/grandmont/agent/miniapp')
 
 ROADMAP_FILE = os.path.join(DATA_ROOT, 'roadmap.json')
 

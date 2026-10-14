@@ -243,9 +243,9 @@ class TestLegacyRouteWiringUnaffected:
         import ast
         import inspect
 
-        import routes.objects as objects_module
+        import services.object_assignments as assignments_service_module
 
-        source = inspect.getsource(objects_module)
+        source = inspect.getsource(assignments_service_module)
         assert 'shadow_compare_assignments' in source
         tree = ast.parse(source)
         found_try_guard = False

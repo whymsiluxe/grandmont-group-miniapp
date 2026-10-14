@@ -18,7 +18,7 @@ same standalone-script pattern as backend/cleanup_old_attachments.py.
 Deploy: like cleanup_old_attachments.py, this file is NOT copied automatically by
 scripts/deploy.sh's manifest (it isn't imported by main.py, so it isn't a runtime
 dependency of the app) -- copy it manually into the runtime package directory,
-next to main.py (/home/promonta/agent/miniapp/), so `import main as backend`
+next to main.py (/home/grandmont/agent/miniapp/), so `import main as backend`
 below resolves the same top-level `main` module the systemd uvicorn service and
 every tests/test_*.py file use (as opposed to the `miniapp.main` package import
 uvicorn itself uses -- see main.py's own relative/absolute import fallback
@@ -47,7 +47,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/promonta/agent/miniapp')
+DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/grandmont/agent/miniapp')
 STATE_FILE = os.path.join(DATA_ROOT, 'daily_plan_cutoff_state.json')
 
 MODES = {

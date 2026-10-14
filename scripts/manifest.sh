@@ -44,10 +44,14 @@ BACKEND_STANDALONE_SCRIPTS=(
     "cleanup_old_attachments.py"
     "daily_plan_cutoff_check.py"
 )
-# Shipped as a unit: rm -rf $DEST/core && cp -r $SRC/core $DEST/core
+# Shipped as units: rm -rf $DEST/<dir> && cp -r $SRC/<dir> $DEST/<dir>.
 BACKEND_CORE_DIR="core"
 # 25.09: first router extraction (routes/auth.py) -- main.py now does
 # `app.include_router(...)` from this package, so it must ship exactly like
 # core/ (same rm -rf + cp -r unit) or a deploy leaves main.py importing a
 # directory that doesn't exist on the serving path.
 BACKEND_ROUTES_DIR="routes"
+# 13.10 Phase 9: route factories now import framework-agnostic application
+# services. Keep this directory in the same transactional runtime manifest so
+# deploy/backup/rollback cannot leave routes and services from different SHAs.
+BACKEND_SERVICES_DIR="services"

@@ -1,6 +1,7 @@
 """Object-document HTTP routes extracted from ``backend.main``."""
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
@@ -15,6 +16,8 @@ try:
     from ..core.object_info_store import ObjectInfoStore
 except ImportError:
     from core.object_info_store import ObjectInfoStore  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -172,10 +175,18 @@ def create_documents_router(deps: DocumentsRouteDeps) -> tuple[APIRouter, Docume
 
         doc = deps.update_json_transaction(deps.store.file_path(), {}, _mutator)
         file_path = _contained_document_path(deps.object_doc_dir(), str(doc.get("file") or ""))
-        # Unsafe/corrupt legacy metadata is removed from JSON but is never allowed
-        # to make deletion touch a path outside OBJECT_DOC_DIR.
+        # Metadata deletion is the primary durable operation. Once it commits the
+        # document is no longer reachable through the API. A filesystem cleanup
+        # failure must not turn that committed delete into a false 500/404 retry
+        # loop; leave an orphan for retention cleanup and log it explicitly.
         if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+            try:
+                os.remove(file_path)
+            except OSError:
+                logger.exception(
+                    "Document binary cleanup failed after metadata delete: %s",
+                    file_path,
+                )
         return {"status": "ok"}
 
     @router.get("/api/objects/{object_id}/documents/{fname}/file")

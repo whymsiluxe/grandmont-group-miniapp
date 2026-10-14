@@ -6,7 +6,7 @@ import time
 import threading
 
 # 31.07 (доп.раунд, П4): тот же MINIAPP_DATA_ROOT, что main.py/roadmap_lib.py.
-DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/promonta/agent/miniapp')
+DATA_ROOT = os.environ.get('MINIAPP_DATA_ROOT', '/home/grandmont/agent/miniapp')
 MANGEL_FILE = os.path.join(DATA_ROOT, 'mangel_tickets.json')
 
 
