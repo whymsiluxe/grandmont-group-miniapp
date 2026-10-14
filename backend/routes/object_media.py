@@ -1,6 +1,7 @@
 """Object and blocker photo HTTP routes extracted from backend.main."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -79,6 +80,39 @@ def _legacy_blocker_photo_owned(object_id: str, fname: str) -> bool:
     )
 
 
+def _write_binary_file(path: str, data: bytes, *, create_parent: bool = False) -> None:
+    """Blocking binary write helper intended to run outside the event loop."""
+    if create_parent:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as output:
+        output.write(data)
+
+
+def _remove_binary_after_failed_commit(path: str) -> None:
+    """Best-effort rollback for a binary whose metadata transaction failed."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        logger.exception("Failed to remove orphan object media after metadata failure: %s", path)
+
+
+def _write_owned_blocker_file(blocker_root: str, relative_path: str, data: bytes) -> str | None:
+    """Resolve, create and write one blocker file without blocking the event loop."""
+    path = resolve_owned_media_path(blocker_root, relative_path)
+    if not path:
+        return None
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Re-resolve after directory creation so a pre-existing symlink namespace
+    # cannot redirect this object's upload to another media identity.
+    path = resolve_owned_media_path(blocker_root, relative_path)
+    if not path:
+        return None
+    with open(path, "wb") as output:
+        output.write(data)
+    return path
+
+
 def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, ObjectMediaHandlers]:
     router = APIRouter()
 
@@ -100,11 +134,9 @@ def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, Object
             raise HTTPException(400, "Файл должен быть изображением")
         ext = deps.allowed_image_mime_ext[detected]
         photo_dir = deps.object_photo_dir()
-        os.makedirs(photo_dir, exist_ok=True)
         fname = f"{uuid.uuid4().hex}.{ext}"
         fpath = os.path.join(photo_dir, fname)
-        with open(fpath, "wb") as f_out:
-            f_out.write(raw)
+        await asyncio.to_thread(_write_binary_file, fpath, raw, create_parent=True)
 
         def _mutator(images):
             existing = images.get(object_id) or []
@@ -114,15 +146,16 @@ def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, Object
             return images[object_id]
 
         try:
-            photos = deps.update_json_transaction(deps.object_images_file(), {}, _mutator)
+            photos = await asyncio.to_thread(
+                deps.update_json_transaction,
+                deps.object_images_file(),
+                {},
+                _mutator,
+            )
         except Exception:
             # Binary is created before metadata commit. Any failed metadata/storage
             # transaction must roll it back, not only HTTPException failures.
-            try:
-                if os.path.exists(fpath):
-                    os.remove(fpath)
-            except OSError as cleanup_exc:
-                print(f"[object-media] failed to remove orphan {fpath}: {cleanup_exc}")
+            await asyncio.to_thread(_remove_binary_after_failed_commit, fpath)
             raise
         return {"status": "ok", "photos": photos}
 
@@ -196,17 +229,14 @@ def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, Object
         fname = f"{uuid.uuid4().hex}.{ext}"
         blocker_root = deps.blocker_photo_dir()
         relative_path = os.path.join(_blocker_object_namespace(object_id), fname)
-        path = resolve_owned_media_path(blocker_root, relative_path)
+        path = await asyncio.to_thread(
+            _write_owned_blocker_file,
+            blocker_root,
+            relative_path,
+            raw,
+        )
         if not path:
             raise HTTPException(500, "Не удалось подготовить хранилище фото")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        # Re-resolve after directory creation so a pre-existing symlink namespace
-        # cannot redirect this object's upload to another media identity.
-        path = resolve_owned_media_path(blocker_root, relative_path)
-        if not path:
-            raise HTTPException(500, "Не удалось подготовить хранилище фото")
-        with open(path, "wb") as out:
-            out.write(raw)
         return {"photo_url": f"/api/objects/{object_id}/blocker-photo/{fname}"}
 
     @router.get("/api/objects/{object_id}/blocker-photo/{fname}")
