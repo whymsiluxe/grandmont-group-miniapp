@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import uuid
 from dataclasses import dataclass
@@ -18,6 +19,9 @@ except ImportError:
     import roadmap_lib as _roadmap_lib  # noqa: E402
     from core.media_paths import resolve_owned_media_path  # noqa: E402
     from core.storage import _safe_load_json  # noqa: E402
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -143,7 +147,16 @@ def create_object_media_router(deps: ObjectMediaDeps) -> tuple[APIRouter, Object
         photos = deps.update_json_transaction(deps.object_images_file(), {}, _mutator)
         path = resolve_owned_media_path(deps.object_photo_dir(), safe_name)
         if path and os.path.isfile(path):
-            os.remove(path)
+            try:
+                os.remove(path)
+            except OSError:
+                # Metadata deletion is the durable operation. A binary cleanup
+                # failure must not turn that committed delete into a false 500;
+                # leave an unreachable orphan for retention cleanup instead.
+                logger.exception(
+                    "Object image binary cleanup failed after metadata delete: %s",
+                    path,
+                )
         return {"status": "ok", "photos": photos}
 
     @router.get("/api/objects/{object_id}/image/file")
