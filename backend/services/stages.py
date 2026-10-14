@@ -6,8 +6,12 @@ routes/stages.py; persistence collaborators are injected by the composition root
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable
+
+
+logger = logging.getLogger(__name__)
 
 
 class StageServiceError(RuntimeError):
@@ -469,26 +473,60 @@ class StageService:
                 if kind == "delete_stage"
                 else f"смену статуса на «{payload.get('new_status', '')}»"
             )
-            alert = self.deps.create_critical_alert(
-                target_user_id=owner_id,
-                kind="stage_request",
-                title=f"{requester_name} просит {kind_label}",
-                subtitle=stage.get("Название этапа", ""),
-                ref_id=request["id"],
-            )
-            request["critical_alert_id"] = alert["id"]
+            try:
+                alert = self.deps.create_critical_alert(
+                    target_user_id=owner_id,
+                    kind="stage_request",
+                    title=f"{requester_name} просит {kind_label}",
+                    subtitle=stage.get("Название этапа", ""),
+                    ref_id=request["id"],
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to create critical alert after stage request commit",
+                    extra={"request_id": request.get("id"), "object_id": object_id},
+                )
+            else:
+                alert_id = alert.get("id") if isinstance(alert, dict) else None
+                if not alert_id:
+                    logger.error(
+                        "Critical alert returned no id after stage request commit",
+                        extra={"request_id": request.get("id"), "object_id": object_id},
+                    )
+                else:
+                    def attach_alert(requests):
+                        stored = rl.find_stage_request(requests, request["id"])
+                        if stored:
+                            stored["critical_alert_id"] = alert_id
+                        return stored
 
-            def attach_alert(requests):
-                stored = rl.find_stage_request(requests, request["id"])
-                if stored:
-                    stored["critical_alert_id"] = alert["id"]
-                return stored
-
-            self.deps.update_json_transaction(
-                rl.STAGE_REQUESTS_FILE,
-                rl._default_requests,
-                attach_alert,
-            )
+                    try:
+                        stored = self.deps.update_json_transaction(
+                            rl.STAGE_REQUESTS_FILE,
+                            rl._default_requests,
+                            attach_alert,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to attach critical alert after stage request commit",
+                            extra={
+                                "request_id": request.get("id"),
+                                "critical_alert_id": alert_id,
+                                "object_id": object_id,
+                            },
+                        )
+                    else:
+                        if stored:
+                            request["critical_alert_id"] = alert_id
+                        else:
+                            logger.warning(
+                                "Stage request disappeared before critical alert attachment",
+                                extra={
+                                    "request_id": request.get("id"),
+                                    "critical_alert_id": alert_id,
+                                    "object_id": object_id,
+                                },
+                            )
         return request
 
     def list_stage_requests(self, object_id: str) -> dict:
